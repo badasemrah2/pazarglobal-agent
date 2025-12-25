@@ -11,6 +11,7 @@ from config.prompts import (
 from tools import search_listings_tool, market_price_tool
 from typing import Dict, Any
 import asyncio
+import json
 from loguru import logger
 
 
@@ -123,9 +124,21 @@ class SearchComposerAgent(BaseAgent):
             # Limit to 5 items for response to avoid token blowup
             preview_listings = all_listings[:5]
             remaining = max(len(all_listings) - len(preview_listings), 0)
-            msg = f"{len(all_listings)} ilan bulundu."
+            msg_lines = [f"{len(all_listings)} ilan bulundu."]
+            if preview_listings:
+                for idx, listing in enumerate(preview_listings, 1):
+                    title = listing.get("title") or "Başlıksız"
+                    price = listing.get("price")
+                    price_txt = f"{price} TL" if price is not None else "Fiyat belirtilmemiş"
+                    category = listing.get("category") or "Kategori yok"
+                    msg_lines.append(f"{idx}. {title} - {price_txt} - {category}")
             if remaining > 0:
-                msg += f" İlk {len(preview_listings)} tanesini gösteriyorum. Daha fazlası için söyleyin."
+                msg_lines.append(f"İlk {len(preview_listings)} tanesi gösterildi. Daha fazlası için söyleyin.")
+            msg = "\n".join(msg_lines)
+
+            # Attach cache marker for frontend parsing
+            search_cache = {"results": preview_listings}
+            msg = f"{msg}\n[SEARCH_CACHE]{json.dumps(search_cache)}"
 
             return {
                 "success": True,
