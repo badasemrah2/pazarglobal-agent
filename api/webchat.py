@@ -72,30 +72,37 @@ async def process_webchat_message(
         Response dict
     """
     try:
-        # Get or create session
+        # Get or create session (safe even if redis is disabled)
         session = await redis_client.get_session(session_id)
-        if not session:
-            # Create new session
-            await redis_client.set_session(session_id, {
-                "user_id": user_id or str(uuid.uuid4()),
+        # Normalize session to dict to avoid attribute errors
+        if session is None or not isinstance(session, dict):
+            session = {
+                "user_id": user_id,
                 "intent": None,
                 "active_draft_id": None
-            })
-            session = await redis_client.get_session(session_id)
+            }
+        if not session.get("user_id"):
+            session["user_id"] = user_id or str(uuid.uuid4())
+        # Persist only if redis is enabled
+        if not getattr(redis_client, "disabled", False):
+            await redis_client.set_session(session_id, session)
         
         # Store message in history
-        await redis_client.add_message(session_id, {
-            "role": "user",
-            "content": message_body,
-            "timestamp": str(uuid.uuid1().time)
-        })
+        if not getattr(redis_client, "disabled", False):
+            await redis_client.add_message(session_id, {
+                "role": "user",
+                "content": message_body,
+                "timestamp": str(uuid.uuid1().time)
+            })
         
         # Get or determine intent
         intent = session.get("intent")
         if not intent:
             router_agent = IntentRouterAgent()
             intent = await router_agent.classify_intent(message_body)
-            await redis_client.set_intent(session_id, intent)
+            session["intent"] = intent
+            if not getattr(redis_client, "disabled", False):
+                await redis_client.set_intent(session_id, intent)
             logger.info(f"WebChat intent for {session_id}: {intent}")
         
         response_data = {"intent": intent}
@@ -105,14 +112,24 @@ async def process_webchat_message(
             composer = ComposerAgent()
             result = await composer.orchestrate_listing_creation(
                 user_message=message_body,
-                user_id=session["user_id"],
+                user_id=session.get("user_id"),
                 phone_number=session_id,  # Use session_id as identifier
                 draft_id=session.get("active_draft_id"),
                 media_url=media_url
             )
-            
-            if result["success"]:
-                await redis_client.set_active_draft(session_id, result["draft_id"])
+            # Guard against unexpected None/invalid result
+            if not result or not isinstance(result, dict):
+                return {
+                    "success": False,
+                    "message": "Internal error: listing creation failed",
+                    "data": None,
+                    "intent": intent
+                }
+
+            if result.get("success"):
+                session["active_draft_id"] = result["draft_id"]
+                if not getattr(redis_client, "disabled", False):
+                    await redis_client.set_active_draft(session_id, result["draft_id"])
                 
                 draft = result["draft"]
                 response_text = "✅ Draft updated successfully!\n\n"
@@ -132,7 +149,7 @@ async def process_webchat_message(
             else:
                 return {
                     "success": False,
-                    "message": result.get("error", "Failed to create listing"),
+                    "message": (result.get("error") if isinstance(result, dict) else "Failed to create listing"),
                     "data": None,
                     "intent": intent
                 }
@@ -142,15 +159,23 @@ async def process_webchat_message(
             result = await agent.run(
                 user_message=message_body,
                 context={
-                    "user_id": session["user_id"],
+                    "user_id": session.get("user_id"),
                     "draft_id": session.get("active_draft_id")
                 }
             )
-            
+            # Guard against unexpected None/invalid result
+            if not result or not isinstance(result, dict):
+                return {
+                    "success": False,
+                    "message": "Internal error: publish/delete failed",
+                    "data": None,
+                    "intent": intent
+                }
+
             response_data["type"] = "publish_delete"
             return {
-                "success": result["success"],
-                "message": result["response"],
+                "success": result.get("success", False),
+                "message": result.get("response", ""),
                 "data": response_data,
                 "intent": intent
             }
@@ -158,15 +183,23 @@ async def process_webchat_message(
         elif intent == "search_listings":
             composer = SearchComposerAgent()
             result = await composer.orchestrate_search(message_body)
-            
+
+            if not result or not isinstance(result, dict):
+                return {
+                    "success": False,
+                    "message": "Internal error: search failed",
+                    "data": None,
+                    "intent": intent
+                }
+
             response_data.update({
-                "listings": result["listings"],
-                "count": result["count"],
+                "listings": result.get("listings", []),
+                "count": result.get("count", 0),
                 "type": "search_results"
             })
-            
+
             return {
-                "success": result["success"],
+                "success": result.get("success", False),
                 "message": result.get("message", "Search completed"),
                 "data": response_data,
                 "intent": intent
@@ -175,11 +208,11 @@ async def process_webchat_message(
         else:  # small_talk
             agent = SmallTalkAgent()
             response = await agent.run_simple(message_body)
-            
+
             response_data["type"] = "conversation"
             return {
                 "success": True,
-                "message": response,
+                "message": response or "",
                 "data": response_data,
                 "intent": intent
             }
