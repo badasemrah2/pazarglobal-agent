@@ -9,6 +9,10 @@ from services import redis_client
 from agents import IntentRouterAgent, ComposerAgent, PublishDeleteAgent, SearchComposerAgent, SmallTalkAgent
 import json
 import uuid
+import re
+
+# In-memory cache for last search results (when Redis is disabled)
+LAST_SEARCH_CACHE: Dict[str, list] = {}
 
 router = APIRouter(prefix="/webchat", tags=["webchat"])
 
@@ -181,6 +185,44 @@ async def process_webchat_message(
             }
         
         elif intent == "search_listings":
+            # If user asks to show previous search results, reuse cache
+            lower_msg = message_body.lower()
+            if any(k in lower_msg for k in ["göster", "detay"]) and LAST_SEARCH_CACHE.get(session_id):
+                listings = LAST_SEARCH_CACHE.get(session_id, [])
+                idx_match = re.search(r"(\d+)", lower_msg)
+                idx = int(idx_match.group(1)) - 1 if idx_match else 0
+                if 0 <= idx < len(listings):
+                    listing = listings[idx]
+                    title = listing.get("title") or "Başlıksız"
+                    price = listing.get("price")
+                    price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
+                    category = listing.get("category") or "Kategori yok"
+                    location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
+                    description = listing.get("description") or "Açıklama yok"
+                    owner = listing.get("user_name") or "Satıcı bilgisi yok"
+                    phone = listing.get("user_phone") or "Telefon yok"
+                    image_url = listing.get("image_url")
+                    if not image_url and listing.get("images") and isinstance(listing["images"], list):
+                        first_img = listing["images"][0]
+                        if isinstance(first_img, dict):
+                            image_url = first_img.get("image_url") or first_img.get("public_url")
+                        elif isinstance(first_img, str):
+                            image_url = first_img
+                    detail_msg = f"""{title}
+{price_txt} - {category} - {location}
+Satıcı: {owner} | Telefon: {phone}
+
+Açıklama:
+{description}"""
+                    if image_url:
+                        detail_msg += f"\nGörsel: {image_url}"
+                    return {
+                        "success": True,
+                        "message": detail_msg,
+                        "data": {"listing": listing, "type": "search_results"},
+                        "intent": intent
+                    }
+
             composer = SearchComposerAgent()
             result = await composer.orchestrate_search(message_body)
 
@@ -197,6 +239,10 @@ async def process_webchat_message(
                 "count": result.get("count", 0),
                 "type": "search_results"
             })
+
+            # Cache full results for follow-up detail requests
+            if result.get("listings_full") is not None:
+                LAST_SEARCH_CACHE[session_id] = result["listings_full"]
 
             return {
                 "success": result.get("success", False),

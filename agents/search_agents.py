@@ -143,6 +143,7 @@ class SearchComposerAgent(BaseAgent):
             return {
                 "success": True,
                 "listings": preview_listings,
+                "listings_full": all_listings,
                 "count": len(all_listings),
                 "market_data": market_data["data"] if market_data.get("success") else {},
                 "insights": insights,

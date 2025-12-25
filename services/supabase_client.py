@@ -39,7 +39,7 @@ class SupabaseClient:
                 "state": "in_progress",
                 "listing_data": listing_data,
                 "images": [],
-                "vision_product": None
+                "vision_product": {}
             }).execute()
             
             if result.data:
