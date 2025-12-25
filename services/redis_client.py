@@ -14,10 +14,10 @@ class RedisClient:
     """Redis client for session state management"""
     
     def __init__(self):
-        self._client: Optional[redis.Redis] = None
+        self._client: Optional[Any] = None  # type: ignore
         self.disabled = True  # temporary: no Redis available
     
-    async def get_client(self) -> redis.Redis:
+    async def get_client(self) -> Optional[Any]:
         """Get or create Redis client"""
         if self.disabled:
             return None
