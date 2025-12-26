@@ -81,6 +81,81 @@ def is_delete_command(message: str) -> bool:
     return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
 
 
+def is_create_listing_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    # Explicit create/sell commands
+    if msg in {"ilan oluştur", "ilan olustur", "ilan ver", "sat", "satıyorum", "satiyorum", "satmak istiyorum"}:
+        return True
+    return any(phrase in msg for phrase in [
+        "ilan oluştur",
+        "ilan olustur",
+        "ilan ver",
+        "satmak istiyorum",
+        "satıyorum",
+        "satiyorum",
+        "satacağım",
+        "satacagim",
+        "satışa koy",
+        "satisa koy",
+    ])
+
+
+def is_search_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    # Common Turkish search/browse phrases
+    if any(phrase in msg for phrase in [
+        "arıyorum",
+        "ariyorum",
+        "benzer ara",
+        "benzerini ara",
+        "benzer",
+        "ilan listele",
+        "ilanları listele",
+        "ilanlari listele",
+        "ilanlar",
+        "ilanları",
+        "ilanlari",
+        "listele",
+        "göster",
+        "goster",
+        "ara ",
+        " ara",
+        "bul ",
+        " bul",
+        "search",
+        "find",
+    ]):
+        return True
+
+    # Word-boundary guard for short verbs like "ara" and "bul" to avoid matching inside other words.
+    return bool(re.search(r"\b(ara|bul|listele|goster|göster)\b", msg))
+
+
+def is_browse_all_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return msg in {
+        "ilan listele",
+        "ilanları listele",
+        "ilanlari listele",
+        "ilanlar",
+        "ilanları",
+        "ilanlari",
+        "listele",
+        "ilanlari goster",
+        "ilanları göster",
+        "ilanları goster",
+        "ilanlari göster",
+        "ilanlari göster",
+        "ilanları goster",
+    }
+
+
 def is_confirm_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
@@ -550,6 +625,22 @@ async def process_webchat_message(
 
         # Get or determine intent
         intent = session.get("intent")
+
+        # Deterministic re-route for clear user commands (prevents "sticky" small_talk from blocking tasks)
+        # Precedence: publish/delete (handled above) > media(create_listing) > explicit create/search.
+        if not has_media_context:
+            override_intent = None
+            if is_create_listing_command(message_body):
+                override_intent = "create_listing"
+            elif is_search_command(message_body):
+                override_intent = "search_listings"
+            if override_intent and override_intent != intent:
+                intent = override_intent
+                session["intent"] = intent
+                session_dirty = True
+                if not redis_disabled:
+                    await redis_client.set_intent(session_id, intent)
+
         if has_media_context and intent != "create_listing":
             intent = "create_listing"
             session["intent"] = intent
@@ -647,6 +738,35 @@ async def process_webchat_message(
             })
         
         elif intent == "search_listings":
+            # Handle simple "ilan listele" style requests deterministically.
+            if is_browse_all_command(message_body):
+                from services import supabase_client
+                listings = await supabase_client.search_listings(limit=5)
+                LAST_SEARCH_CACHE[session_id] = listings
+                if not listings:
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Şu anda listelenecek aktif ilan bulunamadı.",
+                        "data": {"type": "search_results", "listings": [], "count": 0},
+                        "intent": intent
+                    })
+
+                msg_lines = [f"🔍 Son {len(listings)} ilan:"]
+                for idx, listing in enumerate(listings, 1):
+                    title = listing.get("title") or "Başlıksız"
+                    price = listing.get("price")
+                    price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
+                    category = listing.get("category") or "Kategori yok"
+                    msg_lines.append(f"{idx}. {title} - {price_txt} - {category}")
+
+                msg_lines.append("Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
+                return await finalize_response({
+                    "success": True,
+                    "message": "\n".join(msg_lines),
+                    "data": {"type": "search_results", "listings": listings, "count": len(listings)},
+                    "intent": intent
+                })
+
             # If user asks to show previous search results, reuse cache
             lower_msg = message_body.lower()
             if any(k in lower_msg for k in ["göster", "detay", "ilanı", "ilanin"]) and LAST_SEARCH_CACHE.get(session_id):

@@ -8,8 +8,67 @@ from twilio.twiml.messaging_response import MessagingResponse
 from services import redis_client
 from agents import IntentRouterAgent, ComposerAgent, PublishDeleteAgent, SearchComposerAgent, SmallTalkAgent
 import uuid
+import re
 
 router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
+
+
+def is_publish_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in ["yayınla", "yayina", "publish", "yayınlamak"])
+
+
+def is_delete_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
+
+
+def is_create_listing_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if msg in {"ilan oluştur", "ilan olustur", "ilan ver", "sat", "satıyorum", "satiyorum", "satmak istiyorum"}:
+        return True
+    return any(phrase in msg for phrase in [
+        "ilan oluştur",
+        "ilan olustur",
+        "ilan ver",
+        "satmak istiyorum",
+        "satıyorum",
+        "satiyorum",
+        "satacağım",
+        "satacagim",
+        "satışa koy",
+        "satisa koy",
+    ])
+
+
+def is_search_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if any(phrase in msg for phrase in [
+        "arıyorum",
+        "ariyorum",
+        "benzer",
+        "ilan listele",
+        "ilanları listele",
+        "ilanlari listele",
+        "ilanlar",
+        "ilanları",
+        "ilanlari",
+        "listele",
+        "göster",
+        "goster",
+        "search",
+        "find",
+    ]):
+        return True
+    return bool(re.search(r"\b(ara|bul|listele|goster|göster)\b", msg))
 
 
 async def get_or_create_session(phone_number: str) -> str:
@@ -51,9 +110,25 @@ async def process_whatsapp_message(
         # Get or create session
         session_id = await get_or_create_session(from_number)
         session = await redis_client.get_session(session_id)
+
+        # Deterministic intent override each message (prevents sticky small_talk from blocking tasks)
+        current_intent = session.get("intent")
+        override_intent = None
+        if is_publish_command(message_body) or is_delete_command(message_body):
+            override_intent = "publish_or_delete"
+        elif media_url is not None or is_create_listing_command(message_body):
+            override_intent = "create_listing"
+        elif is_search_command(message_body):
+            override_intent = "search_listings"
+
+        if override_intent and override_intent != current_intent:
+            intent = override_intent
+            await redis_client.set_intent(session_id, intent)
+            session["intent"] = intent
+        else:
+            intent = current_intent
         
         # Get or determine intent
-        intent = session.get("intent")
         if not intent:
             # First message - classify intent
             router_agent = IntentRouterAgent()
