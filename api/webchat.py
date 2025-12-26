@@ -70,9 +70,30 @@ def build_draft_status_message(draft: Dict[str, Any]) -> str:
     if not images:
         missing.append("ürün fotoğrafları")
 
+        vision = draft.get("vision_product")
+        vision_lines: List[str] = []
+        if isinstance(vision, dict):
+            vision_category = vision.get("category")
+            vision_condition = vision.get("condition")
+            features = vision.get("features")
+            if vision_category and not category:
+                add_line("Kategori", vision_category)
+            if vision_category:
+                vision_lines.append(f"Ürün türü: {vision_category}")
+            if vision_condition:
+                vision_lines.append(f"Durum: {vision_condition}")
+            if isinstance(features, list) and features:
+                top_features = ", ".join(features[:3])
+                vision_lines.append(f"Öne çıkan özellikler: {top_features}")
+            elif isinstance(features, str) and features:
+                vision_lines.append(f"Öne çıkan özellikler: {features}")
+
     message_parts = ["📋 Taslak durumu güncellendi."]
     if summary_lines:
         message_parts.append("\n".join(summary_lines))
+
+        if vision_lines:
+            message_parts.append("🔎 Görsel analizi:\n" + "\n".join(f"• {line}" for line in vision_lines))
 
     if missing:
         message_parts.append(
@@ -92,6 +113,7 @@ class ChatMessage(BaseModel):
     message: str
     user_id: Optional[str] = None
     media_url: Optional[str] = None
+    media_urls: Optional[List[str]] = None
 
 
 class ChatResponse(BaseModel):
@@ -378,7 +400,8 @@ async def send_message(chat_message: ChatMessage):
         message_body=chat_message.message,
         session_id=chat_message.session_id,
         user_id=chat_message.user_id,
-        media_url=chat_message.media_url
+        media_url=chat_message.media_url,
+        media_urls=chat_message.media_urls
     )
     
     # Store response in history
