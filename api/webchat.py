@@ -14,6 +14,20 @@ import re
 # In-memory cache for last search results (when Redis is disabled)
 LAST_SEARCH_CACHE: Dict[str, list] = {}
 
+# UUID helper for anonymous web users
+UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def normalize_user_id(raw_id: Optional[str]) -> str:
+    """Ensure we always operate with a valid UUID (required by Supabase)."""
+    if raw_id:
+        try:
+            return str(uuid.UUID(str(raw_id)))
+        except (ValueError, AttributeError, TypeError):
+            # Deterministically hash non-UUID identifiers (e.g., web_user_x) to stable UUIDs
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, str(raw_id)))
+    return str(uuid.uuid4())
+
 router = APIRouter(prefix="/webchat", tags=["webchat"])
 
 
@@ -85,8 +99,11 @@ async def process_webchat_message(
                 "intent": None,
                 "active_draft_id": None
             }
-        if not session.get("user_id"):
-            session["user_id"] = user_id or str(uuid.uuid4())
+
+        raw_user_id = session.get("user_id") or user_id
+        normalized_user_id = normalize_user_id(raw_user_id)
+        session["user_id"] = normalized_user_id
+        user_id = normalized_user_id
         # Persist only if redis is enabled
         if not getattr(redis_client, "disabled", False):
             await redis_client.set_session(session_id, session)

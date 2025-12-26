@@ -27,6 +27,26 @@ class SupabaseClient:
     async def create_draft(self, user_id: str, phone_number: str) -> Dict[str, Any]:
         """Create a new draft listing aligned to active_drafts schema."""
         try:
+            # Reuse existing draft if one is already in progress for this user
+            existing = (self.client.table("active_drafts")
+                        .select("*")
+                        .eq("user_id", user_id)
+                        .order("created_at", desc=True)
+                        .limit(1)
+                        .execute())
+            if existing.data:
+                draft = existing.data[0]
+                if draft.get("state") != "in_progress":
+                    try:
+                        self.client.table("active_drafts").update({
+                            "state": "in_progress"
+                        }).eq("id", draft["id"]).execute()
+                        draft["state"] = "in_progress"
+                    except Exception as state_err:
+                        logger.warning(f"Failed to refresh draft state for {draft['id']}: {state_err}")
+                logger.info(f"Reusing existing draft {draft['id']} for user {user_id}")
+                return draft
+
             listing_data = {
                 "title": None,
                 "description": None,
@@ -48,6 +68,18 @@ class SupabaseClient:
             
             raise Exception("Failed to create draft")
         except Exception as e:
+            # Handle race condition: another draft may have been created after the initial check
+            error_text = str(e)
+            if "duplicate key value" in error_text and "active_drafts_user_id_key" in error_text:
+                logger.warning(f"Draft already exists for user {user_id}, returning latest draft")
+                fallback = (self.client.table("active_drafts")
+                            .select("*")
+                            .eq("user_id", user_id)
+                            .order("created_at", desc=True)
+                            .limit(1)
+                            .execute())
+                if fallback.data:
+                    return fallback.data[0]
             logger.error(f"Error creating draft: {e}")
             raise
     
