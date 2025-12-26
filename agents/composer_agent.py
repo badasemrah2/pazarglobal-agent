@@ -103,10 +103,25 @@ class ComposerAgent(BaseAgent):
             # ALWAYS run all agents in parallel for create_listing intent
             # Each agent's system prompt determines what updates it should make
             # This ensures comprehensive listing data extraction from any user message
-            tasks = [
-                self.title_agent.run(user_message, context),
-                self.description_agent.run(user_message, context)
-            ]
+            # If the user message is just a flow command (e.g., "ilan oluştur") and we already have media,
+            # avoid generating random titles/descriptions from empty text. Let ImageAgent / vision fill them.
+            normalized_msg = (user_message or "").strip().lower()
+            is_command_only = normalized_msg in {
+                "ilan oluştur",
+                "ilan olustur",
+                "ilan",
+                "başlat",
+                "baslat",
+                "devam",
+                "devam et",
+            }
+
+            tasks = []
+            if not (is_command_only and all_media_urls):
+                tasks.extend([
+                    self.title_agent.run(user_message, context),
+                    self.description_agent.run(user_message, context)
+                ])
 
             # Only run PriceAgent when user actually provided a price signal.
             # This prevents hallucinated or cached prices from being (re)written on commands like "ilan oluştur".

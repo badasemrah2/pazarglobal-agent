@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from loguru import logger
 from services import redis_client, openai_client
+from config import settings
+from tools import publish_listing_tool, get_wallet_balance_tool
 from agents import IntentRouterAgent, ComposerAgent, PublishDeleteAgent, SearchComposerAgent, SmallTalkAgent
 import json
 import uuid
@@ -77,6 +79,163 @@ def is_delete_command(message: str) -> bool:
     if not msg:
         return False
     return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
+
+
+def is_confirm_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    # Common confirmations + typos
+    return any(token in msg for token in [
+        "onayla",
+        "onaylıyorum",
+        "onayliyorum",
+        "onay",
+        "evet",
+        "tamam",
+        "olur",
+        "ok",
+        "okay",
+        "onyalıyorum",
+        "onyaliyorum",
+    ])
+
+
+def is_cancel_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in ["iptal", "vazgeç", "vazgec", "hayır", "hayir", "boşver", "bosver"])
+
+
+def draft_is_publishable(draft: Dict[str, Any]) -> bool:
+    listing = (draft or {}).get("listing_data") or {}
+    images = (draft or {}).get("images") or []
+    if not (listing.get("title") and str(listing.get("title")).strip()):
+        return False
+    if not (listing.get("description") and str(listing.get("description")).strip()):
+        return False
+    if listing.get("price") is None:
+        return False
+    if not (listing.get("category") and str(listing.get("category")).strip()):
+        return False
+    if not images:
+        return False
+    return True
+
+
+async def handle_publish_or_delete_flow(
+    message_body: str,
+    session_id: str,
+    session: Dict[str, Any],
+    user_id: str,
+    redis_disabled: bool,
+    session_dirty: bool
+) -> Dict[str, Any]:
+    """Deterministic publish flow (no LLM): avoids looping confirmations and fake costs."""
+
+    # Only support publish for now (delete can be added similarly)
+    draft_id = session.get("active_draft_id")
+    if not draft_id:
+        return {
+            "success": False,
+            "message": "Aktif bir taslak bulunamadı. Önce 'ilan oluştur' ile taslak başlatın.",
+            "data": {"type": "publish_delete"},
+            "intent": "publish_or_delete"
+        }
+
+    # Read draft
+    from services import supabase_client
+    draft = await supabase_client.get_draft(draft_id)
+    if not draft:
+        return {
+            "success": False,
+            "message": "Taslak bulunamadı. Lütfen yeniden deneyin.",
+            "data": {"type": "publish_delete"},
+            "intent": "publish_or_delete"
+        }
+
+    # Pending confirmation state
+    pending = session.get("pending_publish")
+    if isinstance(pending, dict) and pending.get("draft_id") == draft_id:
+        if is_cancel_command(message_body):
+            session.pop("pending_publish", None)
+            session_dirty = True
+            return {
+                "success": True,
+                "message": "Yayınlama işlemi iptal edildi.",
+                "data": {"type": "publish_delete"},
+                "intent": "publish_or_delete",
+                "_session_dirty": session_dirty
+            }
+
+        if is_confirm_command(message_body):
+            cost = int(pending.get("cost") or settings.listing_credit_cost)
+            result = await publish_listing_tool.execute(draft_id=draft_id, user_id=user_id, credit_cost=cost)
+            if result.get("success"):
+                # Clear session state after publish
+                session.pop("pending_publish", None)
+                session["active_draft_id"] = None
+                session["intent"] = None
+                session_dirty = True
+                listing_id = (result.get("data") or {}).get("listing_id")
+                return {
+                    "success": True,
+                    "message": f"İlan yayınlandı. İlan ID: {listing_id}" if listing_id else "İlan yayınlandı.",
+                    "data": {"type": "publish_delete", "listing_id": listing_id},
+                    "intent": "publish_or_delete",
+                    "_session_dirty": session_dirty
+                }
+            return {
+                "success": False,
+                "message": result.get("error") or "Yayınlama başarısız oldu.",
+                "data": {"type": "publish_delete"},
+                "intent": "publish_or_delete",
+                "_session_dirty": session_dirty
+            }
+
+        # If pending exists but user didn't confirm/cancel, re-prompt succinctly.
+        cost = int(pending.get("cost") or settings.listing_credit_cost)
+        return {
+            "success": True,
+            "message": f"Yayınlama ücreti {cost} kredi. Onaylıyorsanız 'onayla', vazgeçmek için 'iptal' yazın.",
+            "data": {"type": "publish_delete"},
+            "intent": "publish_or_delete",
+            "_session_dirty": session_dirty
+        }
+
+    # Not pending: if draft incomplete, show what is missing
+    if not draft_is_publishable(draft):
+        return {
+            "success": True,
+            "message": build_draft_status_message(draft),
+            "data": {"type": "draft_update"},
+            "intent": "create_listing",
+            "_session_dirty": session_dirty
+        }
+
+    # If user said publish (or we are in publish intent), ask a single confirmation
+    balance_result = await get_wallet_balance_tool.execute(user_id=user_id)
+    balance = None
+    if balance_result.get("success"):
+        balance = (balance_result.get("data") or {}).get("balance")
+    cost = int(settings.listing_credit_cost)
+
+    # If user is just saying publish/onay, start confirmation step
+    session["pending_publish"] = {"draft_id": draft_id, "cost": cost}
+    session_dirty = True
+
+    balance_text = f"Mevcut bakiyeniz: {balance} kredi. " if balance is not None else ""
+    return {
+        "success": True,
+        "message": (
+            f"İlanı yayınlamak üzeresiniz. {balance_text}Yayınlama ücreti: {cost} kredi. "
+            "Onaylıyorsanız 'onayla', vazgeçmek için 'iptal' yazın."
+        ),
+        "data": {"type": "publish_delete", "draft_id": draft_id, "credit_cost": cost},
+        "intent": "publish_or_delete",
+        "_session_dirty": session_dirty
+    }
 
 
 async def analyze_media_with_vision(media_urls: List[str]) -> List[Dict[str, Any]]:
@@ -463,29 +622,28 @@ async def process_webchat_message(
                 })
         
         elif intent == "publish_or_delete":
-            agent = PublishDeleteAgent()
-            result = await agent.run(
-                user_message=message_body,
-                context={
-                    "user_id": session.get("user_id"),
-                    "draft_id": session.get("active_draft_id")
-                }
+            # Deterministic publish/delete flow to avoid looping confirmations and hallucinated fees.
+            publish_payload = await handle_publish_or_delete_flow(
+                message_body=message_body,
+                session_id=session_id,
+                session=session,
+                user_id=session.get("user_id"),
+                redis_disabled=redis_disabled,
+                session_dirty=session_dirty
             )
-            # Guard against unexpected None/invalid result
-            if not result or not isinstance(result, dict):
-                return await finalize_response({
-                    "success": False,
-                    "message": "Internal error: publish/delete failed",
-                    "data": None,
-                    "intent": intent
-                })
+
+            # propagate session_dirty back to outer finalize
+            if publish_payload.pop("_session_dirty", False):
+                session_dirty = True
 
             response_data["type"] = "publish_delete"
+            if isinstance(publish_payload.get("data"), dict):
+                response_data.update(publish_payload["data"])
             return await finalize_response({
-                "success": result.get("success", False),
-                "message": result.get("response", ""),
+                "success": publish_payload.get("success", False),
+                "message": publish_payload.get("message", ""),
                 "data": response_data,
-                "intent": intent
+                "intent": publish_payload.get("intent")
             })
         
         elif intent == "search_listings":

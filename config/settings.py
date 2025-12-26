@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
     max_draft_age_hours: int = 24
-    listing_credit_cost: int = 1
+    listing_credit_cost: int = 55
     
     # Rate Limiting
     rate_limit_per_minute: int = 60
