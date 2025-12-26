@@ -51,7 +51,7 @@ Railway dashboard → "Variables" sekmesine gidin ve şunları ekleyin:
 ```
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4-turbo-preview
-OPENAI_VISION_MODEL=gpt-4-vision-preview
+OPENAI_VISION_MODEL=gpt-4o-mini
 ```
 
 #### Supabase

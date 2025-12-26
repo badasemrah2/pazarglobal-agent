@@ -11,6 +11,7 @@ from .image_agent import ImageAgent
 from typing import Dict, Any, List
 from loguru import logger
 import asyncio
+import re
 
 
 class ComposerAgent(BaseAgent):
@@ -73,6 +74,15 @@ class ComposerAgent(BaseAgent):
                     }
                 draft_id = result["data"]["draft_id"]
                 logger.info(f"Created new draft: {draft_id}")
+
+                # If the user is starting from fresh media, reset the (reused) draft so old fields
+                # like price/title don't leak into the new flow.
+                if all_media_urls:
+                    try:
+                        from services import supabase_client
+                        await supabase_client.reset_draft(draft_id, phone_number=phone_number)
+                    except Exception as reset_err:
+                        logger.warning(f"Failed to reset draft {draft_id}: {reset_err}")
             
             # Always read current draft state before updates
             current_draft = await read_draft_tool.execute(draft_id=draft_id)
@@ -95,9 +105,16 @@ class ComposerAgent(BaseAgent):
             # This ensures comprehensive listing data extraction from any user message
             tasks = [
                 self.title_agent.run(user_message, context),
-                self.description_agent.run(user_message, context),
-                self.price_agent.run(user_message, context)
+                self.description_agent.run(user_message, context)
             ]
+
+            # Only run PriceAgent when user actually provided a price signal.
+            # This prevents hallucinated or cached prices from being (re)written on commands like "ilan oluştur".
+            msg = (user_message or "").lower()
+            has_price_number = bool(re.search(r"\b\d{2,}\b", msg))
+            has_currency_hint = any(tok in msg for tok in ["₺", "tl", "try", "lira", "fiyat"])
+            if has_price_number and has_currency_hint:
+                tasks.append(self.price_agent.run(user_message, context))
             
             # Add image agent for each media URL provided
             if all_media_urls:

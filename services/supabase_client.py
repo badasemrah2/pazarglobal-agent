@@ -82,6 +82,33 @@ class SupabaseClient:
                     return fallback.data[0]
             logger.error(f"Error creating draft: {e}")
             raise
+
+    async def reset_draft(self, draft_id: str, phone_number: Optional[str] = None) -> bool:
+        """Reset an existing draft to a clean state.
+
+        This is used when the platform enforces a single in-progress draft per user,
+        but the user is clearly starting a brand-new listing flow.
+        """
+        try:
+            listing_data = {
+                "title": None,
+                "description": None,
+                "price": None,
+                "category": None,
+            }
+            if phone_number:
+                listing_data["contact_phone"] = phone_number
+
+            result = self.client.table("active_drafts").update({
+                "state": "in_progress",
+                "listing_data": listing_data,
+                "images": [],
+                "vision_product": {}
+            }).eq("id", draft_id).execute()
+            return bool(result.data)
+        except Exception as e:
+            logger.error(f"Error resetting draft: {e}")
+            return False
     
     async def get_draft(self, draft_id: str) -> Optional[Dict[str, Any]]:
         """Get draft by ID"""

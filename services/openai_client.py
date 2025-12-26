@@ -91,7 +91,21 @@ class OpenAIClient:
             response = await self.client.chat.completions.create(**params)
             return response
         except Exception as e:
+            error_text = str(e)
             logger.error(f"Error creating vision completion: {e}")
+
+            # Fallback: if deployment still points to a deprecated vision model via env,
+            # retry with a known-good current model.
+            if ("model_not_found" in error_text) or ("deprecated" in error_text):
+                try:
+                    fallback_params = dict(params)
+                    fallback_params["model"] = "gpt-4o-mini"
+                    response = await self.client.chat.completions.create(**fallback_params)
+                    return response
+                except Exception as fallback_error:
+                    logger.error(f"Vision fallback model failed: {fallback_error}")
+                    raise
+
             raise
     
     async def parse_tool_calls(self, response: Any) -> List[Dict[str, Any]]:

@@ -164,6 +164,7 @@ def build_draft_status_message(draft: Dict[str, Any]) -> str:
     images = draft.get("images") or []
     summary_lines: List[str] = []
     missing: List[str] = []
+    vision_lines: List[str] = []
 
     def add_line(label: str, value: str):
         if value:
@@ -199,23 +200,23 @@ def build_draft_status_message(draft: Dict[str, Any]) -> str:
     if not images:
         missing.append("ürün fotoğrafları")
 
-        vision = draft.get("vision_product")
-        vision_lines: List[str] = []
-        if isinstance(vision, dict):
-            vision_category = vision.get("category")
-            vision_condition = vision.get("condition")
-            features = vision.get("features")
-            if vision_category and not category:
-                add_line("Kategori", vision_category)
-            if vision_category:
-                vision_lines.append(f"Ürün türü: {vision_category}")
-            if vision_condition:
-                vision_lines.append(f"Durum: {vision_condition}")
-            if isinstance(features, list) and features:
-                top_features = ", ".join(features[:3])
+    vision = draft.get("vision_product")
+    if isinstance(vision, dict):
+        vision_category = vision.get("category") or vision.get("product")
+        vision_condition = vision.get("condition")
+        features = vision.get("features")
+        if vision_category and not category:
+            add_line("Kategori", str(vision_category))
+        if vision_category:
+            vision_lines.append(f"Ürün türü: {vision_category}")
+        if vision_condition:
+            vision_lines.append(f"Durum: {vision_condition}")
+        if isinstance(features, list) and features:
+            top_features = ", ".join([str(f) for f in features[:3] if f])
+            if top_features:
                 vision_lines.append(f"Öne çıkan özellikler: {top_features}")
-            elif isinstance(features, str) and features:
-                vision_lines.append(f"Öne çıkan özellikler: {features}")
+        elif isinstance(features, str) and features:
+            vision_lines.append(f"Öne çıkan özellikler: {features}")
 
     message_parts = ["📋 Taslak durumu güncellendi."]
     if summary_lines:
@@ -619,6 +620,11 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
 
     merged_urls = merge_unique_urls(session.get("pending_media_urls") or [], chat_message.media_urls)
     session["pending_media_urls"] = merged_urls
+
+    # Mark this session as starting a fresh listing draft if user proceeds to "ilan oluştur".
+    # This prevents older draft fields (like a cached price) from leaking into a new flow.
+    if not session.get("active_draft_id"):
+        session["start_fresh_draft"] = True
 
     analyses = await analyze_media_with_vision(chat_message.media_urls)
     session["pending_media_analysis"] = analyses

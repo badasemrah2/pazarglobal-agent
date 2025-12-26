@@ -36,50 +36,93 @@ class ProcessImageTool(BaseTool):
         if not draft_id:
             return self.format_error("missing_listing_id: draft_id is required")
         
+        # Always store the image URL first so drafts don't end up with "no photos"
+        # when vision analysis fails due to model/config issues.
+        stored_ok = await supabase_client.add_listing_image(draft_id, image_url, metadata={})
+
+        analysis: Dict[str, Any] = {}
+        analysis_text = "{}"
         try:
-            # Analyze image using OpenAI Vision
+            system_prompt = (
+                "You are a marketplace vision assistant that returns concise Turkish JSON. "
+                "Always respond with a single JSON object containing these keys: "
+                "product (string), category (string), condition (string), features (array of up to 5 short strings), "
+                "description (string), safety_flags (array of short warning strings). "
+                "Never return an empty object. If unsure, make your best guess."
+            )
+            user_prompt = "Görseldeki ürünü analiz et ve JSON alanlarını doldur."
+
             messages = [
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": "Analyze this product image. Determine: 1) Product category 2) Product condition 3) Key features visible 4) Any safety concerns. Respond in JSON format with keys: category, condition, features, safety_flags."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_url}
-                        }
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}}
                     ]
                 }
             ]
-            
-            response = await openai_client.create_vision_completion(messages)
+
+            response = await openai_client.create_vision_completion(
+                messages,
+                max_tokens=600,
+                response_format={"type": "json_object"}
+            )
             analysis_text = response.choices[0].message.content or "{}"
             try:
-                analysis = json.loads(analysis_text)
+                parsed = json.loads(analysis_text)
+                analysis = parsed if isinstance(parsed, dict) else {"summary": parsed}
             except Exception:
-                analysis = {"raw": analysis_text}
-            
-            # Store image in database (draft images array)
-            metadata = {"analysis": analysis}
-            await supabase_client.add_listing_image(draft_id, image_url, metadata)
-            
-            # Update category/vision_product if detected
-            detected_category = analysis.get("category") if isinstance(analysis, dict) else None
+                analysis = {"summary": analysis_text}
+        except Exception as vision_error:
+            analysis = {"error": str(vision_error)}
+
+        # Update image metadata with analysis (best-effort)
+        try:
+            await supabase_client.add_listing_image(draft_id, image_url, metadata={"analysis": analysis})
+        except Exception:
+            # If metadata update fails, keep the previously stored URL.
+            pass
+
+        # Best-effort: update category + vision_product for downstream draft summaries
+        try:
+            detected_category = ""
+            if isinstance(analysis, dict):
+                detected_category = str(analysis.get("category") or "").strip()
             await supabase_client.update_draft_category(
                 draft_id,
                 detected_category or "unspecified",
                 vision_product=analysis if isinstance(analysis, dict) else {"raw": analysis_text}
             )
-            
-            return self.format_success({
-                "image_url": image_url,
-                "analysis": analysis,
-                "stored": True
-            })
-        except Exception as e:
-            return self.format_error(f"Image processing failed: {str(e)}")
+        except Exception:
+            pass
+
+        # Best-effort: auto-fill title/description if empty using vision output
+        try:
+            draft = await supabase_client.get_draft(draft_id)
+            listing_data = (draft or {}).get("listing_data") or {}
+            title_missing = not (listing_data.get("title") or "").strip()
+            desc_missing = not (listing_data.get("description") or "").strip()
+
+            if isinstance(analysis, dict):
+                product = str(analysis.get("product") or analysis.get("category") or "").strip()
+                description = str(analysis.get("description") or "").strip()
+                features = analysis.get("features")
+                if desc_missing and (not description) and isinstance(features, list) and features:
+                    description = "Öne çıkan özellikler: " + ", ".join([str(f) for f in features[:5] if f])
+
+                if title_missing and product:
+                    await supabase_client.update_draft_title(draft_id, product[:100])
+                if desc_missing and description:
+                    await supabase_client.update_draft_description(draft_id, description)
+        except Exception:
+            pass
+
+        return self.format_success({
+            "image_url": image_url,
+            "analysis": analysis,
+            "stored": bool(stored_ok)
+        })
 
 
 # Tool instance
