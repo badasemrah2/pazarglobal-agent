@@ -131,9 +131,24 @@ class SearchComposerAgent(BaseAgent):
                     price = listing.get("price")
                     price_txt = f"{price} TL" if price is not None else "Fiyat belirtilmemiş"
                     category = listing.get("category") or "Kategori yok"
+                    image_url = None
+                    if listing.get("image_url"):
+                        image_url = listing["image_url"]
+                    elif listing.get("images") and isinstance(listing["images"], list) and listing["images"]:
+                        first_img = listing["images"][0]
+                        if isinstance(first_img, dict):
+                            image_url = first_img.get("image_url") or first_img.get("public_url")
+                        elif isinstance(first_img, str):
+                            image_url = first_img
+                    short_desc = (listing.get("description") or "")[:120]
                     msg_lines.append(f"{idx}. {title} - {price_txt} - {category}")
+                    if image_url:
+                        msg_lines.append(f"![{title}]({image_url})")
+                    if short_desc:
+                        msg_lines.append(short_desc + "...")
             if remaining > 0:
                 msg_lines.append(f"İlk {len(preview_listings)} tanesi gösterildi. Daha fazlası için söyleyin.")
+            msg_lines.append("Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
             msg = "\n".join(msg_lines)
 
             # Attach cache marker for frontend parsing

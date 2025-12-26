@@ -187,7 +187,7 @@ async def process_webchat_message(
         elif intent == "search_listings":
             # If user asks to show previous search results, reuse cache
             lower_msg = message_body.lower()
-            if any(k in lower_msg for k in ["göster", "detay"]) and LAST_SEARCH_CACHE.get(session_id):
+            if any(k in lower_msg for k in ["göster", "detay", "ilanı", "ilanin"]) and LAST_SEARCH_CACHE.get(session_id):
                 listings = LAST_SEARCH_CACHE.get(session_id, [])
                 idx_match = re.search(r"(\d+)", lower_msg)
                 idx = int(idx_match.group(1)) - 1 if idx_match else 0
@@ -199,27 +199,42 @@ async def process_webchat_message(
                     category = listing.get("category") or "Kategori yok"
                     location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
                     description = listing.get("description") or "Açıklama yok"
+                    # Trim uzun açıklama
+                    if len(description) > 600:
+                        description = description[:600] + "..."
                     owner = listing.get("user_name") or "Satıcı bilgisi yok"
                     phone = listing.get("user_phone") or "Telefon yok"
+                    # Görsel seçimi
                     image_url = listing.get("image_url")
+                    extra_images = []
                     if not image_url and listing.get("images") and isinstance(listing["images"], list):
                         first_img = listing["images"][0]
                         if isinstance(first_img, dict):
                             image_url = first_img.get("image_url") or first_img.get("public_url")
                         elif isinstance(first_img, str):
                             image_url = first_img
-                    detail_msg = f"""{title}
-{price_txt} - {category} - {location}
-Satıcı: {owner} | Telefon: {phone}
-
-Açıklama:
-{description}"""
-                    if image_url:
-                        detail_msg += f"\nGörsel: {image_url}"
+                        extra_images = [
+                            img.get("image_url") or img.get("public_url") or img
+                            for img in listing["images"][1:]
+                            if isinstance(img, (dict, str))
+                        ]
+                    detail_msg = f"![{title}]({image_url})\n" if image_url else ""
+                    detail_msg += f"**{title}**\n{price_txt} | {location} | {category}\nSatıcı: {owner} | Telefon: {phone}\n\nAçıklama:\n{description}"
+                    if extra_images:
+                        links = "\n".join([f"[Foto {i+2}]({url})" for i, url in enumerate(extra_images) if url])
+                        if links:
+                            detail_msg += f"\n\nEk görseller:\n{links}"
                     return {
                         "success": True,
                         "message": detail_msg,
                         "data": {"listing": listing, "type": "search_results"},
+                        "intent": intent
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": "Önce bir arama yapın ya da geçerli bir ilan numarası belirtin (örn: '1 nolu ilanın detayını göster').",
+                        "data": None,
                         "intent": intent
                     }
 
