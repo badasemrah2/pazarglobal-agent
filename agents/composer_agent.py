@@ -35,12 +35,23 @@ class ComposerAgent(BaseAgent):
         user_id: str,
         phone_number: str,
         draft_id: str = None,
-        media_url: str = None
+        media_url: str = None,
+        media_urls: list = None
     ) -> Dict[str, Any]:
         """
         Orchestrate the listing creation process.
+        
+        Args:
+            user_message: User's text message
+            user_id: User identifier
+            phone_number: Phone/session identifier
+            draft_id: Existing draft ID (optional)
+            media_url: Legacy single media URL parameter
+            media_urls: List of media URLs to process
         """
         try:
+            # Support both single and multiple media URLs
+            all_media_urls = media_urls or ([media_url] if media_url else [])
             # Create draft if not exists
             if not draft_id:
                 result = await create_draft_tool.execute(
@@ -79,10 +90,12 @@ class ComposerAgent(BaseAgent):
                 self.price_agent.run(user_message, context)
             ]
             
-            # Add image agent if media provided or if message mentions images
-            if media_url:
-                tasks.append(self.image_agent.run(media_url, context))
+            # Add image agent for each media URL provided
+            if all_media_urls:
+                for media_url_item in all_media_urls:
+                    tasks.append(self.image_agent.run(media_url_item, context))
             else:
+                # Also check if message mentions images without explicit URLs
                 message_lower = user_message.lower()
                 if any(word in message_lower for word in ["image", "photo", "resim", "fotoğraf", "görsel", "resim yükle"]):
                     tasks.append(self.image_agent.run(user_message, context))

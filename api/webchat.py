@@ -130,7 +130,8 @@ async def process_webchat_message(
     message_body: str,
     session_id: str,
     user_id: Optional[str] = None,
-    media_url: Optional[str] = None
+    media_url: Optional[str] = None,
+    media_urls: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Process webchat message and route to appropriate agent
@@ -139,12 +140,17 @@ async def process_webchat_message(
         message_body: Message text
         session_id: Session identifier
         user_id: User ID (optional)
-        media_url: Optional media URL
+        media_url: Optional single media URL (legacy)
+        media_urls: Optional list of media URLs
     
     Returns:
         Response dict
     """
     try:
+        # Support both single and multiple media URLs
+        all_media_urls = media_urls or (
+            [media_url] if media_url else []
+        )
         # Get or create session (safe even if redis is disabled)
         session = await redis_client.get_session(session_id)
         # Normalize session to dict to avoid attribute errors
@@ -186,12 +192,13 @@ async def process_webchat_message(
         # Route to appropriate agent
         if intent == "create_listing":
             composer = ComposerAgent()
+            # Pass all media URLs to composer, which can distribute to image agents
             result = await composer.orchestrate_listing_creation(
                 user_message=message_body,
                 user_id=session.get("user_id"),
                 phone_number=session_id,  # Use session_id as identifier
                 draft_id=session.get("active_draft_id"),
-                media_url=media_url
+                media_urls=all_media_urls  # Pass list of all media URLs
             )
             # Guard against unexpected None/invalid result
             if not result or not isinstance(result, dict):
