@@ -8,7 +8,7 @@ from .title_agent import TitleAgent
 from .description_agent import DescriptionAgent
 from .price_agent import PriceAgent
 from .image_agent import ImageAgent
-from typing import Dict, Any
+from typing import Dict, Any, List
 from loguru import logger
 import asyncio
 
@@ -52,6 +52,14 @@ class ComposerAgent(BaseAgent):
         try:
             # Support both single and multiple media URLs
             all_media_urls = media_urls or ([media_url] if media_url else [])
+            if all_media_urls:
+                deduped: List[str] = []
+                seen = set()
+                for url in all_media_urls:
+                    if url and url not in seen:
+                        deduped.append(url)
+                        seen.add(url)
+                all_media_urls = deduped
             # Create draft if not exists
             if not draft_id:
                 result = await create_draft_tool.execute(
@@ -78,7 +86,8 @@ class ComposerAgent(BaseAgent):
             # Context for all agents
             context = {
                 "draft_id": draft_id,
-                "user_id": user_id
+                "user_id": user_id,
+                "media_urls": all_media_urls
             }
             
             # ALWAYS run all agents in parallel for create_listing intent

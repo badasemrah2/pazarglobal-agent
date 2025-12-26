@@ -5,7 +5,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, De
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from loguru import logger
-from services import redis_client
+from services import redis_client, openai_client
 from agents import IntentRouterAgent, ComposerAgent, PublishDeleteAgent, SearchComposerAgent, SmallTalkAgent
 import json
 import uuid
@@ -13,6 +13,121 @@ import re
 
 # In-memory cache for last search results (when Redis is disabled)
 LAST_SEARCH_CACHE: Dict[str, list] = {}
+
+# Local session cache fallback when Redis is disabled
+IN_MEMORY_SESSION_CACHE: Dict[str, Dict[str, Any]] = {}
+
+MEDIA_ANALYSIS_PROMPT = (
+    "You are a marketplace vision assistant. For each image, describe the product, category, condition, and any key features or defects."
+)
+
+
+def redis_is_disabled() -> bool:
+    """Centralize redis enabled/disabled checks."""
+    return getattr(redis_client, "disabled", False)
+
+
+async def load_session_state(session_id: str) -> Optional[Dict[str, Any]]:
+    """Load session either from Redis or in-memory fallback."""
+    if redis_is_disabled():
+        return IN_MEMORY_SESSION_CACHE.get(session_id)
+    return await redis_client.get_session(session_id)
+
+
+async def persist_session_state(session_id: str, session: Dict[str, Any]) -> None:
+    """Persist session state regardless of backend availability."""
+    if redis_is_disabled():
+        IN_MEMORY_SESSION_CACHE[session_id] = session
+        return
+    await redis_client.set_session(session_id, session)
+
+
+def remove_session_state(session_id: str) -> None:
+    """Remove session from fallback cache when Redis is disabled."""
+    if redis_is_disabled():
+        IN_MEMORY_SESSION_CACHE.pop(session_id, None)
+
+
+def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
+    """Merge new media URLs while preserving order and removing duplicates."""
+    seen = set()
+    merged: List[str] = []
+    for url in existing + new_urls:
+        if url and url not in seen:
+            merged.append(url)
+            seen.add(url)
+    return merged
+
+
+async def analyze_media_with_vision(media_urls: List[str]) -> List[Dict[str, Any]]:
+    """Run OpenAI vision analysis for each media URL."""
+    analyses: List[Dict[str, Any]] = []
+    for url in media_urls:
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": MEDIA_ANALYSIS_PROMPT},
+                        {"type": "image_url", "image_url": {"url": url}}
+                    ]
+                }
+            ]
+            response = await openai_client.create_vision_completion(messages)
+            raw = response.choices[0].message.content or "{}"
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {"summary": raw}
+            analyses.append({"image_url": url, "analysis": parsed})
+        except Exception as exc:
+            analyses.append({"image_url": url, "analysis": {"error": str(exc)}})
+    return analyses
+
+
+def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
+    """Create a user-facing message summarizing media analyses."""
+    summary_lines: List[str] = []
+    for idx, entry in enumerate(analyses, 1):
+        analysis = entry.get("analysis") or {}
+        if not isinstance(analysis, dict):
+            analysis = {"summary": analysis}
+        parts: List[str] = []
+        product = analysis.get("product") or analysis.get("category")
+        if product:
+            parts.append(f"ürün: {product}")
+        condition = analysis.get("condition")
+        if condition:
+            parts.append(f"durum: {condition}")
+        features = analysis.get("features")
+        if isinstance(features, list) and features:
+            parts.append("özellikler: " + ", ".join(features[:3]))
+        elif isinstance(features, str) and features:
+            parts.append(f"özellikler: {features}")
+        safety = analysis.get("safety_flags")
+        if safety:
+            if isinstance(safety, list):
+                parts.append("uyarılar: " + ", ".join(safety))
+            else:
+                parts.append(f"uyarılar: {safety}")
+        if not parts:
+            fallback = analysis.get("summary") or analysis.get("description") or "Detay bulunamadı"
+            parts.append(str(fallback))
+        summary_lines.append(f"Fotoğraf {idx}: " + "; ".join(parts))
+
+    if not summary_lines:
+        summary_lines.append("Görseller analiz edilemedi.")
+
+    prompt_line = (
+        "Bu ürün için ne yapmak istersiniz? 'ilan oluştur' yazarak satış taslağı başlatabilir "
+        "veya 'benzer ara' yazarak benzer ürünleri inceleyebilirsiniz."
+    )
+
+    return "\n\n".join([
+        "🔎 Görsel analizi hazır!",
+        "\n".join(summary_lines),
+        prompt_line
+    ])
 
 # UUID helper for anonymous web users
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -116,6 +231,13 @@ class ChatMessage(BaseModel):
     media_urls: Optional[List[str]] = None
 
 
+class MediaAnalysisRequest(BaseModel):
+    """Media analysis request model"""
+    session_id: str
+    user_id: Optional[str] = None
+    media_urls: List[str]
+
+
 class ChatResponse(BaseModel):
     """Chat response model"""
     success: bool
@@ -168,44 +290,83 @@ async def process_webchat_message(
     Returns:
         Response dict
     """
+    async def _default_finalize(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return payload
+
+    finalize_response = _default_finalize
+
     try:
         # Support both single and multiple media URLs
-        all_media_urls = media_urls or (
-            [media_url] if media_url else []
-        )
-        # Get or create session (safe even if redis is disabled)
-        session = await redis_client.get_session(session_id)
-        # Normalize session to dict to avoid attribute errors
+        all_media_urls = media_urls or ([media_url] if media_url else [])
+        redis_disabled = redis_is_disabled()
+        session_dirty = False
+
+        # Get or create session regardless of Redis availability
+        session = await load_session_state(session_id)
         if session is None or not isinstance(session, dict):
             session = {
                 "user_id": user_id,
                 "intent": None,
-                "active_draft_id": None
+                "active_draft_id": None,
+                "pending_media_urls": []
             }
+            session_dirty = True
+        else:
+            # Make a shallow copy so we can mutate safely
+            session = dict(session)
+            if "pending_media_urls" not in session:
+                session["pending_media_urls"] = []
+                session_dirty = True
+
+        async def _finalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+            if session_dirty:
+                await persist_session_state(session_id, session)
+            return payload
+        finalize_response = _finalize_response
 
         raw_user_id = session.get("user_id") or user_id
         normalized_user_id = normalize_user_id(raw_user_id)
-        session["user_id"] = normalized_user_id
+        if session.get("user_id") != normalized_user_id:
+            session["user_id"] = normalized_user_id
+            session_dirty = True
         user_id = normalized_user_id
-        # Persist only if redis is enabled
-        if not getattr(redis_client, "disabled", False):
-            await redis_client.set_session(session_id, session)
         
         # Store message in history
-        if not getattr(redis_client, "disabled", False):
+        if not redis_disabled:
             await redis_client.add_message(session_id, {
                 "role": "user",
                 "content": message_body,
                 "timestamp": str(uuid.uuid1().time)
             })
-        
+
+        # Merge any newly provided media into session-level context
+        pending_media_urls = session.get("pending_media_urls") or []
+        if not isinstance(pending_media_urls, list):
+            pending_media_urls = []
+        if all_media_urls:
+            merged = merge_unique_urls(pending_media_urls, all_media_urls)
+            if merged != pending_media_urls:
+                session["pending_media_urls"] = merged
+                pending_media_urls = merged
+                session_dirty = True
+        all_media_urls = pending_media_urls
+        has_media_context = bool(all_media_urls)
+
         # Get or determine intent
         intent = session.get("intent")
+        if has_media_context and intent != "create_listing":
+            intent = "create_listing"
+            session["intent"] = intent
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, intent)
+
         if not intent:
             router_agent = IntentRouterAgent()
             intent = await router_agent.classify_intent(message_body)
             session["intent"] = intent
-            if not getattr(redis_client, "disabled", False):
+            session_dirty = True
+            if not redis_disabled:
                 await redis_client.set_intent(session_id, intent)
             logger.info(f"WebChat intent for {session_id}: {intent}")
         
@@ -224,17 +385,22 @@ async def process_webchat_message(
             )
             # Guard against unexpected None/invalid result
             if not result or not isinstance(result, dict):
-                return {
+                return await finalize_response({
                     "success": False,
                     "message": "Internal error: listing creation failed",
                     "data": None,
                     "intent": intent
-                }
+                })
 
             if result.get("success"):
-                session["active_draft_id"] = result["draft_id"]
-                if not getattr(redis_client, "disabled", False):
+                if session.get("active_draft_id") != result["draft_id"]:
+                    session["active_draft_id"] = result["draft_id"]
+                    session_dirty = True
+                if not redis_disabled:
                     await redis_client.set_active_draft(session_id, result["draft_id"])
+                if session.get("pending_media_urls"):
+                    session["pending_media_urls"] = []
+                    session_dirty = True
                 
                 draft = result["draft"]
                 response_text = build_draft_status_message(draft)
@@ -245,19 +411,19 @@ async def process_webchat_message(
                     "type": "draft_update"
                 })
                 
-                return {
+                return await finalize_response({
                     "success": True,
                     "message": response_text,
                     "data": response_data,
                     "intent": intent
-                }
+                })
             else:
-                return {
+                return await finalize_response({
                     "success": False,
                     "message": (result.get("error") if isinstance(result, dict) else "Failed to create listing"),
                     "data": None,
                     "intent": intent
-                }
+                })
         
         elif intent == "publish_or_delete":
             agent = PublishDeleteAgent()
@@ -270,20 +436,20 @@ async def process_webchat_message(
             )
             # Guard against unexpected None/invalid result
             if not result or not isinstance(result, dict):
-                return {
+                return await finalize_response({
                     "success": False,
                     "message": "Internal error: publish/delete failed",
                     "data": None,
                     "intent": intent
-                }
+                })
 
             response_data["type"] = "publish_delete"
-            return {
+            return await finalize_response({
                 "success": result.get("success", False),
                 "message": result.get("response", ""),
                 "data": response_data,
                 "intent": intent
-            }
+            })
         
         elif intent == "search_listings":
             # If user asks to show previous search results, reuse cache
@@ -325,30 +491,30 @@ async def process_webchat_message(
                         links = "\n".join([f"[Foto {i+2}]({url})" for i, url in enumerate(extra_images) if url])
                         if links:
                             detail_msg += f"\n\nEk görseller:\n{links}"
-                    return {
+                    return await finalize_response({
                         "success": True,
                         "message": detail_msg,
                         "data": {"listing": listing, "type": "search_results"},
                         "intent": intent
-                    }
+                    })
                 else:
-                    return {
+                    return await finalize_response({
                         "success": False,
                         "message": "Önce bir arama yapın ya da geçerli bir ilan numarası belirtin (örn: '1 nolu ilanın detayını göster').",
                         "data": None,
                         "intent": intent
-                    }
+                    })
 
             composer = SearchComposerAgent()
             result = await composer.orchestrate_search(message_body)
 
             if not result or not isinstance(result, dict):
-                return {
+                return await finalize_response({
                     "success": False,
                     "message": "Internal error: search failed",
                     "data": None,
                     "intent": intent
-                }
+                })
 
             response_data.update({
                 "listings": result.get("listings", []),
@@ -360,33 +526,33 @@ async def process_webchat_message(
             if result.get("listings_full") is not None:
                 LAST_SEARCH_CACHE[session_id] = result["listings_full"]
 
-            return {
+            return await finalize_response({
                 "success": result.get("success", False),
                 "message": result.get("message", "Search completed"),
                 "data": response_data,
                 "intent": intent
-            }
+            })
         
         else:  # small_talk
             agent = SmallTalkAgent()
             response = await agent.run_simple(message_body)
 
             response_data["type"] = "conversation"
-            return {
+            return await finalize_response({
                 "success": True,
                 "message": response or "",
                 "data": response_data,
                 "intent": intent
-            }
+            })
     
     except Exception as e:
         logger.error(f"WebChat message processing error: {e}")
-        return {
+        return await finalize_response({
             "success": False,
             "message": "An error occurred. Please try again.",
             "data": None,
             "intent": None
-        }
+        })
 
 
 @router.post("/message", response_model=ChatResponse)
@@ -412,6 +578,57 @@ async def send_message(chat_message: ChatMessage):
     })
     
     return ChatResponse(**result)
+
+
+@router.post("/media/analyze", response_model=ChatResponse)
+async def analyze_media(chat_message: MediaAnalysisRequest):
+    """Run vision analysis on uploaded media and prompt user for next action."""
+    if not chat_message.media_urls:
+        raise HTTPException(status_code=400, detail="media_urls is required")
+
+    session = await load_session_state(chat_message.session_id)
+    if session is None or not isinstance(session, dict):
+        session = {
+            "user_id": chat_message.user_id,
+            "intent": None,
+            "active_draft_id": None,
+            "pending_media_urls": []
+        }
+    else:
+        session = dict(session)
+        if "pending_media_urls" not in session:
+            session["pending_media_urls"] = []
+
+    raw_user_id = session.get("user_id") or chat_message.user_id
+    normalized_user_id = normalize_user_id(raw_user_id)
+    session["user_id"] = normalized_user_id
+
+    merged_urls = merge_unique_urls(session.get("pending_media_urls") or [], chat_message.media_urls)
+    session["pending_media_urls"] = merged_urls
+
+    analyses = await analyze_media_with_vision(chat_message.media_urls)
+    session["pending_media_analysis"] = analyses
+    message_text = format_media_analysis_message(analyses)
+
+    await persist_session_state(chat_message.session_id, session)
+
+    if not redis_is_disabled():
+        await redis_client.add_message(chat_message.session_id, {
+            "role": "assistant",
+            "content": message_text,
+            "timestamp": str(uuid.uuid1().time)
+        })
+
+    return ChatResponse(
+        success=True,
+        message=message_text,
+        data={
+            "type": "media_analysis",
+            "analyses": analyses,
+            "pending_media_urls": merged_urls
+        },
+        intent=session.get("intent")
+    )
 
 
 @router.websocket("/ws/{session_id}")
@@ -472,7 +689,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 @router.get("/session/{session_id}")
 async def get_session(session_id: str):
     """Get session information"""
-    session = await redis_client.get_session(session_id)
+    session = await load_session_state(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -498,10 +715,11 @@ async def create_session(user_id: Optional[str] = None):
     """Create a new chat session"""
     session_id = f"web_{uuid.uuid4()}"
     
-    await redis_client.set_session(session_id, {
+    await persist_session_state(session_id, {
         "user_id": user_id or str(uuid.uuid4()),
         "intent": None,
-        "active_draft_id": None
+        "active_draft_id": None,
+        "pending_media_urls": []
     })
     
     return {
@@ -513,8 +731,10 @@ async def create_session(user_id: Optional[str] = None):
 @router.delete("/session/{session_id}")
 async def delete_session(session_id: str):
     """Delete a chat session"""
-    success = await redis_client.delete_session(session_id)
-    
-    if success:
-        return {"message": "Session deleted successfully"}
-    raise HTTPException(status_code=404, detail="Session not found")
+    existing = await load_session_state(session_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Session not found")
+    remove_session_state(session_id)
+    if not redis_is_disabled():
+        await redis_client.delete_session(session_id)
+    return {"message": "Session deleted successfully"}
