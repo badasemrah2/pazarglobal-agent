@@ -122,14 +122,11 @@ class SupabaseClient:
     async def update_draft_title(self, draft_id: str, title: str) -> bool:
         """Update draft title inside listing_data"""
         try:
-            draft = await self.get_draft(draft_id)
-            if not draft:
-                return False
-            listing_data = draft.get("listing_data") or {}
-            listing_data["title"] = title
-            result = self.client.table("active_drafts").update({
-                "listing_data": listing_data
-            }).eq("id", draft_id).execute()
+            result = self.client.rpc("update_listing_field", {
+                "listing_id": draft_id,
+                "field_name": "title",
+                "field_value": title
+            }).execute()
             return bool(result.data)
         except Exception as e:
             logger.error(f"Error updating title: {e}")
@@ -138,14 +135,11 @@ class SupabaseClient:
     async def update_draft_description(self, draft_id: str, description: str) -> bool:
         """Update draft description inside listing_data"""
         try:
-            draft = await self.get_draft(draft_id)
-            if not draft:
-                return False
-            listing_data = draft.get("listing_data") or {}
-            listing_data["description"] = description
-            result = self.client.table("active_drafts").update({
-                "listing_data": listing_data
-            }).eq("id", draft_id).execute()
+            result = self.client.rpc("update_listing_field", {
+                "listing_id": draft_id,
+                "field_name": "description",
+                "field_value": description
+            }).execute()
             return bool(result.data)
         except Exception as e:
             logger.error(f"Error updating description: {e}")
@@ -154,14 +148,11 @@ class SupabaseClient:
     async def update_draft_price(self, draft_id: str, price: float) -> bool:
         """Update draft price inside listing_data"""
         try:
-            draft = await self.get_draft(draft_id)
-            if not draft:
-                return False
-            listing_data = draft.get("listing_data") or {}
-            listing_data["price"] = price
-            result = self.client.table("active_drafts").update({
-                "listing_data": listing_data
-            }).eq("id", draft_id).execute()
+            result = self.client.rpc("update_listing_field", {
+                "listing_id": draft_id,
+                "field_name": "price",
+                "field_value": price
+            }).execute()
             return bool(result.data)
         except Exception as e:
             logger.error(f"Error updating price: {e}")
@@ -170,18 +161,18 @@ class SupabaseClient:
     async def update_draft_category(self, draft_id: str, category: str, vision_product: Dict[str, Any] = None) -> bool:
         """Update draft category inside listing_data and optionally vision_product"""
         try:
-            draft = await self.get_draft(draft_id)
-            if not draft:
-                return False
-            listing_data = draft.get("listing_data") or {}
-            listing_data["category"] = category
-            update_payload = {
-                "listing_data": listing_data
-            }
+            rpc_result = self.client.rpc("update_listing_field", {
+                "listing_id": draft_id,
+                "field_name": "category",
+                "field_value": category
+            }).execute()
+
             if vision_product is not None:
-                update_payload["vision_product"] = vision_product
-            result = self.client.table("active_drafts").update(update_payload).eq("id", draft_id).execute()
-            return bool(result.data)
+                self.client.table("active_drafts").update({
+                    "vision_product": vision_product
+                }).eq("id", draft_id).execute()
+
+            return bool(rpc_result.data)
         except Exception as e:
             logger.error(f"Error updating category: {e}")
             return False
