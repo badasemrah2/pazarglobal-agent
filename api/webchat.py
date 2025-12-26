@@ -17,8 +17,14 @@ LAST_SEARCH_CACHE: Dict[str, list] = {}
 # Local session cache fallback when Redis is disabled
 IN_MEMORY_SESSION_CACHE: Dict[str, Dict[str, Any]] = {}
 
-MEDIA_ANALYSIS_PROMPT = (
-    "You are a marketplace vision assistant. For each image, describe the product, category, condition, and any key features or defects."
+MEDIA_ANALYSIS_SYSTEM_PROMPT = (
+    "You are a marketplace vision assistant that returns concise Turkish JSON. Always respond with a single JSON object containing these keys: "
+    "product (string), category (string), condition (string), features (array of up to 5 short strings), description (string), "
+    "safety_flags (array of short warning strings, empty array when no issues). If you are unsure, set the field to an empty string or empty array."
+)
+
+MEDIA_ANALYSIS_USER_PROMPT = (
+    "Lütfen görseldeki ürünü analiz et ve yukarıdaki JSON şemasını doldur. Ürünün türünü, olası kullanım alanını, durumunu ve dikkat çeken özelliklerini belirt."
 )
 
 
@@ -66,14 +72,22 @@ async def analyze_media_with_vision(media_urls: List[str]) -> List[Dict[str, Any
         try:
             messages = [
                 {
+                    "role": "system",
+                    "content": MEDIA_ANALYSIS_SYSTEM_PROMPT
+                },
+                {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": MEDIA_ANALYSIS_PROMPT},
+                        {"type": "text", "text": MEDIA_ANALYSIS_USER_PROMPT},
                         {"type": "image_url", "image_url": {"url": url}}
                     ]
                 }
             ]
-            response = await openai_client.create_vision_completion(messages)
+            response = await openai_client.create_vision_completion(
+                messages,
+                max_tokens=600,
+                response_format={"type": "json_object"}
+            )
             raw = response.choices[0].message.content or "{}"
             try:
                 parsed = json.loads(raw)

@@ -65,7 +65,8 @@ class OpenAIClient:
         self,
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None
     ) -> Any:
         """
         Create a vision completion for image analysis
@@ -79,11 +80,15 @@ class OpenAIClient:
             OpenAI ChatCompletion response
         """
         try:
-            response = await self.client.chat.completions.create(
-                model=model or settings.openai_vision_model,
-                messages=messages,
-                max_tokens=max_tokens or 500
-            )
+            params: Dict[str, Any] = {
+                "model": model or settings.openai_vision_model,
+                "messages": messages,
+                "max_tokens": max_tokens or 500
+            }
+            if response_format:
+                params["response_format"] = response_format
+
+            response = await self.client.chat.completions.create(**params)
             return response
         except Exception as e:
             logger.error(f"Error creating vision completion: {e}")

@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     
     # OpenAI Configuration
     openai_api_key: str
-    openai_model: str = "gpt-4-turbo-preview"
-    openai_vision_model: str = "gpt-4-vision-preview"
+    openai_model: str = "gpt-4o"
+    openai_vision_model: str = "gpt-4o-mini"
     openai_temperature: float = 0.7
     openai_max_tokens: int = 1500
     
