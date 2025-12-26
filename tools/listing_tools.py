@@ -40,7 +40,7 @@ class PublishListingTool(BaseTool):
         if listing:
             return self.format_success({
                 "listing_id": listing["id"],
-                "message": "Listing published successfully"
+                "message": "İlan başarıyla yayınlandı"
             })
         return self.format_error("Failed to publish listing")
 
@@ -73,7 +73,7 @@ class DeleteListingTool(BaseTool):
     async def execute(self, listing_id: str, user_id: str = None) -> Dict[str, Any]:
         success = await supabase_client.delete_listing(listing_id, user_id=user_id)
         if success:
-            return self.format_success({"message": "Listing deleted successfully"})
+            return self.format_success({"message": "İlan silindi"})
         return self.format_error("Failed to delete listing")
 
 

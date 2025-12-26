@@ -65,6 +65,20 @@ def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
     return merged
 
 
+def is_publish_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in ["yayınla", "yayınla!", "yayina", "publish", "yayınlamak"])
+
+
+def is_delete_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
+
+
 async def analyze_media_with_vision(media_urls: List[str]) -> List[Dict[str, Any]]:
     """Run OpenAI vision analysis for each media URL."""
     analyses: List[Dict[str, Any]] = []
@@ -345,6 +359,14 @@ async def process_webchat_message(
             session["user_id"] = normalized_user_id
             session_dirty = True
         user_id = normalized_user_id
+
+        # If user issues a publish/delete command, override any sticky intent.
+        # Otherwise the session may remain in create_listing and never reach PublishDeleteAgent.
+        if is_publish_command(message_body) or is_delete_command(message_body):
+            session["intent"] = "publish_or_delete"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, "publish_or_delete")
         
         # Store message in history
         if not redis_disabled:

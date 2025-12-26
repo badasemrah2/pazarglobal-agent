@@ -7,6 +7,58 @@ from .base_tool import BaseTool
 from services import supabase_client, openai_client
 
 
+ALLOWED_CATEGORIES = [
+    "Elektronik",
+    "Otomotiv",
+    "Emlak",
+    "Mobilya & Dekorasyon",
+    "Giyim & Aksesuar",
+    "Gıda & İçecek",
+    "Kozmetik & Kişisel Bakım",
+    "Kozmetik & Bakım",
+    "Kitap, Dergi & Müzik",
+    "Spor & Outdoor",
+    "Anne, Bebek & Oyuncak",
+    "Hayvan & Pet Shop",
+    "Yapı Market & Bahçe",
+    "Hobi & Oyun",
+    "Sanat & Zanaat",
+    "İş & Sanayi",
+    "Eğitim & Kurs",
+    "Etkinlik & Bilet",
+    "Hizmetler",
+    "Diğer",
+]
+
+
+def normalize_category(raw_category: str) -> str:
+    """Map model output into a stable, frontend-compatible category."""
+    if not raw_category:
+        return "Diğer"
+    cat = str(raw_category).strip()
+    if cat in ALLOWED_CATEGORIES:
+        return cat
+
+    lower = cat.lower()
+    # Electronics
+    if any(k in lower for k in ["bilgisayar", "laptop", "notebook", "dizüstü", "dizustu", "telefon", "tablet", "tv", "telev", "kamera", "kulaklık", "kulaklik", "playstation", "xbox"]):
+        return "Elektronik"
+    # Automotive
+    if any(k in lower for k in ["araba", "otomobil", "motor", "motosiklet", "oto", "jant", "lastik", "aksesuar"]):
+        return "Otomotiv"
+    # Real estate
+    if any(k in lower for k in ["ev", "daire", "arsa", "kiralık", "kiralik", "satılık", "satilik", "emlak", "ofis"]):
+        return "Emlak"
+    # Furniture
+    if any(k in lower for k in ["mobilya", "koltuk", "masa", "sandalye", "dolap", "yatak", "dekor"]):
+        return "Mobilya & Dekorasyon"
+    # Clothing
+    if any(k in lower for k in ["giyim", "ayakkabı", "ayakkabi", "çanta", "canta", "aksesuar", "mont", "elbise", "pantolon"]):
+        return "Giyim & Aksesuar"
+
+    return "Diğer"
+
+
 class ProcessImageTool(BaseTool):
     """Tool to process and analyze product images"""
     
@@ -89,9 +141,10 @@ class ProcessImageTool(BaseTool):
             detected_category = ""
             if isinstance(analysis, dict):
                 detected_category = str(analysis.get("category") or "").strip()
+            detected_category = normalize_category(detected_category)
             await supabase_client.update_draft_category(
                 draft_id,
-                detected_category or "unspecified",
+                detected_category or "Diğer",
                 vision_product=analysis if isinstance(analysis, dict) else {"raw": analysis_text}
             )
         except Exception:

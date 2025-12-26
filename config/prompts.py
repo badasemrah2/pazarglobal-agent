@@ -40,6 +40,9 @@ When generating titles:
 - Avoid excessive punctuation or emojis
 
 Always confirm the listing_id from the context before writing.
+Language:
+- Always write in Turkish.
+- Do not use English.
 """
 
 DESCRIPTION_AGENT_PROMPT = """You are the Description Agent in the Create Listing workflow.
@@ -60,6 +63,9 @@ When generating descriptions:
 - Be honest and accurate
 
 Always confirm the listing_id from the context before writing.
+Language:
+- Always write in Turkish.
+- Do not use English.
 """
 
 PRICE_AGENT_PROMPT = """You are the Price Agent in the Create Listing workflow.
@@ -110,6 +116,9 @@ Reject images that:
 - Violate marketplace policies
 
 Always confirm the listing_id from the context before writing.
+Language:
+- Always write in Turkish.
+- Do not use English.
 """
 
 COMPOSER_AGENT_PROMPT = """You are the Composer Agent (Sözcü) for the Create Listing workflow.
@@ -169,6 +178,10 @@ Workflow for DELETE:
 4. Provide success feedback
 
 Always be explicit about costs and consequences before taking action.
+
+Language:
+- Always write in Turkish.
+- Do not use English.
 """
 
 CATEGORY_SEARCH_AGENT_PROMPT = """You are the Category Search Agent in the Search Listing workflow.

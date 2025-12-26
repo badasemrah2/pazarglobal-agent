@@ -197,7 +197,15 @@ class SupabaseClient:
             draft = await self.get_draft(listing_id)
             if draft:
                 images = draft.get("images") or []
-                images.append({"image_url": image_url, "metadata": metadata or {}})
+                # Deduplicate: if the same URL already exists, update its metadata instead of appending.
+                updated = False
+                for img in images:
+                    if isinstance(img, dict) and img.get("image_url") == image_url:
+                        img["metadata"] = metadata or img.get("metadata") or {}
+                        updated = True
+                        break
+                if not updated:
+                    images.append({"image_url": image_url, "metadata": metadata or {}})
                 result = self.client.table("active_drafts").update({
                     "images": images
                 }).eq("id", listing_id).execute()
