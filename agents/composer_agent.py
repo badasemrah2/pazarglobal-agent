@@ -70,34 +70,22 @@ class ComposerAgent(BaseAgent):
                 "user_id": user_id
             }
             
-            # Run agents in parallel (they all work on the SAME draft_id)
-            tasks = []
+            # ALWAYS run all agents in parallel for create_listing intent
+            # Each agent's system prompt determines what updates it should make
+            # This ensures comprehensive listing data extraction from any user message
+            tasks = [
+                self.title_agent.run(user_message, context),
+                self.description_agent.run(user_message, context),
+                self.price_agent.run(user_message, context)
+            ]
             
-            # Determine which agents to run based on message content
-            message_lower = user_message.lower()
-            
-            if any(word in message_lower for word in ["title", "name", "başlık", "isim"]):
-                tasks.append(self.title_agent.run(user_message, context))
-            
-            if any(word in message_lower for word in ["description", "açıklama", "detay", "describe"]):
-                tasks.append(self.description_agent.run(user_message, context))
-            
-            if any(word in message_lower for word in ["price", "fiyat", "cost", "ücret", "tl", "$", "₺"]):
-                tasks.append(self.price_agent.run(user_message, context))
-            
-            # Media or image keywords trigger ImageAgent
-            if media_url or any(word in message_lower for word in ["image", "photo", "resim", "fotoğraf", "görsel"]):
-                tasks.append(self.image_agent.run(media_url or user_message, context))
-            
-            # If no specific agent matched, run all (include image if media exists)
-            if not tasks:
-                tasks = [
-                    self.title_agent.run(user_message, context),
-                    self.description_agent.run(user_message, context),
-                    self.price_agent.run(user_message, context)
-                ]
-                if media_url:
-                    tasks.append(self.image_agent.run(media_url, context))
+            # Add image agent if media provided or if message mentions images
+            if media_url:
+                tasks.append(self.image_agent.run(media_url, context))
+            else:
+                message_lower = user_message.lower()
+                if any(word in message_lower for word in ["image", "photo", "resim", "fotoğraf", "görsel", "resim yükle"]):
+                    tasks.append(self.image_agent.run(user_message, context))
             
             # Execute agents in parallel
             results = await asyncio.gather(*tasks, return_exceptions=True)
