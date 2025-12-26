@@ -3,7 +3,7 @@ WebChat API endpoints for frontend integration
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from loguru import logger
 from services import redis_client
 from agents import IntentRouterAgent, ComposerAgent, PublishDeleteAgent, SearchComposerAgent, SmallTalkAgent
@@ -27,6 +27,61 @@ def normalize_user_id(raw_id: Optional[str]) -> str:
             # Deterministically hash non-UUID identifiers (e.g., web_user_x) to stable UUIDs
             return str(uuid.uuid5(uuid.NAMESPACE_URL, str(raw_id)))
     return str(uuid.uuid4())
+
+
+def build_draft_status_message(draft: Dict[str, Any]) -> str:
+    """Generate a friendly status message about the current draft state."""
+    listing = draft.get("listing_data") or {}
+    images = draft.get("images") or []
+    summary_lines: List[str] = []
+    missing: List[str] = []
+
+    def add_line(label: str, value: str):
+        if value:
+            summary_lines.append(f"• {label}: {value}")
+
+    title = listing.get("title")
+    if title:
+        add_line("Başlık", title)
+    else:
+        missing.append("ürünün adı (başlık)")
+
+    description = listing.get("description")
+    if description:
+        preview = description if len(description) <= 160 else description[:157] + "..."
+        add_line("Açıklama", preview)
+    else:
+        missing.append("detaylı açıklama")
+
+    price = listing.get("price")
+    if price is not None:
+        price_value = f"{price} ₺" if isinstance(price, (int, float)) else str(price)
+        add_line("Fiyat", price_value)
+    else:
+        missing.append("tahmini fiyat")
+
+    category = listing.get("category")
+    if category:
+        add_line("Kategori", category)
+    else:
+        missing.append("kategori")
+
+    add_line("Fotoğraflar", f"{len(images)} adet" if images else "henüz eklenmedi")
+    if not images:
+        missing.append("ürün fotoğrafları")
+
+    message_parts = ["📋 Taslak durumu güncellendi."]
+    if summary_lines:
+        message_parts.append("\n".join(summary_lines))
+
+    if missing:
+        message_parts.append(
+            "Eksik bilgiler: " + ", ".join(missing) + ". Lütfen bu detayları yazarak veya fotoğraf yükleyerek paylaşın."
+        )
+    else:
+        message_parts.append("Tüm temel bilgiler tamam. Hazırsanız 'yayınla' yazarak ilanı yayınlayabilirsiniz.")
+
+    return "\n\n".join(part.strip() for part in message_parts if part.strip())
 
 router = APIRouter(prefix="/webchat", tags=["webchat"])
 
@@ -153,7 +208,7 @@ async def process_webchat_message(
                     await redis_client.set_active_draft(session_id, result["draft_id"])
                 
                 draft = result["draft"]
-                response_text = "✅ Draft updated successfully!\n\n"
+                response_text = build_draft_status_message(draft)
                 
                 response_data.update({
                     "draft_id": result["draft_id"],
