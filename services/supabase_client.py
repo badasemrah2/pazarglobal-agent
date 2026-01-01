@@ -37,6 +37,30 @@ class SupabaseClient:
                 settings.supabase_service_key
             )
         return self._client
+
+    async def get_user_display_name(self, user_id: str) -> Optional[str]:
+        """Resolve a friendly user display name from profiles.
+
+        Tries display_name first, then full_name. Returns None when not found.
+        """
+        if not user_id:
+            return None
+        try:
+            result = (
+                self.client.table("profiles")
+                .select("display_name, full_name")
+                .eq("id", user_id)
+                .limit(1)
+                .execute()
+            )
+            row = (result.data or [None])[0]
+            if not isinstance(row, dict):
+                return None
+            name = (row.get("display_name") or row.get("full_name") or "").strip()
+            return name or None
+        except Exception as e:
+            logger.warning(f"Failed to resolve user display name: {e}")
+            return None
     
     # Active Drafts Operations
     async def create_draft(self, user_id: str, phone_number: str) -> Dict[str, Any]:

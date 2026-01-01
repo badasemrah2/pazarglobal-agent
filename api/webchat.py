@@ -866,12 +866,26 @@ async def process_webchat_message(
             and not is_create_listing_command(message_body)
             and not is_search_command(message_body)
         ):
+            display_name = None
+            try:
+                display_name = await supabase_client.get_user_display_name(user_id)
+            except Exception:
+                display_name = None
+
+            name_txt = f" {display_name}" if display_name else ""
+            welcome = (
+                f"Selam{name_txt}! PazarGlobal'e hoş geldin!\n\n"
+                "🛒 Ürün satmak istersen: Satmak istediğin ürünün adını ve özelliklerini yazabilirsin.\n\n"
+                "🔍 Ürün aramak istersen: Ne tür bir ürün arıyorsun?\n\n"
+                "Bugün PazarGlobal'de ne yapmak istersin, ürün mü satacaksın yoksa bir şey mi arıyorsun?"
+            )
+
             hint = ""
             if session.get("active_draft_id") or session.get("pending_media_urls") or session.get("pending_media_analysis"):
                 hint = "\n\nİstersen ilan taslağına kaldığımız yerden devam edebiliriz. Ürünün adını (başlık) yazman yeterli."
             return await finalize_response({
                 "success": True,
-                "message": "Merhaba! Size nasıl yardımcı olabilirim?" + hint,
+                "message": welcome + hint,
                 "data": {"type": "conversation", "intent": "small_talk"},
                 "intent": "small_talk",
             })
