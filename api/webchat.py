@@ -237,6 +237,22 @@ def draft_has_any_content(draft: Dict[str, Any]) -> bool:
     return False
 
 
+def draft_has_non_media_content(draft: Dict[str, Any]) -> bool:
+    """Return True if draft has listing fields filled (excluding images).
+
+    This is used to decide whether an existing draft likely contains an older item's data.
+    Images alone are common in the "upload photos first" flow and should not trigger a reset.
+    """
+    listing = (draft or {}).get("listing_data") or {}
+    for key in ["title", "description", "category"]:
+        val = listing.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+    if listing.get("price") is not None:
+        return True
+    return False
+
+
 def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> bool:
     """Heuristic: if user explicitly starts a new listing, reset the single in-progress draft.
 
@@ -251,8 +267,9 @@ def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> b
     # Don't reset when user says "devam"; they likely want to continue the current draft.
     if msg in {"devam", "devam et"}:
         return False
-    # Reset only if there's something to lose (draft already has content)
-    return draft_has_any_content(draft)
+    # Reset only when we have non-media listing fields that indicate an older draft.
+    # Do NOT reset drafts that only have images; otherwise we wipe newly uploaded photos and loop.
+    return draft_has_non_media_content(draft)
 
 
 async def handle_publish_or_delete_flow(
@@ -973,6 +990,54 @@ async def process_webchat_message(
                     cached_analyses = cached_analyses + new_analyses
                     session["pending_media_analysis"] = cached_analyses
                     session_dirty = True
+
+                # IMPORTANT (non-sticky sessions): persist media into the draft immediately.
+                # Otherwise the user uploads photos, sees analysis, then "ilan oluştur" hits another instance
+                # and the draft appears to have 0 photos.
+                if user_id and all_media_urls:
+                    try:
+                        draft = None
+                        draft_id = session.get("active_draft_id")
+                        if isinstance(draft_id, str) and draft_id:
+                            draft = await supabase_client.get_draft(draft_id)
+                        if not draft:
+                            draft = await supabase_client.get_latest_draft_for_user(user_id)
+                            draft_id = (draft or {}).get("id")
+                        if not draft:
+                            draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                            draft_id = (draft or {}).get("id")
+
+                        if draft_id:
+                            # Pin the active draft in this session too (best-effort)
+                            session["active_draft_id"] = draft_id
+                            session_dirty = True
+
+                            analysis_by_url: Dict[str, Any] = {}
+                            for entry in cached_analyses or []:
+                                if isinstance(entry, dict) and entry.get("image_url"):
+                                    analysis_by_url[str(entry["image_url"])] = entry.get("analysis")
+
+                            # Attach media URLs to the draft (dedup happens in add_listing_image)
+                            for url in all_media_urls:
+                                if not url:
+                                    continue
+                                meta = {}
+                                analysis = analysis_by_url.get(url)
+                                if analysis is not None:
+                                    meta = {"analysis": analysis}
+                                await supabase_client.add_listing_image(draft_id, url, metadata=meta or None)
+
+                            # Best-effort: store the first analysis as draft.vision_product (no category changes)
+                            first_analysis = None
+                            for entry in cached_analyses or []:
+                                a = (entry or {}).get("analysis") if isinstance(entry, dict) else None
+                                if isinstance(a, dict) and a:
+                                    first_analysis = a
+                                    break
+                            if isinstance(first_analysis, dict) and first_analysis:
+                                await supabase_client.update_draft_vision_product(draft_id, first_analysis)
+                    except Exception:
+                        pass
 
                 message_text = format_media_analysis_message(session.get("pending_media_analysis") or [])
                 return await finalize_response({

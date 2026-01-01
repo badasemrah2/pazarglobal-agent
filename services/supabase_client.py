@@ -6,6 +6,9 @@ from config import settings
 from typing import Optional, Dict, List, Any
 from loguru import logger
 import httpx
+import re
+
+from .metadata_keywords import generate_listing_keywords
 
 
 class SupabaseClient:
@@ -60,6 +63,27 @@ class SupabaseClient:
             return name or None
         except Exception as e:
             logger.warning(f"Failed to resolve user display name: {e}")
+            return None
+
+    async def get_user_phone(self, user_id: str) -> Optional[str]:
+        """Resolve user's phone from profiles (best-effort)."""
+        if not user_id:
+            return None
+        try:
+            result = (
+                self.client.table("profiles")
+                .select("phone")
+                .eq("id", user_id)
+                .limit(1)
+                .execute()
+            )
+            row = (result.data or [None])[0]
+            if not isinstance(row, dict):
+                return None
+            phone = (row.get("phone") or "").strip()
+            return phone or None
+        except Exception as e:
+            logger.warning(f"Failed to resolve user phone: {e}")
             return None
     
     # Active Drafts Operations
@@ -345,6 +369,24 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error updating category: {e}")
             return False
+
+    async def update_draft_vision_product(self, draft_id: str, vision_product: Dict[str, Any]) -> bool:
+        """Update draft vision_product without mutating listing_data/category."""
+        try:
+            if not draft_id:
+                return False
+            if not isinstance(vision_product, dict):
+                return False
+            updated = (
+                self.client.table("active_drafts")
+                .update({"vision_product": vision_product})
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Error updating vision_product: {e}")
+            return False
     
     # Listing Images Operations
     async def add_listing_image(self, listing_id: str, image_url: str, metadata: Dict = None) -> bool:
@@ -400,6 +442,42 @@ class SupabaseClient:
             
             listing_data = draft.get("listing_data") or {}
             images = draft.get("images") or []
+
+            # Best-effort: generate listing-level metadata keywords to improve search recall.
+            # This does NOT block publishing if generation fails.
+            listing_metadata: Dict[str, Any] = {}
+            try:
+                if isinstance(listing_data, dict):
+                    existing_keywords = listing_data.get("_keywords")
+                else:
+                    existing_keywords = None
+
+                keywords: List[str] = []
+                keywords_text = ""
+                if isinstance(existing_keywords, list) and existing_keywords:
+                    keywords = [str(k).strip().lower() for k in existing_keywords if str(k).strip()]
+                    keywords_text = " ".join(keywords)
+                else:
+                    title = str(listing_data.get("title") or "").strip() if isinstance(listing_data, dict) else ""
+                    category = str(listing_data.get("category") or "").strip() if isinstance(listing_data, dict) else ""
+                    description = str(listing_data.get("description") or "").strip() if isinstance(listing_data, dict) else ""
+                    condition = str(listing_data.get("condition") or "").strip() if isinstance(listing_data, dict) else ""
+                    generated = await generate_listing_keywords(
+                        title=title,
+                        category=category,
+                        description=description,
+                        condition=condition,
+                        vision_product=draft.get("vision_product") if isinstance(draft.get("vision_product"), dict) else None,
+                    )
+                    keywords = generated.get("keywords") or []
+                    keywords_text = generated.get("keywords_text") or ""
+
+                if keywords:
+                    listing_metadata["keywords"] = keywords
+                if keywords_text:
+                    listing_metadata["keywords_text"] = keywords_text
+            except Exception as meta_err:
+                logger.warning(f"Failed to generate listing metadata: {meta_err}")
             
             # Insert into listings
             result = self.client.table("listings").insert({
@@ -409,7 +487,8 @@ class SupabaseClient:
                 "price": listing_data.get("price"),
                 "category": listing_data.get("category"),
                 "status": "active",
-                "images": images
+                "images": images,
+                "metadata": listing_metadata
             }).execute()
             
             if result.data:
@@ -487,7 +566,26 @@ class SupabaseClient:
                 query = query.lte("price", max_price)
             
             if search_text:
-                query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
+                if getattr(settings, "enable_metadata_keyword_search", False):
+                    # Also search in metadata keyword blob (best-effort) to improve recall.
+                    # Use both the full phrase and a few tokens so queries like "telefon arıyorum"
+                    # can still hit listings whose metadata contains "telefon".
+                    clauses: List[str] = [
+                        f"title.ilike.%{search_text}%",
+                        f"description.ilike.%{search_text}%",
+                    ]
+
+                    tokens = [t for t in re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ]+", search_text.lower()) if len(t) >= 3]
+                    # Keep it bounded so the OR string doesn't explode
+                    for tok in tokens[:4]:
+                        clauses.append(f"metadata->>keywords_text.ilike.%{tok}%")
+
+                    # Still include the full phrase as a fallback when it makes sense
+                    clauses.append(f"metadata->>keywords_text.ilike.%{search_text}%")
+
+                    query = query.or_(",".join(clauses))
+                else:
+                    query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
             
             result = query.limit(limit).execute()
             return result.data or []
@@ -550,11 +648,22 @@ class SupabaseClient:
     ) -> bool:
         """Log agent action to audit_logs (schema-aligned)."""
         try:
+            phone: Optional[str] = None
+            if isinstance(metadata, dict):
+                phone = (metadata.get("phone") or metadata.get("contact_phone") or "").strip() or None
+
+            if not phone and user_id:
+                phone = await self.get_user_phone(user_id)
+
+            # Some environments enforce NOT NULL on audit_logs.phone; keep inserts safe.
+            phone = phone or ""
+
             payload = {
                 "action": action,
                 "resource_type": resource_type,
                 "resource_id": resource_id,
                 "user_id": user_id,
+                "phone": phone,
                 "metadata": metadata
             }
             result = self.client.table("audit_logs").insert(payload).execute()
