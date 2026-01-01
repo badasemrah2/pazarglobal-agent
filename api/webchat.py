@@ -934,6 +934,48 @@ async def process_webchat_message(
 
             draft_id = session.get("active_draft_id")
             existing_draft = await supabase_client.get_draft(draft_id) if draft_id else None
+
+            # If we previously suggested a price, allow a natural confirmation response.
+            pending_price = session.get("pending_price_suggestion")
+            if (
+                existing_draft
+                and next_missing_slot(existing_draft) == "price"
+                and isinstance(pending_price, dict)
+                and pending_price.get("draft_id") == draft_id
+            ):
+                if is_confirm_command(message_body):
+                    try:
+                        suggested_price = pending_price.get("suggested_price")
+                        if suggested_price is not None:
+                            ok = await supabase_client.update_draft_price(draft_id, float(suggested_price))
+                            session.pop("pending_price_suggestion", None)
+                            session_dirty = True
+                            if ok:
+                                updated = await supabase_client.get_draft(draft_id)
+                                response_data.update({
+                                    "draft_id": draft_id,
+                                    "draft": updated,
+                                    "type": "draft_update",
+                                })
+                                return await finalize_response({
+                                    "success": True,
+                                    "message": build_next_step_message(updated or {}),
+                                    "data": response_data,
+                                    "intent": intent,
+                                })
+                    except Exception:
+                        # Fall through to normal handling
+                        pass
+                elif is_cancel_command(message_body):
+                    session.pop("pending_price_suggestion", None)
+                    session_dirty = True
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Peki. Fiyatı siz yazar mısınız?",
+                        "data": {"type": "slot_prompt", "slot": "price", "draft_id": draft_id},
+                        "intent": intent,
+                    })
+
             if existing_draft and next_missing_slot(existing_draft) == "price" and user_asks_market_price(message_body):
                 listing = (existing_draft or {}).get("listing_data") or {}
                 vision = (existing_draft or {}).get("vision_product") or {}
@@ -964,6 +1006,13 @@ async def process_webchat_message(
                     confidence = price_resp.get("confidence")
                     cached_txt = "(önbellekten)" if cached else "(webden güncel)"
                     conf_txt = f" Güven: %{int(float(confidence) * 100)}." if confidence is not None else ""
+
+                    session["pending_price_suggestion"] = {
+                        "draft_id": draft_id,
+                        "suggested_price": suggested,
+                    }
+                    session_dirty = True
+
                     return await finalize_response({
                         "success": True,
                         "message": (
