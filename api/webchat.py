@@ -592,6 +592,81 @@ def user_asks_market_price(message: str) -> bool:
     ])
 
 
+def normalize_category_input(message: str) -> Optional[str]:
+    """Normalize common category inputs to canonical labels.
+
+    Returns None if the message does not look like a category.
+    """
+    msg = (message or "").strip().lower()
+    if not msg:
+        return None
+
+    # Keep this intentionally small and conservative to avoid misclassifying insults/random text as a category.
+    mapping = {
+        "otomotiv": "Otomotiv",
+        "vasita": "Otomotiv",
+        "taşıt": "Otomotiv",
+        "tasit": "Otomotiv",
+        "araba": "Otomotiv",
+        "elektronik": "Elektronik",
+        "telefon": "Elektronik",
+        "bilgisayar": "Elektronik",
+        "ev": "Ev & Yaşam",
+        "ev yaşam": "Ev & Yaşam",
+        "ev & yaşam": "Ev & Yaşam",
+        "ev ve yaşam": "Ev & Yaşam",
+        "moda": "Moda",
+        "giyim": "Moda",
+        "spor": "Spor",
+        "hobi": "Hobi",
+        "emlak": "Emlak",
+        "hizmet": "Hizmet",
+        "diger": "Diğer",
+        "diğer": "Diğer",
+    }
+
+    if msg in mapping:
+        return mapping[msg]
+
+    # Also handle simple forms like "kategori: otomotiv"
+    for key in ["kategori", "category"]:
+        if msg.startswith(f"{key}:"):
+            rest = msg.split(":", 1)[1].strip()
+            return mapping.get(rest) or (rest.title() if rest else None)
+
+    # For single-token inputs, accept Title-case as a last resort only if it looks like a known category word.
+    tokens = [t for t in msg.replace("/", " ").replace(",", " ").split() if t]
+    if len(tokens) == 1 and tokens[0] in mapping:
+        return mapping[tokens[0]]
+
+    return None
+
+
+def parse_price_input(message: str) -> Optional[float]:
+    """Best-effort price parser for direct user input (e.g. '250000', '250.000', '250k')."""
+    msg = (message or "").strip().lower()
+    if not msg:
+        return None
+    # Don't treat market-price questions as numeric input.
+    if user_asks_market_price(msg):
+        return None
+
+    # Normalize thousands separators
+    cleaned = msg.replace("₺", "").replace("tl", "").replace("try", "").strip()
+    multiplier = 1.0
+    if cleaned.endswith("k"):
+        multiplier = 1000.0
+        cleaned = cleaned[:-1].strip()
+    cleaned = cleaned.replace(" ", "")
+    cleaned = cleaned.replace(".", "").replace(",", "")
+    if not cleaned.isdigit():
+        return None
+    try:
+        return float(int(cleaned) * multiplier)
+    except Exception:
+        return None
+
+
 def extract_vision_search_query(analyses: List[Dict[str, Any]]) -> str:
     """Convert cached vision JSON into a simple Turkish keyword query."""
     tokens: List[str] = []
@@ -855,6 +930,43 @@ async def process_webchat_message(
                     "intent": None
                 })
 
+        # PRE-INTENT DRAFT SLOT RECOVERY:
+        # With Redis disabled and requests potentially landing on different instances,
+        # the intent router may misclassify short slot answers like "Otomotiv".
+        # If the user has an in-progress draft missing category, accept category answers
+        # deterministically before intent routing.
+        if user_id:
+            try:
+                latest = await supabase_client.get_latest_draft_for_user(user_id)
+                if latest and latest.get("id"):
+                    missing = next_missing_slot(latest)
+                    if missing == "category":
+                        normalized = normalize_category_input(message_body)
+                        if normalized:
+                            draft_id = latest.get("id")
+                            ok = await supabase_client.update_draft_category(draft_id, normalized)
+                            updated = await supabase_client.get_draft(draft_id)
+                            # Pin session to create_listing for subsequent turns
+                            session["intent"] = "create_listing"
+                            session["locked_intent"] = "create_listing"
+                            session["active_draft_id"] = draft_id
+                            session_dirty = True
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or latest),
+                                "data": {
+                                    "intent": "create_listing",
+                                    "draft_id": draft_id,
+                                    "draft": updated or latest,
+                                    "type": "draft_update",
+                                    "category": normalized,
+                                    "applied": bool(ok),
+                                },
+                                "intent": "create_listing",
+                            })
+            except Exception:
+                pass
+
         # PURE GREETING OVERRIDE:
         # If the user only greets ("selam", "merhaba"...), do not advance task flows
         # (create_listing / publish_or_delete / search_listings). This avoids confusing
@@ -1000,6 +1112,110 @@ async def process_webchat_message(
 
             draft_id = session.get("active_draft_id")
             existing_draft = await supabase_client.get_draft(draft_id) if draft_id else None
+
+            # With Redis disabled (and Railway load-balancing), a new request may land on a different instance.
+            # Recover the active draft deterministically from the DB.
+            if not existing_draft and user_id:
+                existing_draft = await supabase_client.get_latest_draft_for_user(user_id)
+                if existing_draft and existing_draft.get("id"):
+                    draft_id = existing_draft.get("id")
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+
+            # Deterministic slot filling: if the draft is missing exactly one next slot,
+            # treat the user's next message as that slot input (avoid depending on sticky session state).
+            if existing_draft and draft_id and is_cancel_command(message_body):
+                # User wants to stop this flow.
+                try:
+                    session.pop("locked_intent", None)
+                    session.pop("intent", None)
+                    session.pop("pending_price_suggestion", None)
+                    session_dirty = True
+                except Exception:
+                    pass
+                return await finalize_response({
+                    "success": True,
+                    "message": "Tamam. İlan oluşturmayı iptal ettim. İstersen yeni bir ürün satabilir ya da ürün arayabilirsin.",
+                    "data": {"type": "conversation", "intent": "small_talk"},
+                    "intent": "small_talk",
+                })
+
+            if existing_draft and draft_id:
+                slot = next_missing_slot(existing_draft)
+
+                # Category
+                if slot == "category":
+                    normalized = normalize_category_input(message_body)
+                    if normalized:
+                        ok = await supabase_client.update_draft_category(draft_id, normalized)
+                        updated = await supabase_client.get_draft(draft_id)
+                        if ok or updated:
+                            response_data.update({
+                                "draft_id": draft_id,
+                                "draft": updated,
+                                "type": "draft_update",
+                            })
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or existing_draft),
+                                "data": response_data,
+                                "intent": intent,
+                            })
+
+                # Title
+                if slot == "title" and not is_command_only_message(message_body):
+                    if len((message_body or "").strip()) >= 3:
+                        ok = await supabase_client.update_draft_title(draft_id, (message_body or "").strip())
+                        updated = await supabase_client.get_draft(draft_id)
+                        if ok or updated:
+                            response_data.update({
+                                "draft_id": draft_id,
+                                "draft": updated,
+                                "type": "draft_update",
+                            })
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or existing_draft),
+                                "data": response_data,
+                                "intent": intent,
+                            })
+
+                # Description
+                if slot == "description" and not is_command_only_message(message_body):
+                    if len((message_body or "").strip()) >= 6:
+                        ok = await supabase_client.update_draft_description(draft_id, (message_body or "").strip())
+                        updated = await supabase_client.get_draft(draft_id)
+                        if ok or updated:
+                            response_data.update({
+                                "draft_id": draft_id,
+                                "draft": updated,
+                                "type": "draft_update",
+                            })
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or existing_draft),
+                                "data": response_data,
+                                "intent": intent,
+                            })
+
+                # Price (only if user typed a numeric price)
+                if slot == "price":
+                    price_val = parse_price_input(message_body)
+                    if price_val is not None:
+                        ok = await supabase_client.update_draft_price(draft_id, float(price_val))
+                        updated = await supabase_client.get_draft(draft_id)
+                        if ok or updated:
+                            response_data.update({
+                                "draft_id": draft_id,
+                                "draft": updated,
+                                "type": "draft_update",
+                            })
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or existing_draft),
+                                "data": response_data,
+                                "intent": intent,
+                            })
 
             # If we previously suggested a price, allow a natural confirmation response.
             pending_price = session.get("pending_price_suggestion")
