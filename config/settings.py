@@ -1,13 +1,22 @@
 """
 Application settings and configuration
 """
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 from pathlib import Path
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables"""
+
+    model_config = SettingsConfigDict(
+        # Always load the .env that belongs to this project, regardless of where
+        # the process is launched from (repo root, Railway, etc.).
+        env_file=str(Path(__file__).resolve().parents[1] / ".env"),
+        case_sensitive=False,
+        # Allow unrelated/extra env vars (e.g., deployment tokens) without crashing.
+        extra="ignore",
+    )
     
     # OpenAI Configuration
     openai_api_key: str
@@ -49,12 +58,5 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1000
     
-    class Config:
-        # Always load the .env that belongs to this project, regardless of where
-        # the process is launched from (repo root, Railway, etc.).
-        env_file = str(Path(__file__).resolve().parents[1] / ".env")
-        case_sensitive = False
-
-
 # Global settings instance
 settings = Settings()

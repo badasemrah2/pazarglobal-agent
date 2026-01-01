@@ -142,7 +142,23 @@ class SupabaseClient:
                 "field_name": "title",
                 "field_value": title
             }).execute()
-            return bool(result.data)
+            if result.data:
+                return True
+        except Exception as e:
+            logger.warning(f"RPC update_listing_field failed for title (falling back to direct update): {e}")
+
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["title"] = title
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
         except Exception as e:
             logger.error(f"Error updating title: {e}")
             return False
@@ -155,7 +171,23 @@ class SupabaseClient:
                 "field_name": "description",
                 "field_value": description
             }).execute()
-            return bool(result.data)
+            if result.data:
+                return True
+        except Exception as e:
+            logger.warning(f"RPC update_listing_field failed for description (falling back to direct update): {e}")
+
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["description"] = description
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
         except Exception as e:
             logger.error(f"Error updating description: {e}")
             return False
@@ -168,7 +200,23 @@ class SupabaseClient:
                 "field_name": "price",
                 "field_value": price
             }).execute()
-            return bool(result.data)
+            if result.data:
+                return True
+        except Exception as e:
+            logger.warning(f"RPC update_listing_field failed for price (falling back to direct update): {e}")
+
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["price"] = price
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
         except Exception as e:
             logger.error(f"Error updating price: {e}")
             return False
@@ -181,13 +229,30 @@ class SupabaseClient:
                 "field_name": "category",
                 "field_value": category
             }).execute()
+            if rpc_result.data:
+                if vision_product is not None:
+                    self.client.table("active_drafts").update({
+                        "vision_product": vision_product
+                    }).eq("id", draft_id).execute()
+                return True
+        except Exception as e:
+            logger.warning(f"RPC update_listing_field failed for category (falling back to direct update): {e}")
 
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["category"] = category
+
+            payload: Dict[str, Any] = {"listing_data": listing_data}
             if vision_product is not None:
-                self.client.table("active_drafts").update({
-                    "vision_product": vision_product
-                }).eq("id", draft_id).execute()
+                payload["vision_product"] = vision_product
 
-            return bool(rpc_result.data)
+            updated = self.client.table("active_drafts").update(payload).eq("id", draft_id).execute()
+            return bool(updated.data)
         except Exception as e:
             logger.error(f"Error updating category: {e}")
             return False

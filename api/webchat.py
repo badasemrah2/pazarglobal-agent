@@ -72,7 +72,15 @@ def is_publish_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
         return False
-    return any(token in msg for token in ["yayınla", "yayınla!", "yayina", "publish", "yayınlamak"])
+    return any(token in msg for token in [
+        "yayınla",
+        "yayınla!",
+        "yayinla",
+        "yayina",
+        "yayınlamak",
+        "yayinlamak",
+        "publish",
+    ])
 
 
 def is_delete_command(message: str) -> bool:
