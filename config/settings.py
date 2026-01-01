@@ -3,6 +3,7 @@ Application settings and configuration
 """
 from pydantic_settings import BaseSettings
 from typing import Optional
+from pathlib import Path
 
 
 class Settings(BaseSettings):
@@ -49,7 +50,9 @@ class Settings(BaseSettings):
     rate_limit_per_hour: int = 1000
     
     class Config:
-        env_file = ".env"
+        # Always load the .env that belongs to this project, regardless of where
+        # the process is launched from (repo root, Railway, etc.).
+        env_file = str(Path(__file__).resolve().parents[1] / ".env")
         case_sensitive = False
 
 

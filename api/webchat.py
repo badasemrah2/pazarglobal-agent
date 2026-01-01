@@ -9,12 +9,13 @@ from services import redis_client, openai_client
 from config import settings
 from tools import publish_listing_tool, get_wallet_balance_tool
 from agents import IntentRouterAgent, ComposerAgent, PublishDeleteAgent, SearchComposerAgent, SmallTalkAgent
+from services import supabase_client
 import json
 import uuid
 import re
 
 # In-memory cache for last search results (when Redis is disabled)
-LAST_SEARCH_CACHE: Dict[str, list] = {}
+LAST_SEARCH_CACHE: Dict[str, List[Any]] = {}
 
 # Local session cache fallback when Redis is disabled
 IN_MEMORY_SESSION_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -58,7 +59,7 @@ def remove_session_state(session_id: str) -> None:
 
 def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
     """Merge new media URLs while preserving order and removing duplicates."""
-    seen = set()
+    seen: set[str] = set()
     merged: List[str] = []
     for url in existing + new_urls:
         if url and url not in seen:
@@ -482,6 +483,134 @@ def build_draft_status_message(draft: Dict[str, Any]) -> str:
 
     return "\n\n".join(part.strip() for part in message_parts if part.strip())
 
+
+_GREETING_TOKENS = {
+    "selam",
+    "selamlar",
+    "merhaba",
+    "mrb",
+    "hey",
+    "hi",
+    "hello",
+    "günaydın",
+    "gunaydin",
+    "iyi akşamlar",
+    "iyi aksamlar",
+    "iyi geceler",
+}
+
+
+def looks_like_greeting(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if msg in _GREETING_TOKENS:
+        return True
+    # very short social pings
+    if len(msg) <= 6 and any(tok in msg for tok in ["selam", "mrb", "hi", "hey"]):
+        return True
+    return False
+
+
+_COMMAND_ONLY_TOKENS = {
+    "ilan oluştur",
+    "ilan olustur",
+    "ilan",
+    "başlat",
+    "baslat",
+    "devam",
+    "devam et",
+}
+
+
+def is_command_only_message(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    return msg in _COMMAND_ONLY_TOKENS
+
+
+def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
+    listing = (draft or {}).get("listing_data") or {}
+    images = (draft or {}).get("images") or []
+    # Ask for images first only if none exists (keeps flow predictable)
+    if not images:
+        return "images"
+    if not (listing.get("title") or "").strip():
+        return "title"
+    if not (listing.get("description") or "").strip():
+        return "description"
+    if listing.get("price") is None:
+        return "price"
+    if not (listing.get("category") or "").strip():
+        return "category"
+    return None
+
+
+def build_next_step_message(draft: Dict[str, Any]) -> str:
+    slot = next_missing_slot(draft)
+    vision = (draft or {}).get("vision_product") or {}
+    suggested_category = ""
+    if isinstance(vision, dict):
+        suggested_category = str(vision.get("category") or vision.get("product") or "").strip()
+
+    if slot == "images":
+        return "İlanı hazırlayabilmem için lütfen 1-2 fotoğraf yükleyin."
+    if slot == "title":
+        return "Ürünün adı nedir? (Örn: 'iPhone 14 128GB siyah')"
+    if slot == "description":
+        return "Kısa bir açıklama yazar mısınız? (durum, çizik/hasar, kutu/fatura, takas vb.)"
+    if slot == "price":
+        return "Fiyat nedir? İsterseniz 'kaç para eder' yazın, piyasa verisine göre tahmin söyleyeyim."
+    if slot == "category":
+        if suggested_category:
+            return f"Kategori nedir? (İsterseniz önerim: {suggested_category})"
+        return "Kategori nedir? (Örn: Elektronik, Otomotiv...)"
+
+    # Completed
+    return "Tüm temel bilgiler tamam. Hazırsanız 'yayınla' yazarak ilanı yayınlayabilirsiniz."
+
+
+def user_asks_market_price(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(phrase in msg for phrase in [
+        "kaç para eder",
+        "kac para eder",
+        "ne kadar eder",
+        "ne kadara gider",
+        "piyasa",
+        "fiyat öner",
+        "fiyat oner",
+    ])
+
+
+def extract_vision_search_query(analyses: List[Dict[str, Any]]) -> str:
+    """Convert cached vision JSON into a simple Turkish keyword query."""
+    tokens: List[str] = []
+    for entry in analyses or []:
+        analysis = (entry or {}).get("analysis")
+        if not isinstance(analysis, dict):
+            continue
+        for key in ["product", "category", "condition"]:
+            val = str(analysis.get(key) or "").strip()
+            if val and val.lower() not in {"", "unknown", "bilinmiyor"}:
+                tokens.append(val)
+        feats = analysis.get("features")
+        if isinstance(feats, list):
+            for f in feats[:3]:
+                f_txt = str(f or "").strip()
+                if f_txt:
+                    tokens.append(f_txt)
+    # de-dup while preserving order
+    seen = set()
+    uniq: List[str] = []
+    for t in tokens:
+        k = t.lower()
+        if k not in seen:
+            uniq.append(t)
+            seen.add(k)
+    return " ".join(uniq[:10]).strip()
+
 router = APIRouter(prefix="/webchat", tags=["webchat"])
 
 
@@ -570,8 +699,10 @@ async def process_webchat_message(
             session = {
                 "user_id": user_id,
                 "intent": None,
+                "locked_intent": None,
                 "active_draft_id": None,
-                "pending_media_urls": []
+                "pending_media_urls": [],
+                "pending_media_analysis": []
             }
             session_dirty = True
         else:
@@ -579,6 +710,12 @@ async def process_webchat_message(
             session = dict(session)
             if "pending_media_urls" not in session:
                 session["pending_media_urls"] = []
+                session_dirty = True
+            if "pending_media_analysis" not in session:
+                session["pending_media_analysis"] = []
+                session_dirty = True
+            if "locked_intent" not in session:
+                session["locked_intent"] = None
                 session_dirty = True
 
         async def _finalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -623,12 +760,76 @@ async def process_webchat_message(
         all_media_urls = pending_media_urls
         has_media_context = bool(all_media_urls)
 
+        # PRE-INTENT BUFFER RULE:
+        # Images are data, not intent. If user only sent media (or media + neutral text)
+        # and we have no locked intent yet, do not force create_listing.
+        locked_intent = session.get("locked_intent")
+        if has_media_context and not locked_intent:
+            # If user already expressed an explicit intent in text, we'll continue below.
+            explicit_create = is_create_listing_command(message_body)
+            explicit_search = is_search_command(message_body)
+
+            if not explicit_create and not explicit_search:
+                # Ensure we have vision analysis cached for the buffered media (best-effort)
+                cached_analyses = session.get("pending_media_analysis") or []
+                if not isinstance(cached_analyses, list):
+                    cached_analyses = []
+                # Only analyze URLs we haven't analyzed yet
+                analyzed_urls = {str(a.get("image_url")) for a in cached_analyses if isinstance(a, dict) and a.get("image_url")}
+                new_urls = [u for u in all_media_urls if u and u not in analyzed_urls]
+                if new_urls:
+                    new_analyses = await analyze_media_with_vision(new_urls)
+                    cached_analyses = cached_analyses + new_analyses
+                    session["pending_media_analysis"] = cached_analyses
+                    session_dirty = True
+
+                message_text = format_media_analysis_message(session.get("pending_media_analysis") or [])
+                return await finalize_response({
+                    "success": True,
+                    "message": message_text,
+                    "data": {
+                        "type": "media_analysis",
+                        "media_urls": all_media_urls,
+                        "media_analysis": session.get("pending_media_analysis") or []
+                    },
+                    "intent": None
+                })
+
+        # PURE GREETING OVERRIDE:
+        # If the user only greets ("selam", "merhaba"...), do not advance task flows
+        # (create_listing / publish_or_delete / search_listings). This avoids confusing
+        # draft status prompts when the user is just saying hi.
+        if (
+            looks_like_greeting(message_body)
+            and not is_publish_command(message_body)
+            and not is_delete_command(message_body)
+            and not is_create_listing_command(message_body)
+            and not is_search_command(message_body)
+        ):
+            hint = ""
+            if session.get("active_draft_id") or session.get("pending_media_urls") or session.get("pending_media_analysis"):
+                hint = "\n\nİstersen ilan taslağına kaldığımız yerden devam edebiliriz. Ürünün adını (başlık) yazman yeterli."
+            return await finalize_response({
+                "success": True,
+                "message": "Merhaba! Size nasıl yardımcı olabilirim?" + hint,
+                "data": {"type": "conversation", "intent": "small_talk"},
+                "intent": "small_talk",
+            })
+
         # Get or determine intent
         intent = session.get("intent")
+        locked_intent = session.get("locked_intent")
 
-        # Deterministic re-route for clear user commands (prevents "sticky" small_talk from blocking tasks)
-        # Precedence: publish/delete (handled above) > media(create_listing) > explicit create/search.
-        if not has_media_context:
+        # Sticky intent: once locked_intent is set, do not re-run global routing.
+        # Publish/delete can still temporarily override.
+        if locked_intent and intent != "publish_or_delete":
+            intent = locked_intent
+            if session.get("intent") != intent:
+                session["intent"] = intent
+                session_dirty = True
+
+        # If no locked intent, deterministic override for clear user commands.
+        if not locked_intent and intent != "publish_or_delete":
             override_intent = None
             if is_create_listing_command(message_body):
                 override_intent = "create_listing"
@@ -637,16 +838,11 @@ async def process_webchat_message(
             if override_intent and override_intent != intent:
                 intent = override_intent
                 session["intent"] = intent
+                session["locked_intent"] = intent
+                locked_intent = intent
                 session_dirty = True
                 if not redis_disabled:
                     await redis_client.set_intent(session_id, intent)
-
-        if has_media_context and intent != "create_listing":
-            intent = "create_listing"
-            session["intent"] = intent
-            session_dirty = True
-            if not redis_disabled:
-                await redis_client.set_intent(session_id, intent)
 
         if not intent:
             router_agent = IntentRouterAgent()
@@ -656,20 +852,185 @@ async def process_webchat_message(
             if not redis_disabled:
                 await redis_client.set_intent(session_id, intent)
             logger.info(f"WebChat intent for {session_id}: {intent}")
+
+            # Only lock "task" intents; keep small_talk unlocked.
+            if intent in {"create_listing", "search_listings"}:
+                session["locked_intent"] = intent
+                locked_intent = intent
+                session_dirty = True
         
         response_data = {"intent": intent}
         
         # Route to appropriate agent
         if intent == "create_listing":
+            # If user asks for market price while we are missing price, answer deterministically.
+            # Uses cached Perplexity pipeline on Supabase Edge (market_price_snapshots).
+            draft_id = session.get("active_draft_id")
+
+            # If we have pre-intent buffered media, consume it into the draft once intent is locked.
+            # Important: do NOT re-run vision in process_image_tool; reuse cached analysis.
+            if session.get("pending_media_urls") and not draft_id:
+                # Create a draft first
+                draft_created = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                draft_id = (draft_created or {}).get("id")
+                if draft_id:
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+
+            if session.get("pending_media_urls") and draft_id:
+                analyses = session.get("pending_media_analysis") or []
+                analysis_by_url: Dict[str, Any] = {}
+                if isinstance(analyses, list):
+                    for entry in analyses:
+                        if isinstance(entry, dict) and entry.get("image_url"):
+                            analysis_by_url[str(entry["image_url"])] = entry.get("analysis")
+
+                # Attach images + metadata
+                for url in session.get("pending_media_urls") or []:
+                    if not url:
+                        continue
+                    meta = {}
+                    if url in analysis_by_url:
+                        meta = {"analysis": analysis_by_url[url]}
+                    await supabase_client.add_listing_image(draft_id, url, metadata=meta)
+
+                # Best-effort: seed vision_product/category from first analysis
+                first_analysis = None
+                if isinstance(analyses, list) and analyses:
+                    first = analyses[0]
+                    if isinstance(first, dict):
+                        first_analysis = first.get("analysis")
+                if isinstance(first_analysis, dict):
+                    try:
+                        existing = await supabase_client.get_draft(draft_id)
+                        listing_data = (existing or {}).get("listing_data") or {}
+                        if not (listing_data.get("category") or "").strip():
+                            suggested = str(first_analysis.get("category") or "").strip()
+                            if suggested:
+                                await supabase_client.update_draft_category(draft_id, suggested, vision_product=first_analysis)
+                        else:
+                            # still store vision_product
+                            existing_category = str(listing_data.get("category") or "").strip()
+                            await supabase_client.update_draft_category(
+                                draft_id,
+                                existing_category or "Diğer",
+                                vision_product=first_analysis,
+                            )
+                    except Exception:
+                        pass
+
+                # Clear pre-intent buffer after consumption
+                session["pending_media_urls"] = []
+                session["pending_media_analysis"] = []
+                session_dirty = True
+
+            draft_id = session.get("active_draft_id")
+            existing_draft = await supabase_client.get_draft(draft_id) if draft_id else None
+            if existing_draft and next_missing_slot(existing_draft) == "price" and user_asks_market_price(message_body):
+                listing = (existing_draft or {}).get("listing_data") or {}
+                vision = (existing_draft or {}).get("vision_product") or {}
+
+                title = (listing.get("title") or "").strip()
+                description = (listing.get("description") or "").strip()
+                category = (listing.get("category") or "").strip()
+                condition = ""
+                if isinstance(vision, dict):
+                    condition = str(vision.get("condition") or "").strip()
+
+                # If we don't have a title yet, fall back to vision product/category
+                if not title and isinstance(vision, dict):
+                    title = str(vision.get("product") or vision.get("category") or "").strip()
+
+                # If we don't have a category yet, let edge function handle defaulting.
+                price_resp = await supabase_client.suggest_price_cached(
+                    title=title or "Ürün",
+                    category=category or "Diğer",
+                    description=description or "",
+                    condition=condition or "İyi Durumda",
+                )
+
+                price_value = price_resp.get("price")
+                if price_resp.get("success") and price_value is not None:
+                    suggested = int(price_value)
+                    cached = bool(price_resp.get("cached"))
+                    confidence = price_resp.get("confidence")
+                    cached_txt = "(önbellekten)" if cached else "(webden güncel)"
+                    conf_txt = f" Güven: %{int(float(confidence) * 100)}." if confidence is not None else ""
+                    return await finalize_response({
+                        "success": True,
+                        "message": (
+                            f"Önerilen satış fiyatı: {suggested} ₺ {cached_txt}.{conf_txt} "
+                            "Fiyatı bu şekilde yazayım mı? (evet/hayır ya da kendi fiyatınızı yazın)"
+                        ),
+                        "data": {
+                            "type": "price_suggestion",
+                            "suggested_price": suggested,
+                            "cached": cached,
+                            "confidence": confidence,
+                            "details": price_resp.get("result"),
+                        },
+                        "intent": intent
+                    })
+
+                # If edge function fails, fall back to direct ask
+                return await finalize_response({
+                    "success": True,
+                    "message": "Şu an piyasa verisine erişemedim. Fiyatı siz yazar mısınız?",
+                    "data": {"type": "slot_prompt", "slot": "price"},
+                    "intent": intent
+                })
+
             composer = ComposerAgent()
-            # Pass all media URLs to composer, which can distribute to image agents
-            result = await composer.orchestrate_listing_creation(
-                user_message=message_body,
-                user_id=session.get("user_id"),
-                phone_number=session_id,  # Use session_id as identifier
-                draft_id=session.get("active_draft_id"),
-                media_urls=all_media_urls  # Pass list of all media URLs
-            )
+
+            # Reduce unnecessary LLM load: don't run composer on pure greetings.
+            run_composer = True
+            if looks_like_greeting(message_body):
+                run_composer = False
+
+            # Also don't run composer on pure flow commands like "ilan oluştur" when we already
+            # have media in the draft; otherwise title/description agents may hallucinate from
+            # an empty/command-only message.
+            if run_composer and is_command_only_message(message_body):
+                active_draft_id = session.get("active_draft_id")
+                if not existing_draft and isinstance(active_draft_id, str) and active_draft_id:
+                    existing_draft = await supabase_client.get_draft(active_draft_id)
+                if existing_draft and (existing_draft.get("images") or []):
+                    run_composer = False
+
+            # Pass no media URLs here because we already consumed pre-intent buffer into the draft.
+            # If you later want to support post-lock image uploads in this endpoint, they will still
+            # come through as media_urls and can be attached before calling composer.
+            result = None
+            if run_composer:
+                active_draft_id = session.get("active_draft_id")
+                composer_draft_id = active_draft_id if isinstance(active_draft_id, str) and active_draft_id else None
+                result = await composer.orchestrate_listing_creation(
+                    user_message=message_body,
+                    user_id=user_id,
+                    phone_number=session_id,  # Use session_id as identifier
+                    draft_id=composer_draft_id,
+                    media_urls=[]
+                )
+
+            # If we skipped composer (or composer failed), just read current draft
+            if not result:
+                draft_id = session.get("active_draft_id")
+                draft = await supabase_client.get_draft(draft_id) if draft_id else None
+                if not draft:
+                    return await finalize_response({
+                        "success": True,
+                        "message": "İlan taslağı için bir şeyler yazın veya fotoğraf yükleyin.",
+                        "data": {"type": "slot_prompt"},
+                        "intent": intent
+                    })
+                prompt = build_next_step_message(draft)
+                slot = next_missing_slot(draft)
+                return await finalize_response({
+                    "success": True,
+                    "message": prompt,
+                    "data": {"type": "slot_prompt", "slot": slot, "draft_id": draft_id},
+                    "intent": intent
+                })
             # Guard against unexpected None/invalid result
             if not result or not isinstance(result, dict):
                 return await finalize_response({
@@ -690,7 +1051,14 @@ async def process_webchat_message(
                     session_dirty = True
                 
                 draft = result["draft"]
-                response_text = build_draft_status_message(draft)
+
+                # Step-by-step UX: ask only the next missing slot.
+                # (Full summary is still available via build_draft_status_message if needed.)
+                slot = next_missing_slot(draft)
+                if slot is None:
+                    response_text = build_draft_status_message(draft)
+                else:
+                    response_text = build_next_step_message(draft)
                 
                 response_data.update({
                     "draft_id": result["draft_id"],
@@ -718,7 +1086,7 @@ async def process_webchat_message(
                 message_body=message_body,
                 session_id=session_id,
                 session=session,
-                user_id=session.get("user_id"),
+                user_id=user_id,
                 redis_disabled=redis_disabled,
                 session_dirty=session_dirty
             )
@@ -738,9 +1106,17 @@ async def process_webchat_message(
             })
         
         elif intent == "search_listings":
+            # If we have pre-intent buffered media analysis, enrich the search query with it.
+            if session.get("pending_media_urls") and session.get("pending_media_analysis"):
+                vision_query = extract_vision_search_query(session.get("pending_media_analysis") or [])
+                if vision_query:
+                    message_body = (message_body + " " + vision_query).strip()
+                session["pending_media_urls"] = []
+                session["pending_media_analysis"] = []
+                session_dirty = True
+
             # Handle simple "ilan listele" style requests deterministically.
             if is_browse_all_command(message_body):
-                from services import supabase_client
                 listings = await supabase_client.search_listings(limit=5)
                 LAST_SEARCH_CACHE[session_id] = listings
                 if not listings:
@@ -795,11 +1171,16 @@ async def process_webchat_message(
                             image_url = first_img.get("image_url") or first_img.get("public_url")
                         elif isinstance(first_img, str):
                             image_url = first_img
-                        extra_images = [
-                            img.get("image_url") or img.get("public_url") or img
-                            for img in listing["images"][1:]
-                            if isinstance(img, (dict, str))
-                        ]
+                        extra_images = []
+                        for img in listing["images"][1:]:
+                            if isinstance(img, dict):
+                                url = img.get("image_url") or img.get("public_url")
+                            elif isinstance(img, str):
+                                url = img
+                            else:
+                                url = None
+                            if url:
+                                extra_images.append(url)
                     detail_msg = f"![{title}]({image_url})\n" if image_url else ""
                     detail_msg += f"**{title}**\n{price_txt} | {location} | {category}\nSatıcı: {owner} | Telefon: {phone}\n\nAçıklama:\n{description}"
                     if extra_images:

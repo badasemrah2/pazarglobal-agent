@@ -8,7 +8,7 @@ from .title_agent import TitleAgent
 from .description_agent import DescriptionAgent
 from .price_agent import PriceAgent
 from .image_agent import ImageAgent
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from loguru import logger
 import asyncio
 import re
@@ -35,9 +35,9 @@ class ComposerAgent(BaseAgent):
         user_message: str,
         user_id: str,
         phone_number: str,
-        draft_id: str = None,
-        media_url: str = None,
-        media_urls: list = None
+        draft_id: Optional[str] = None,
+        media_url: Optional[str] = None,
+        media_urls: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Orchestrate the listing creation process.

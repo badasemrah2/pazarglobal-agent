@@ -1,13 +1,23 @@
-"""
-Redis client for state management
+"""services.redis_client
 
-TEMP DISABLED: No Redis instance in the current environment.
-All methods short-circuit to safe defaults to keep the app running.
+Session state store.
+
+This project can run without a Redis instance (e.g. local dev). In that case,
+we keep a lightweight in-memory fallback so session state (intent, drafts,
+pending media) does not reset every request.
 """
+
+from __future__ import annotations
+
 from typing import Optional, Dict, Any
 import json
 from loguru import logger
+
 # redis is intentionally not imported to avoid connection attempts when disabled
+
+
+_IN_MEMORY_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_IN_MEMORY_MESSAGES: Dict[str, list] = {}
 
 
 class RedisClient:
@@ -43,7 +53,8 @@ class RedisClient:
         """Get session state"""
         try:
             if self.disabled:
-                return None
+                data = _IN_MEMORY_SESSIONS.get(session_id)
+                return dict(data) if isinstance(data, dict) else None
             client = await self.get_client()
             data = await client.get(f"session:{session_id}")
             return json.loads(data) if data else None
@@ -55,6 +66,7 @@ class RedisClient:
         """Set session state with TTL (default 24 hours)"""
         try:
             if self.disabled:
+                _IN_MEMORY_SESSIONS[session_id] = dict(data)
                 return True
             client = await self.get_client()
             await client.setex(
@@ -71,6 +83,11 @@ class RedisClient:
         """Update session state"""
         try:
             if self.disabled:
+                session = _IN_MEMORY_SESSIONS.get(session_id) or {}
+                if not isinstance(session, dict):
+                    session = {}
+                session.update(updates)
+                _IN_MEMORY_SESSIONS[session_id] = session
                 return True
             session = await self.get_session(session_id) or {}
             session.update(updates)
@@ -83,6 +100,8 @@ class RedisClient:
         """Delete session state"""
         try:
             if self.disabled:
+                _IN_MEMORY_SESSIONS.pop(session_id, None)
+                _IN_MEMORY_MESSAGES.pop(session_id, None)
                 return True
             client = await self.get_client()
             await client.delete(f"session:{session_id}")
@@ -134,6 +153,9 @@ class RedisClient:
         """Add message to session history"""
         try:
             if self.disabled:
+                history = _IN_MEMORY_MESSAGES.get(session_id) or []
+                history.insert(0, message)
+                _IN_MEMORY_MESSAGES[session_id] = history[:100]
                 return True
             client = await self.get_client()
             await client.lpush(
@@ -151,7 +173,8 @@ class RedisClient:
         """Get recent messages from session"""
         try:
             if self.disabled:
-                return []
+                history = _IN_MEMORY_MESSAGES.get(session_id) or []
+                return history[:limit]
             client = await self.get_client()
             messages = await client.lrange(f"messages:{session_id}", 0, limit - 1)
             return [json.loads(msg) for msg in messages]

@@ -5,6 +5,7 @@ from supabase import create_client, Client
 from config import settings
 from typing import Optional, Dict, List, Any
 from loguru import logger
+import httpx
 
 
 class SupabaseClient:
@@ -17,6 +18,20 @@ class SupabaseClient:
     def client(self) -> Client:
         """Get or create Supabase client"""
         if self._client is None:
+            url = (settings.supabase_url or "").strip()
+            service_key = (settings.supabase_service_key or "").strip()
+
+            if not url.startswith(("http://", "https://")):
+                raise RuntimeError(
+                    "SUPABASE_URL is missing/invalid. Set it in pazarglobal-agent/.env "
+                    "(example: https://<project>.supabase.co)."
+                )
+
+            if not service_key or service_key.startswith("your_"):
+                raise RuntimeError(
+                    "SUPABASE_SERVICE_KEY is missing/invalid. Set your Supabase service role key in pazarglobal-agent/.env."
+                )
+
             self._client = create_client(
                 settings.supabase_url,
                 settings.supabase_service_key
@@ -407,6 +422,56 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error fetching market price data: {e}")
             return []
+
+    async def _call_edge_function(self, function_name: str, payload: Dict[str, Any], timeout_s: int = 30) -> Dict[str, Any]:
+        """Call a Supabase Edge Function.
+
+        Uses service role key to avoid RLS/Auth issues. Function URL pattern:
+        {SUPABASE_URL}/functions/v1/{function_name}
+        """
+        url = f"{settings.supabase_url.rstrip('/')}/functions/v1/{function_name}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.supabase_service_key}",
+            "apikey": settings.supabase_key,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                # Some deployments return non-JSON on errors
+                if resp.status_code >= 400:
+                    return {"success": False, "status": resp.status_code, "error": resp.text}
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"success": False, "status": resp.status_code, "error": "non_json_response", "raw": resp.text}
+        except Exception as e:
+            logger.error(f"Edge function call failed ({function_name}): {e}")
+            return {"success": False, "error": str(e)}
+
+    async def suggest_price_cached(
+        self,
+        title: str,
+        category: str,
+        description: Optional[str] = None,
+        condition: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get a price suggestion using the cached Perplexity pipeline.
+
+        This delegates caching/TTL/query logging to the `ai-assistant-cached` edge function.
+        It will:
+        - return cache hit if snapshot exists and not expired
+        - otherwise call Perplexity and upsert into `market_price_snapshots`
+        """
+        payload = {
+            "action": "suggest_price",
+            "category": category or "Diğer",
+            "title": title or "",
+            "description": description or "",
+            "condition": condition or "İyi Durumda",
+        }
+        return await self._call_edge_function("ai-assistant-cached", payload)
 
 
 # Global instance

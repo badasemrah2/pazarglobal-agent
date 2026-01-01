@@ -27,7 +27,7 @@ class OpenAIClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[str] = None
+        tool_choice: Optional[Any] = None
     ) -> Any:
         """
         Create a chat completion following OpenAI SDK patterns
