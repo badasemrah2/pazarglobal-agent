@@ -80,6 +80,60 @@ class SearchComposerAgent(BaseAgent):
         """
         try:
             message_lower = user_message.lower()
+
+            # If the user is asking a category classification question (not searching listings),
+            # answer directly to avoid confusing "0 ilan bulundu" responses.
+            if any(phrase in message_lower for phrase in [
+                "hangi kategoriye girer",
+                "hangi kategori",
+                "kategoriye girer",
+                "kategorisi ne",
+                "kategorisi nedir",
+            ]):
+                category_map = {
+                    # Automotive
+                    "araba": "Otomotiv",
+                    "otomobil": "Otomotiv",
+                    "citroen": "Otomotiv",
+                    "renault": "Otomotiv",
+                    "fiat": "Otomotiv",
+                    "toyota": "Otomotiv",
+                    "honda": "Otomotiv",
+                    # Electronics
+                    "telefon": "Elektronik",
+                    "iphone": "Elektronik",
+                    "samsung": "Elektronik",
+                    "xiaomi": "Elektronik",
+                    "harddisk": "Elektronik",
+                    "hard disk": "Elektronik",
+                    "ssd": "Elektronik",
+                    # Fashion
+                    "kazak": "Moda & Aksesuar",
+                    "ayakkabı": "Moda & Aksesuar",
+                    "ayakkabi": "Moda & Aksesuar",
+                    "elbise": "Moda & Aksesuar",
+                    "ceket": "Moda & Aksesuar",
+                }
+
+                chosen = None
+                for key, cat in category_map.items():
+                    if key in message_lower:
+                        chosen = cat
+                        break
+                if not chosen:
+                    chosen = "Diğer"
+
+                msg = f"Bence bu ürün için en uygun kategori: {chosen}."
+                return {
+                    "success": True,
+                    "listings": [],
+                    "listings_full": [],
+                    "count": 0,
+                    "market_data": {},
+                    "insights": [],
+                    "message": msg
+                }
+
             tasks = []
             
             # Determine which search agents to run
@@ -146,9 +200,11 @@ class SearchComposerAgent(BaseAgent):
                         msg_lines.append(f"![{title}]({image_url})")
                     if short_desc:
                         msg_lines.append(short_desc + "...")
+                    msg_lines.append("")
             if remaining > 0:
                 msg_lines.append(f"İlk {len(preview_listings)} tanesi gösterildi. Daha fazlası için söyleyin.")
-            msg_lines.append("Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
+            if preview_listings:
+                msg_lines.append("Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
             msg = "\n".join(msg_lines)
 
             # Attach cache marker for frontend parsing
