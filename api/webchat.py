@@ -222,6 +222,39 @@ def draft_is_publishable(draft: Dict[str, Any]) -> bool:
     return True
 
 
+def draft_has_any_content(draft: Dict[str, Any]) -> bool:
+    """Return True if draft has any meaningful user-provided content."""
+    listing = (draft or {}).get("listing_data") or {}
+    images = (draft or {}).get("images") or []
+    if images:
+        return True
+    for key in ["title", "description", "category"]:
+        val = listing.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+    if listing.get("price") is not None:
+        return True
+    return False
+
+
+def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> bool:
+    """Heuristic: if user explicitly starts a new listing, reset the single in-progress draft.
+
+    This avoids mixing data when the platform enforces one active draft per user.
+    Keep conservative: only reset on explicit create/sell phrases, not on 'devam'.
+    """
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if not is_create_listing_command(msg):
+        return False
+    # Don't reset when user says "devam"; they likely want to continue the current draft.
+    if msg in {"devam", "devam et"}:
+        return False
+    # Reset only if there's something to lose (draft already has content)
+    return draft_has_any_content(draft)
+
+
 async def handle_publish_or_delete_flow(
     message_body: str,
     session_id: str,
@@ -1144,6 +1177,16 @@ async def process_webchat_message(
                     draft_id = existing_draft.get("id")
                     session["active_draft_id"] = draft_id
                     session_dirty = True
+
+            # If the user explicitly starts a new listing, reset the single in-progress draft
+            # to prevent reusing an old item's data (common with non-sticky sessions).
+            if existing_draft and draft_id and should_reset_draft_for_new_listing(message_body, existing_draft):
+                try:
+                    ok = await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                    if ok:
+                        existing_draft = await supabase_client.get_draft(draft_id)
+                except Exception:
+                    pass
 
             # Deterministic slot filling: if the draft is missing exactly one next slot,
             # treat the user's next message as that slot input (avoid depending on sticky session state).
