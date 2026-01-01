@@ -739,6 +739,58 @@ async def process_webchat_message(
             session_dirty = True
         user_id = normalized_user_id
 
+        # Deterministic acceptance of a previously suggested price.
+        # This must NOT rely on in-memory session state because Railway may route
+        # consecutive requests to different instances when Redis is disabled.
+        if user_id and (is_confirm_command(message_body) or is_cancel_command(message_body)):
+            try:
+                latest = await supabase_client.get_latest_draft_for_user(user_id)
+                listing = (latest or {}).get("listing_data") or {}
+                if isinstance(listing, dict):
+                    pending_suggested = listing.get("_pending_price_suggestion")
+                else:
+                    pending_suggested = None
+
+                if latest and listing and listing.get("price") is None and pending_suggested is not None:
+                    draft_id = latest.get("id")
+                    if is_confirm_command(message_body):
+                        suggested_int = int(float(pending_suggested))
+                        ok = await supabase_client.update_draft_price(draft_id, float(suggested_int))
+                        # Clear the pending marker regardless of update return value; then verify.
+                        await supabase_client.clear_pending_price_suggestion(draft_id)
+                        updated = await supabase_client.get_draft(draft_id)
+                        updated_listing = (updated or {}).get("listing_data") or {}
+                        if ok or (isinstance(updated_listing, dict) and updated_listing.get("price") is not None):
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or {}),
+                                "data": {
+                                    "intent": "create_listing",
+                                    "draft_id": draft_id,
+                                    "draft": updated,
+                                    "type": "draft_update",
+                                },
+                                "intent": "create_listing",
+                            })
+                        return await finalize_response({
+                            "success": True,
+                            "message": "Fiyatı otomatik yazamadım. Lütfen fiyatı siz yazar mısınız?",
+                            "data": {"type": "slot_prompt", "slot": "price", "draft_id": draft_id},
+                            "intent": "create_listing",
+                        })
+
+                    # Cancel: user rejected the suggestion
+                    await supabase_client.clear_pending_price_suggestion(draft_id)
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Peki. Fiyatı siz yazar mısınız?",
+                        "data": {"type": "slot_prompt", "slot": "price", "draft_id": draft_id},
+                        "intent": "create_listing",
+                    })
+            except Exception:
+                # Fall through to normal handling
+                pass
+
         # If user issues a publish/delete command, override any sticky intent.
         # Otherwise the session may remain in create_listing and never reach PublishDeleteAgent.
         if is_publish_command(message_body) or is_delete_command(message_body):
@@ -1013,6 +1065,12 @@ async def process_webchat_message(
                     }
                     session_dirty = True
 
+                    # Persist suggestion into the draft so confirm/cancel works without session stickiness.
+                    try:
+                        await supabase_client.set_pending_price_suggestion(draft_id, suggested)
+                    except Exception:
+                        pass
+
                     return await finalize_response({
                         "success": True,
                         "message": (
@@ -1022,6 +1080,7 @@ async def process_webchat_message(
                         "data": {
                             "type": "price_suggestion",
                             "suggested_price": suggested,
+                            "draft_id": draft_id,
                             "cached": cached,
                             "confidence": confidence,
                             "details": price_resp.get("result"),

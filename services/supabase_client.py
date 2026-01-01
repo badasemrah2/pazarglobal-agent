@@ -133,6 +133,66 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error getting draft: {e}")
             return None
+
+    async def get_latest_draft_for_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get the most recent draft for a user (best-effort)."""
+        try:
+            result = (
+                self.client.table("active_drafts")
+                .select("*")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logger.error(f"Error getting latest draft for user: {e}")
+            return None
+
+    async def set_pending_price_suggestion(self, draft_id: str, suggested_price: int) -> bool:
+        """Persist a pending suggested price into listing_data so any instance can later apply it."""
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["_pending_price_suggestion"] = int(suggested_price)
+            updated = (
+                self.client.table("active_drafts")
+                .update({"listing_data": listing_data})
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Failed to persist pending price suggestion: {e}")
+            return False
+
+    async def clear_pending_price_suggestion(self, draft_id: str) -> bool:
+        """Remove the persisted pending suggested price from listing_data."""
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            if "_pending_price_suggestion" in listing_data:
+                listing_data.pop("_pending_price_suggestion", None)
+                updated = (
+                    self.client.table("active_drafts")
+                    .update({"listing_data": listing_data})
+                    .eq("id", draft_id)
+                    .execute()
+                )
+                return bool(updated.data)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to clear pending price suggestion: {e}")
+            return False
     
     async def update_draft_title(self, draft_id: str, title: str) -> bool:
         """Update draft title inside listing_data"""
@@ -201,6 +261,10 @@ class SupabaseClient:
                 "field_value": price
             }).execute()
             if result.data:
+                try:
+                    await self.clear_pending_price_suggestion(draft_id)
+                except Exception:
+                    pass
                 return True
         except Exception as e:
             logger.warning(f"RPC update_listing_field failed for price (falling back to direct update): {e}")
@@ -213,6 +277,7 @@ class SupabaseClient:
             if not isinstance(listing_data, dict):
                 listing_data = {}
             listing_data["price"] = price
+            listing_data.pop("_pending_price_suggestion", None)
             updated = self.client.table("active_drafts").update({
                 "listing_data": listing_data,
             }).eq("id", draft_id).execute()
