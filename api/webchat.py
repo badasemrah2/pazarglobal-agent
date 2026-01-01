@@ -95,12 +95,26 @@ def is_create_listing_command(message: str) -> bool:
     if not msg:
         return False
     # Explicit create/sell commands
-    if msg in {"ilan oluştur", "ilan olustur", "ilan ver", "sat", "satıyorum", "satiyorum", "satmak istiyorum"}:
+    if msg in {
+        "ilan oluştur",
+        "ilan olustur",
+        "ilan ver",
+        "ilan vermek istiyorum",
+        "ilan koymak istiyorum",
+        "ilan girmek istiyorum",
+        "sat",
+        "satıyorum",
+        "satiyorum",
+        "satmak istiyorum",
+    }:
         return True
     return any(phrase in msg for phrase in [
         "ilan oluştur",
         "ilan olustur",
         "ilan ver",
+        "ilan vermek istiyorum",
+        "ilan koymak istiyorum",
+        "ilan girmek istiyorum",
         "satmak istiyorum",
         "satıyorum",
         "satiyorum",
@@ -866,13 +880,22 @@ async def process_webchat_message(
                 # Fall through to normal handling
                 pass
 
-        # If user issues a publish/delete command, override any sticky intent.
-        # Otherwise the session may remain in create_listing and never reach PublishDeleteAgent.
+        # If user issues a publish/delete/create command, override any sticky intent.
+        # This prevents getting stuck in a previous flow (e.g., search_listings) when the user explicitly
+        # changes their mind and wants to sell or publish.
         if is_publish_command(message_body) or is_delete_command(message_body):
             session["intent"] = "publish_or_delete"
+            session["locked_intent"] = "publish_or_delete"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "publish_or_delete")
+
+        if is_create_listing_command(message_body) and not (is_publish_command(message_body) or is_delete_command(message_body)):
+            session["intent"] = "create_listing"
+            session["locked_intent"] = "create_listing"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, "create_listing")
         
         # Store message in history
         if not redis_disabled:
