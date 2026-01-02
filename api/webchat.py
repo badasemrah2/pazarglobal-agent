@@ -603,6 +603,8 @@ def is_command_only_message(message: str) -> bool:
 def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
     listing = (draft or {}).get("listing_data") or {}
     images = (draft or {}).get("images") or []
+    # DEBUG: log draft state to diagnose photo-loss loop
+    logger.debug(f"next_missing_slot: draft_id={draft.get('id')}, images_count={len(images)}, listing_keys={list(listing.keys())}")
     # Ask for images first only if none exists (keeps flow predictable)
     if not images:
         return "images"
@@ -1242,6 +1244,8 @@ async def process_webchat_message(
                     draft_id = existing_draft.get("id")
                     session["active_draft_id"] = draft_id
                     session_dirty = True
+                    # DEBUG: log recovered draft state
+                    logger.info(f"Recovered draft {draft_id} for user {user_id}: images={len(existing_draft.get('images') or [])}")
 
             # If the user explicitly starts a new listing, reset the single in-progress draft
             # to prevent reusing an old item's data (common with non-sticky sessions).
