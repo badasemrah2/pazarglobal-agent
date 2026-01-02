@@ -526,6 +526,14 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
             parts.append(str(fallback))
         summary_lines.append(f"Fotoğraf {idx}: " + "; ".join(parts))
 
+    if not summary_lines:
+        summary_lines.append("Görseller analiz edilemedi.")
+
+    prompt_line = (
+        "Bu ürün için ne yapmak istersiniz? 'ilan oluştur' yazarak satış taslağı başlatabilir "
+        "veya 'benzer ara' yazarak benzer ürünleri inceleyebilirsiniz."
+    )
+
     return "\n\n".join([
         "🔎 Görsel analizi hazır!",
         "\n".join(summary_lines),
