@@ -1399,6 +1399,24 @@ async def process_webchat_message(
         intent = session.get("intent")
         locked_intent = session.get("locked_intent")
 
+        # INTENT SWITCH ERGONOMICS:
+        # If the user is locked in create_listing but says a clear search command (e.g. "benzer ara"),
+        # don't silently ignore it. Guide them to the explicit cancel keyword.
+        if locked_intent == "create_listing" and is_search_command(message_body):
+            return await finalize_response({
+                "success": True,
+                "message": (
+                    "Şu an ilan oluşturma akışındasın. Arama moduna geçmek için önce 'iptal' (veya 'vazgeç') yaz. "
+                    "Sonra 'benzer ara' ya da 'telefon ara' gibi arama isteğini yazabilirsin."
+                ),
+                "data": {
+                    "type": "conversation",
+                    "intent": "create_listing",
+                    "hint": {"cancel": "iptal", "then": "benzer ara"},
+                },
+                "intent": "create_listing",
+            })
+
         # Sticky intent: once locked_intent is set, do not re-run global routing.
         # Publish/delete can still temporarily override.
         if locked_intent and intent != "publish_or_delete":

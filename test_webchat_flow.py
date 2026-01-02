@@ -302,3 +302,43 @@ async def test_global_cancel_resets_locked_intent_and_draft(monkeypatch: MonkeyP
     assert r["intent"] == "small_talk"
     assert fake_supabase.reset_called_with, "Draft should be reset on global cancel"
     assert fake_supabase.cleared_pending_publish == ["d1"]
+
+
+@pytest.mark.asyncio
+async def test_locked_create_listing_search_command_prompts_cancel_hint(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return {
+                "id": draft_id,
+                "listing_data": {"title": None, "description": None, "price": None, "category": None},
+                "images": [{"image_url": "https://example.com/x.jpg", "metadata": {}}],
+                "vision_product": {},
+            }
+
+        async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
+            return None
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_locked"] = {
+        "user_id": "u_locked",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d_locked",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    r = await webchat.process_webchat_message(
+        message_body="benzer ara",
+        session_id="s_locked",
+        user_id="u_locked",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    assert r["intent"] == "create_listing"
+    assert "iptal" in r["message"].lower()
