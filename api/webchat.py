@@ -1788,6 +1788,60 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
     session["pending_media_analysis"] = analyses
     message_text = format_media_analysis_message(analyses)
 
+    # IMPORTANT (non-sticky sessions): persist uploaded media into the active draft.
+    # The frontend uses /media/analyze, and the follow-up "ilan oluştur" message may
+    # land on a different instance where in-memory session state is missing.
+    if normalized_user_id and merged_urls:
+        try:
+            draft = None
+            draft_id = session.get("active_draft_id")
+            if isinstance(draft_id, str) and draft_id:
+                draft = await supabase_client.get_draft(draft_id)
+
+            if not draft:
+                draft = await supabase_client.get_latest_draft_for_user(normalized_user_id)
+                draft_id = (draft or {}).get("id")
+
+            # If we're starting fresh and the existing draft has non-media fields, reset it
+            # (avoid leaking old title/price/category into the new photo-first flow).
+            if draft and draft_id and session.get("start_fresh_draft") and draft_has_non_media_content(draft):
+                ok = await supabase_client.reset_draft(draft_id, phone_number=chat_message.session_id)
+                if ok:
+                    draft = await supabase_client.get_draft(draft_id)
+
+            if not draft:
+                draft = await supabase_client.create_draft(user_id=normalized_user_id, phone_number=chat_message.session_id)
+                draft_id = (draft or {}).get("id")
+
+            if draft_id:
+                session["active_draft_id"] = draft_id
+                session.pop("start_fresh_draft", None)
+
+                analysis_by_url: Dict[str, Any] = {}
+                for entry in analyses or []:
+                    if isinstance(entry, dict) and entry.get("image_url"):
+                        analysis_by_url[str(entry["image_url"])] = entry.get("analysis")
+
+                for url in merged_urls:
+                    if not url:
+                        continue
+                    analysis = analysis_by_url.get(url)
+                    meta = {"analysis": analysis} if isinstance(analysis, dict) and analysis else None
+                    await supabase_client.add_listing_image(draft_id, url, metadata=meta)
+
+                # Best-effort: store the first analysis as draft.vision_product
+                first_analysis = None
+                for entry in analyses or []:
+                    a = (entry or {}).get("analysis") if isinstance(entry, dict) else None
+                    if isinstance(a, dict) and a:
+                        first_analysis = a
+                        break
+                if isinstance(first_analysis, dict) and first_analysis:
+                    await supabase_client.update_draft_vision_product(draft_id, first_analysis)
+        except Exception:
+            # Never fail the media analysis response because of draft persistence
+            pass
+
     await persist_session_state(chat_message.session_id, session)
 
     if not redis_is_disabled():
