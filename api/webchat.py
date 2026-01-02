@@ -29,6 +29,95 @@ MEDIA_ANALYSIS_SYSTEM_PROMPT = (
 MEDIA_ANALYSIS_USER_PROMPT = (
     "Lütfen görseldeki ürünü analiz et ve yukarıdaki JSON şemasını doldur. Ürünün türünü, olası kullanım alanını, durumunu ve dikkat çeken özelliklerini belirt."
 )
+
+
+def redis_is_disabled() -> bool:
+    """Centralize redis enabled/disabled checks."""
+    return bool(getattr(redis_client, "disabled", False))
+
+
+async def load_session_state(session_id: str) -> Optional[Dict[str, Any]]:
+    """Load session either from Redis or in-memory fallback."""
+    if redis_is_disabled():
+        return IN_MEMORY_SESSION_CACHE.get(session_id)
+    return await redis_client.get_session(session_id)
+
+
+async def persist_session_state(session_id: str, session: Dict[str, Any]) -> None:
+    """Persist session state regardless of backend availability."""
+    if redis_is_disabled():
+        IN_MEMORY_SESSION_CACHE[session_id] = session
+        return
+    await redis_client.set_session(session_id, session)
+
+
+def remove_session_state(session_id: str) -> None:
+    """Remove session from fallback cache when Redis is disabled."""
+    if redis_is_disabled():
+        IN_MEMORY_SESSION_CACHE.pop(session_id, None)
+
+
+def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
+    """Merge new media URLs while preserving order and removing duplicates."""
+    seen: set[str] = set()
+    merged: List[str] = []
+    for url in (existing or []) + (new_urls or []):
+        if url and url not in seen:
+            merged.append(url)
+            seen.add(url)
+    return merged
+
+
+def is_publish_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in [
+        "yayınla",
+        "yayınla!",
+        "yayinla",
+        "yayina",
+        "yayınlamak",
+        "yayinlamak",
+        "publish",
+    ])
+
+
+def is_delete_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
+
+
+def is_create_listing_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+
+    # Explicit create/sell commands
+    if msg in {
+        "ilan oluştur",
+        "ilan olustur",
+        "ilan ver",
+        "ilan vermek istiyorum",
+        "ilan koymak istiyorum",
+        "ilan girmek istiyorum",
+        "sat",
+        "satıyorum",
+        "satiyorum",
+        "satmak istiyorum",
+    }:
+        return True
+
+    return any(phrase in msg for phrase in [
+        "ilan oluştur",
+        "ilan olustur",
+        "ilan ver",
+        "ilan vermek istiyorum",
+        "ilan koymak istiyorum",
+        "ilan girmek istiyorum",
+        "satmak istiyorum",
         "satıyorum",
         "satiyorum",
         "satacağım",
