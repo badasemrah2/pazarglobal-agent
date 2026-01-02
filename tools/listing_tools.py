@@ -2,8 +2,10 @@
 Listing management tools (publish, delete, search)
 """
 from typing import Dict, Any, Optional
+from loguru import logger
 from .base_tool import BaseTool
 from services import supabase_client
+from services.supabase_client import InsufficientCreditsError
 
 
 class PublishListingTool(BaseTool):
@@ -36,13 +38,20 @@ class PublishListingTool(BaseTool):
         }
     
     async def execute(self, draft_id: str, user_id: str, credit_cost: int = 0) -> Dict[str, Any]:
-        listing = await supabase_client.publish_listing(draft_id, user_id, cost=credit_cost)
+        try:
+            listing = await supabase_client.publish_listing(draft_id, user_id, cost=credit_cost)
+        except InsufficientCreditsError as exc:
+            return self.format_error(str(exc))
+        except Exception as exc:
+            logger.error(f"Publish listing tool failed: {exc}")
+            return self.format_error("Yayınlama sırasında beklenmeyen bir hata oluştu.")
+
         if listing:
             return self.format_success({
                 "listing_id": listing["id"],
                 "message": "İlan başarıyla yayınlandı"
             })
-        return self.format_error("Failed to publish listing")
+        return self.format_error("İlan yayınlanamadı.")
 
 
 class DeleteListingTool(BaseTool):

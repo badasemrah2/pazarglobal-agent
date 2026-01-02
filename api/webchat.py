@@ -29,93 +29,6 @@ MEDIA_ANALYSIS_SYSTEM_PROMPT = (
 MEDIA_ANALYSIS_USER_PROMPT = (
     "Lütfen görseldeki ürünü analiz et ve yukarıdaki JSON şemasını doldur. Ürünün türünü, olası kullanım alanını, durumunu ve dikkat çeken özelliklerini belirt."
 )
-
-
-def redis_is_disabled() -> bool:
-    """Centralize redis enabled/disabled checks."""
-    return getattr(redis_client, "disabled", False)
-
-
-async def load_session_state(session_id: str) -> Optional[Dict[str, Any]]:
-    """Load session either from Redis or in-memory fallback."""
-    if redis_is_disabled():
-        return IN_MEMORY_SESSION_CACHE.get(session_id)
-    return await redis_client.get_session(session_id)
-
-
-async def persist_session_state(session_id: str, session: Dict[str, Any]) -> None:
-    """Persist session state regardless of backend availability."""
-    if redis_is_disabled():
-        IN_MEMORY_SESSION_CACHE[session_id] = session
-        return
-    await redis_client.set_session(session_id, session)
-
-
-def remove_session_state(session_id: str) -> None:
-    """Remove session from fallback cache when Redis is disabled."""
-    if redis_is_disabled():
-        IN_MEMORY_SESSION_CACHE.pop(session_id, None)
-
-
-def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
-    """Merge new media URLs while preserving order and removing duplicates."""
-    seen: set[str] = set()
-    merged: List[str] = []
-    for url in existing + new_urls:
-        if url and url not in seen:
-            merged.append(url)
-            seen.add(url)
-    return merged
-
-
-def is_publish_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    return any(token in msg for token in [
-        "yayınla",
-        "yayınla!",
-        "yayinla",
-        "yayina",
-        "yayınlamak",
-        "yayinlamak",
-        "publish",
-    ])
-
-
-def is_delete_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
-
-
-def is_create_listing_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    # Explicit create/sell commands
-    if msg in {
-        "ilan oluştur",
-        "ilan olustur",
-        "ilan ver",
-        "ilan vermek istiyorum",
-        "ilan koymak istiyorum",
-        "ilan girmek istiyorum",
-        "sat",
-        "satıyorum",
-        "satiyorum",
-        "satmak istiyorum",
-    }:
-        return True
-    return any(phrase in msg for phrase in [
-        "ilan oluştur",
-        "ilan olustur",
-        "ilan ver",
-        "ilan vermek istiyorum",
-        "ilan koymak istiyorum",
-        "ilan girmek istiyorum",
-        "satmak istiyorum",
         "satıyorum",
         "satiyorum",
         "satacağım",
@@ -303,11 +216,67 @@ async def handle_publish_or_delete_flow(
             "intent": "publish_or_delete"
         }
 
-    # Pending confirmation state
-    pending = session.get("pending_publish")
-    if isinstance(pending, dict) and pending.get("draft_id") == draft_id:
+    listing_data = draft.get("listing_data") or {}
+    if not isinstance(listing_data, dict):
+        listing_data = {}
+
+    session_pending = session.get("pending_publish")
+    db_pending = listing_data.get("_pending_publish") if isinstance(listing_data, dict) else None
+    if (
+        (not isinstance(session_pending, dict) or session_pending.get("draft_id") != draft_id)
+        and isinstance(db_pending, dict)
+        and db_pending.get("draft_id") == draft_id
+    ):
+        session["pending_publish"] = db_pending
+        session_pending = db_pending
+        session_dirty = True
+
+    pending = session_pending if isinstance(session_pending, dict) and session_pending.get("draft_id") == draft_id else None
+
+    if pending:
+        edit_request = extract_preview_edit(message_body)
+        if edit_request:
+            edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"])
+            if not edit_result.get("success"):
+                return {
+                    "success": False,
+                    "message": edit_result.get("message") or "Değişiklik kaydedilemedi.",
+                    "data": {"type": "publish_preview", "draft_id": draft_id},
+                    "intent": "publish_or_delete",
+                    "_session_dirty": session_dirty
+                }
+
+            updated_draft = edit_result.get("draft") or draft
+            preview_data = build_draft_preview_payload(updated_draft)
+            pending["preview"] = preview_data
+            session["pending_publish"] = pending
+            session_dirty = True
+            await supabase_client.set_pending_publish_state(draft_id, pending)
+
+            cost = int(pending.get("cost") or settings.listing_credit_cost)
+            balance = pending.get("balance")
+            message_text = format_preview_message(
+                preview_data,
+                cost,
+                balance,
+                highlight=edit_result.get("message")
+            )
+            return {
+                "success": True,
+                "message": message_text,
+                "data": {
+                    "type": "publish_preview",
+                    "draft_id": draft_id,
+                    "preview": preview_data,
+                    "credit_cost": cost
+                },
+                "intent": "publish_or_delete",
+                "_session_dirty": session_dirty
+            }
+
         if is_cancel_command(message_body):
             session.pop("pending_publish", None)
+            await supabase_client.clear_pending_publish_state(draft_id)
             session_dirty = True
             return {
                 "success": True,
@@ -321,7 +290,7 @@ async def handle_publish_or_delete_flow(
             cost = int(pending.get("cost") or settings.listing_credit_cost)
             result = await publish_listing_tool.execute(draft_id=draft_id, user_id=user_id, credit_cost=cost)
             if result.get("success"):
-                # Clear session state after publish
+                await supabase_client.clear_pending_publish_state(draft_id)
                 session.pop("pending_publish", None)
                 session["active_draft_id"] = None
                 session["intent"] = None
@@ -342,12 +311,22 @@ async def handle_publish_or_delete_flow(
                 "_session_dirty": session_dirty
             }
 
-        # If pending exists but user didn't confirm/cancel, re-prompt succinctly.
         cost = int(pending.get("cost") or settings.listing_credit_cost)
+        preview_data = pending.get("preview") or build_draft_preview_payload(draft)
+        pending["preview"] = preview_data
+        session["pending_publish"] = pending
+        session_dirty = True
+        await supabase_client.set_pending_publish_state(draft_id, pending)
+        message_text = format_preview_message(preview_data, cost, pending.get("balance"))
         return {
             "success": True,
-            "message": f"Yayınlama ücreti {cost} kredi. Onaylıyorsanız 'onayla', vazgeçmek için 'iptal' yazın.",
-            "data": {"type": "publish_delete"},
+            "message": message_text,
+            "data": {
+                "type": "publish_preview",
+                "draft_id": draft_id,
+                "preview": preview_data,
+                "credit_cost": cost
+            },
             "intent": "publish_or_delete",
             "_session_dirty": session_dirty
         }
@@ -362,25 +341,33 @@ async def handle_publish_or_delete_flow(
             "_session_dirty": session_dirty
         }
 
-    # If user said publish (or we are in publish intent), ask a single confirmation
     balance_result = await get_wallet_balance_tool.execute(user_id=user_id)
     balance = None
     if balance_result.get("success"):
         balance = (balance_result.get("data") or {}).get("balance")
     cost = int(settings.listing_credit_cost)
+    preview_data = build_draft_preview_payload(draft)
 
-    # If user is just saying publish/onay, start confirmation step
-    session["pending_publish"] = {"draft_id": draft_id, "cost": cost}
+    pending_payload = {
+        "draft_id": draft_id,
+        "cost": cost,
+        "balance": balance,
+        "preview": preview_data
+    }
+
+    session["pending_publish"] = pending_payload
     session_dirty = True
+    await supabase_client.set_pending_publish_state(draft_id, pending_payload)
 
-    balance_text = f"Mevcut bakiyeniz: {balance} kredi. " if balance is not None else ""
     return {
         "success": True,
-        "message": (
-            f"İlanı yayınlamak üzeresiniz. {balance_text}Yayınlama ücreti: {cost} kredi. "
-            "Onaylıyorsanız 'onayla', vazgeçmek için 'iptal' yazın."
-        ),
-        "data": {"type": "publish_delete", "draft_id": draft_id, "credit_cost": cost},
+        "message": format_preview_message(preview_data, cost, balance),
+        "data": {
+            "type": "publish_preview",
+            "draft_id": draft_id,
+            "preview": preview_data,
+            "credit_cost": cost
+        },
         "intent": "publish_or_delete",
         "_session_dirty": session_dirty
     }
@@ -449,14 +436,6 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
             fallback = analysis.get("summary") or analysis.get("description") or "Detay bulunamadı"
             parts.append(str(fallback))
         summary_lines.append(f"Fotoğraf {idx}: " + "; ".join(parts))
-
-    if not summary_lines:
-        summary_lines.append("Görseller analiz edilemedi.")
-
-    prompt_line = (
-        "Bu ürün için ne yapmak istersiniz? 'ilan oluştur' yazarak satış taslağı başlatabilir "
-        "veya 'benzer ara' yazarak benzer ürünleri inceleyebilirsiniz."
-    )
 
     return "\n\n".join([
         "🔎 Görsel analizi hazır!",
@@ -554,6 +533,166 @@ def build_draft_status_message(draft: Dict[str, Any]) -> str:
         message_parts.append("Tüm temel bilgiler tamam. Hazırsanız 'yayınla' yazarak ilanı yayınlayabilirsiniz.")
 
     return "\n\n".join(part.strip() for part in message_parts if part.strip())
+
+
+def _extract_preview_image_url(entry: Any) -> Optional[str]:
+    if isinstance(entry, dict):
+        for key in ["image_url", "public_url", "url", "path"]:
+            val = entry.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    elif isinstance(entry, str) and entry.strip():
+        return entry.strip()
+    return None
+
+
+def build_draft_preview_payload(draft: Dict[str, Any]) -> Dict[str, Any]:
+    listing = (draft or {}).get("listing_data") or {}
+    description = str(listing.get("description") or "").strip()
+    if len(description) > 280:
+        description_preview = description[:277] + "..."
+    else:
+        description_preview = description
+
+    images: List[str] = []
+    for entry in (draft or {}).get("images") or []:
+        url = _extract_preview_image_url(entry)
+        if url:
+            images.append(url)
+
+    return {
+        "draft_id": draft.get("id"),
+        "title": str(listing.get("title") or "").strip(),
+        "description": description_preview,
+        "full_description": description,
+        "price": listing.get("price"),
+        "category": str(listing.get("category") or "").strip(),
+        "images": images,
+        "image_count": len(images),
+        "vision": draft.get("vision_product") if isinstance(draft.get("vision_product"), dict) else None,
+    }
+
+
+def format_preview_message(
+    preview: Dict[str, Any],
+    cost: int,
+    balance: Optional[float] = None,
+    highlight: Optional[str] = None
+) -> str:
+    lines: List[str] = ["📝 Yayın öncesi kontrol:"]
+
+    title = preview.get("title") or "—"
+    description = preview.get("description") or "—"
+    price = preview.get("price")
+    if isinstance(price, (int, float)):
+        price_text = f"{int(price):,} ₺".replace(",", ".")
+    else:
+        price_text = str(price) if price else "—"
+    category = preview.get("category") or "—"
+    image_count = preview.get("image_count") or 0
+
+    lines.append(f"• Başlık: {title}")
+    lines.append(f"• Açıklama: {description}")
+    lines.append(f"• Fiyat: {price_text}")
+    lines.append(f"• Kategori: {category}")
+    lines.append(f"• Fotoğraflar: {image_count} adet")
+
+    vision = preview.get("vision")
+    if isinstance(vision, dict):
+        vision_lines: List[str] = []
+        if vision.get("condition"):
+            vision_lines.append(f"Durum: {vision['condition']}")
+        features = vision.get("features")
+        if isinstance(features, list) and features:
+            feature_txt = ", ".join([str(f) for f in features[:3] if f])
+            if feature_txt:
+                vision_lines.append(f"Özellikler: {feature_txt}")
+        vision_desc = vision.get("description")
+        if vision_desc:
+            vision_lines.append(f"Not: {vision_desc}")
+        if vision_lines:
+            lines.append("")
+            lines.append("🔎 Görsel analizi:")
+            lines.extend(f"• {entry}" for entry in vision_lines)
+
+    if highlight:
+        lines.append("")
+        lines.append(highlight)
+
+    balance_text = ""
+    if balance is not None:
+        balance_text = f"Mevcut bakiyeniz: {int(balance)} kredi. "
+    lines.append("")
+    lines.append(
+        f"{balance_text}Yayın ücreti {cost} kredi. Onay için 'onayla', düzenleme için 'başlık: ...', 'açıklama: ...', 'fiyat: ...', 'kategori: ...', iptal için 'iptal' yazabilirsiniz."
+    )
+
+    return "\n".join(lines)
+
+
+_PREVIEW_EDIT_KEYWORDS = {
+    "title": ["başlık", "baslik", "başlığı", "basligi", "title"],
+    "description": ["açıklama", "aciklama", "açıklamayı", "aciklamayi", "description"],
+    "price": ["fiyat", "price"],
+    "category": ["kategori", "category"],
+}
+
+
+def extract_preview_edit(message: str) -> Optional[Dict[str, str]]:
+    if not message:
+        return None
+    text = message.strip()
+    if not text:
+        return None
+    for field, keywords in _PREVIEW_EDIT_KEYWORDS.items():
+        for keyword in keywords:
+            pattern = rf"{keyword}\s*(?:[:=])\s*(.+)"
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                value = match.group(1).strip()
+                if value:
+                    return {"field": field, "value": value}
+    return None
+
+
+async def apply_preview_edit(draft_id: str, field: str, value: str) -> Dict[str, Any]:
+    if not draft_id:
+        return {"success": False, "message": "Aktif taslak bulunamadı."}
+    clean_value = (value or "").strip()
+    if not clean_value:
+        return {"success": False, "message": "Yeni değeri anlayamadım."}
+
+    success = False
+    feedback = ""
+
+    if field == "title":
+        if len(clean_value) < 3:
+            return {"success": False, "message": "Başlık en az 3 karakter olmalı."}
+        success = await supabase_client.update_draft_title(draft_id, clean_value)
+        feedback = "Başlık güncellendi."
+    elif field == "description":
+        if len(clean_value) < 10:
+            return {"success": False, "message": "Açıklama biraz daha detaylı olmalı (en az 10 karakter)."}
+        success = await supabase_client.update_draft_description(draft_id, clean_value)
+        feedback = "Açıklama güncellendi."
+    elif field == "price":
+        parsed = parse_price_input(clean_value)
+        if parsed is None:
+            return {"success": False, "message": "Fiyatı sayısal olarak yazın (örn: 12500)."}
+        success = await supabase_client.update_draft_price(draft_id, float(parsed))
+        feedback = "Fiyat güncellendi."
+    elif field == "category":
+        normalized = normalize_category_input(clean_value) or clean_value.title()
+        success = await supabase_client.update_draft_category(draft_id, normalized)
+        feedback = f"Kategori '{normalized}' olarak güncellendi."
+    else:
+        return {"success": False, "message": "Bu alanı düzenleyemiyorum."}
+
+    if not success:
+        return {"success": False, "message": "Değişiklik kaydedilemedi. Lütfen tekrar deneyin."}
+
+    updated = await supabase_client.get_draft(draft_id)
+    return {"success": True, "message": feedback, "draft": updated}
 
 
 _GREETING_TOKENS = {

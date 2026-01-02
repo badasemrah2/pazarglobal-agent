@@ -2,8 +2,10 @@
 Wallet and credit management tools
 """
 from typing import Dict, Any
+from loguru import logger
 from .base_tool import BaseTool
 from services import supabase_client
+from services.supabase_client import InsufficientCreditsError
 
 
 class GetWalletBalanceTool(BaseTool):
@@ -64,14 +66,19 @@ class DeductCreditsTool(BaseTool):
         }
     
     async def execute(self, user_id: str, amount: int, description: str) -> Dict[str, Any]:
-        success = await supabase_client.deduct_credits(user_id, amount, description)
-        if success:
-            return self.format_success({
-                "deducted": amount,
-                "description": description,
-                "message": "Credits deducted successfully"
-            })
-        return self.format_error("Insufficient balance or failed to deduct credits")
+        try:
+            await supabase_client.deduct_credits(user_id, amount, description)
+        except InsufficientCreditsError as exc:
+            return self.format_error(str(exc))
+        except Exception as exc:
+            logger.error(f"Deduct credits tool failed: {exc}")
+            return self.format_error("Kredi düşülürken beklenmeyen bir hata oluştu.")
+
+        return self.format_success({
+            "deducted": amount,
+            "description": description,
+            "message": "Credits deducted successfully"
+        })
 
 
 # Tool instances

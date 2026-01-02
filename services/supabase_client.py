@@ -11,6 +11,21 @@ import re
 from .metadata_keywords import generate_listing_keywords
 
 
+class InsufficientCreditsError(Exception):
+    """Raised when wallet balance is not enough to publish a listing."""
+
+    def __init__(self, required: int, balance: Optional[int]):
+        self.required = int(required or 0)
+        self.balance = int(balance) if balance is not None else None
+        if self.balance is None:
+            message = f"Cüzdan bakiyesi doğrulanamadı. Yayın için {self.required} kredi gerekiyor."
+        else:
+            message = (
+                f"Bakiyeniz yetersiz. Yayın için {self.required} kredi gerekli, mevcut bakiye {self.balance} kredi."
+            )
+        super().__init__(message)
+
+
 class SupabaseClient:
     """Supabase database client"""
     
@@ -40,6 +55,44 @@ class SupabaseClient:
                 settings.supabase_service_key
             )
         return self._client
+
+    def _normalize_image_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
+        """Return a consistent image payload with image_url + metadata."""
+        if entry is None:
+            return None
+        url: str = ""
+        metadata: Dict[str, Any] = {}
+
+        if isinstance(entry, dict):
+            raw_url = entry.get("image_url") or entry.get("public_url") or entry.get("url") or entry.get("path")
+            if isinstance(raw_url, str):
+                url = raw_url.strip()
+            raw_meta = entry.get("metadata")
+            if isinstance(raw_meta, dict):
+                metadata = raw_meta
+        elif isinstance(entry, str):
+            url = entry.strip()
+        else:
+            return None
+
+        if not url:
+            return None
+        return {"image_url": url, "metadata": metadata}
+
+    def _normalize_images(self, images: List[Any]) -> List[Dict[str, Any]]:
+        """Normalize any image list into [{image_url, metadata}, ...]."""
+        normalized: List[Dict[str, Any]] = []
+        for entry in images or []:
+            normalized_entry = self._normalize_image_entry(entry)
+            if normalized_entry:
+                normalized.append(normalized_entry)
+        return normalized
+
+    def _extract_image_url(self, entry: Any) -> Optional[str]:
+        normalized = self._normalize_image_entry(entry)
+        if normalized:
+            return normalized.get("image_url")
+        return None
 
     async def get_user_display_name(self, user_id: str) -> Optional[str]:
         """Resolve a friendly user display name from profiles.
@@ -241,6 +294,54 @@ class SupabaseClient:
         except Exception as e:
             logger.warning(f"Failed to clear pending price suggestion: {e}")
             return False
+
+    async def set_pending_publish_state(self, draft_id: str, state: Dict[str, Any]) -> bool:
+        """Persist pending publish metadata inside listing_data."""
+        if not draft_id or not isinstance(state, dict):
+            return False
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["_pending_publish"] = state
+            updated = (
+                self.client.table("active_drafts")
+                .update({"listing_data": listing_data})
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Failed to persist pending publish state: {e}")
+            return False
+
+    async def clear_pending_publish_state(self, draft_id: str) -> bool:
+        """Remove pending publish metadata from listing_data (if present)."""
+        if not draft_id:
+            return False
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            if "_pending_publish" not in listing_data:
+                return True
+            listing_data.pop("_pending_publish", None)
+            updated = (
+                self.client.table("active_drafts")
+                .update({"listing_data": listing_data})
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Failed to clear pending publish state: {e}")
+            return False
     
     async def update_draft_title(self, draft_id: str, title: str) -> bool:
         """Update draft title inside listing_data"""
@@ -395,19 +496,33 @@ class SupabaseClient:
         If listing_id refers to a draft, append to images array; otherwise insert to product_images.
         """
         try:
+            metadata = metadata or {}
+            normalized_new = self._normalize_image_entry({
+                "image_url": image_url,
+                "metadata": metadata
+            })
+            if not normalized_new:
+                return False
+
             # Try draft first
             draft = await self.get_draft(listing_id)
             if draft:
-                images = draft.get("images") or []
+                images = self._normalize_images(draft.get("images") or [])
                 # Deduplicate: if the same URL already exists, update its metadata instead of appending.
                 updated = False
                 for img in images:
-                    if isinstance(img, dict) and img.get("image_url") == image_url:
-                        img["metadata"] = metadata or img.get("metadata") or {}
+                    if img.get("image_url") == normalized_new["image_url"]:
+                        merged_meta: Dict[str, Any] = {}
+                        existing_meta = img.get("metadata")
+                        if isinstance(existing_meta, dict):
+                            merged_meta.update(existing_meta)
+                        if metadata:
+                            merged_meta.update(metadata)
+                        img["metadata"] = merged_meta
                         updated = True
                         break
                 if not updated:
-                    images.append({"image_url": image_url, "metadata": metadata or {}})
+                    images.append(normalized_new)
                 result = self.client.table("active_drafts").update({
                     "images": images
                 }).eq("id", listing_id).execute()
@@ -416,7 +531,7 @@ class SupabaseClient:
             # Otherwise treat as published listing
             self.client.table("product_images").insert({
                 "listing_id": listing_id,
-                "public_url": image_url
+                "public_url": normalized_new["image_url"]
             }).execute()
             return True
         except Exception as e:
@@ -426,8 +541,49 @@ class SupabaseClient:
     async def get_listing_images(self, listing_id: str) -> List[Dict[str, Any]]:
         """Get all images for a listing"""
         try:
-            result = self.client.table("listing_images").select("*").eq("listing_id", listing_id).execute()
-            return result.data or []
+            # Prefer the newer/production table when available.
+            product_rows = (
+                self.client.table("product_images")
+                .select("public_url,storage_path,is_primary,display_order,file_size,mime_type,width,height,created_at")
+                .eq("listing_id", listing_id)
+                .order("display_order", desc=False)
+                .execute()
+            )
+            if product_rows.data:
+                normalized: List[Dict[str, Any]] = []
+                for row in product_rows.data:
+                    if not isinstance(row, dict):
+                        continue
+                    url = (row.get("public_url") or row.get("storage_path") or "").strip() if isinstance(row.get("public_url") or row.get("storage_path"), str) else ""
+                    if not url:
+                        continue
+
+                    metadata: Dict[str, Any] = {}
+                    for key in [
+                        "storage_path",
+                        "is_primary",
+                        "display_order",
+                        "file_size",
+                        "mime_type",
+                        "width",
+                        "height",
+                        "created_at",
+                    ]:
+                        if key in row and row.get(key) is not None:
+                            metadata[key] = row.get(key)
+
+                    normalized.append({"image_url": url, "metadata": metadata})
+                return normalized
+
+            # Backward-compat: older schema uses listing_images with (image_url, metadata)
+            legacy_rows = (
+                self.client.table("listing_images")
+                .select("image_url,metadata,created_at")
+                .eq("listing_id", listing_id)
+                .execute()
+            )
+            images = self._normalize_images(legacy_rows.data or [])
+            return images
         except Exception as e:
             logger.error(f"Error getting images: {e}")
             return []
@@ -441,7 +597,13 @@ class SupabaseClient:
                 return None
             
             listing_data = draft.get("listing_data") or {}
-            images = draft.get("images") or []
+            images = self._normalize_images(draft.get("images") or [])
+
+            if cost > 0:
+                balance = await self.get_wallet_balance(user_id)
+                balance_int = int(balance) if balance is not None else None
+                if balance_int is None or balance_int < cost:
+                    raise InsufficientCreditsError(cost, balance_int)
 
             # Best-effort: generate listing-level metadata keywords to improve search recall.
             # This does NOT block publishing if generation fails.
@@ -493,21 +655,32 @@ class SupabaseClient:
             
             if result.data:
                 listing_id = result.data[0]["id"]
-                
-                # Persist product_images records
+
+                if cost > 0:
+                    try:
+                        await self.deduct_credits(user_id, cost, f"publish_listing:{listing_id}")
+                    except Exception as wallet_err:
+                        try:
+                            self.client.table("listings").delete().eq("id", listing_id).execute()
+                        except Exception as rollback_err:
+                            logger.error(
+                                f"Failed to rollback listing {listing_id} after wallet error: {rollback_err}"
+                            )
+                        raise wallet_err
+
+                # Persist product_images records (only after wallet deduction succeeds)
                 for img in images:
                     try:
+                        public_url = img.get("image_url")
+                        if not public_url:
+                            continue
                         self.client.table("product_images").insert({
                             "listing_id": listing_id,
-                            "public_url": img.get("image_url")
+                            "public_url": public_url
                         }).execute()
                     except Exception as e:
                         logger.warning(f"Failed to copy image to product_images: {e}")
-                
-                # Deduct credits if needed
-                if cost > 0:
-                    await self.deduct_credits(user_id, cost, f"publish_listing:{listing_id}")
-                
+
                 # Delete draft
                 self.client.table("active_drafts").delete().eq("id", draft_id).execute()
                 
@@ -522,6 +695,8 @@ class SupabaseClient:
                 return result.data[0]
             
             return None
+        except InsufficientCreditsError:
+            raise
         except Exception as e:
             logger.error(f"Error publishing listing: {e}")
             return None
@@ -607,35 +782,41 @@ class SupabaseClient:
         """Deduct credits from user wallet and record transaction"""
         try:
             balance = await self.get_wallet_balance(user_id)
-            if balance is None or balance < amount:
-                return False
-            
-            new_balance = balance - amount
-            result = self.client.table("wallets").update({
-                "balance_bigint": new_balance
-            }).eq("user_id", user_id).execute()
-            
-            if result.data:
-                self.client.table("wallet_transactions").insert({
-                    "user_id": user_id,
-                    "amount_bigint": -amount,
-                    "kind": "debit",
-                    "reference": description,
-                    "metadata": {}
-                }).execute()
-                await self.log_action(
-                    action="deduct_credits",
-                    metadata={"amount": amount, "description": description},
-                    resource_type="wallet",
-                    resource_id=user_id,
-                    user_id=user_id
-                )
-                return True
-            
-            return False
+            balance_int = int(balance) if balance is not None else None
+            if balance_int is None or balance_int < amount:
+                raise InsufficientCreditsError(amount, balance_int)
+
+            new_balance = balance_int - amount
+            result = (
+                self.client.table("wallets")
+                .update({"balance_bigint": new_balance})
+                .eq("user_id", user_id)
+                .execute()
+            )
+
+            if not result.data:
+                raise RuntimeError("Wallet balance update failed")
+
+            self.client.table("wallet_transactions").insert({
+                "user_id": user_id,
+                "amount_bigint": -amount,
+                "kind": "debit",
+                "reference": description,
+                "metadata": {}
+            }).execute()
+            await self.log_action(
+                action="deduct_credits",
+                metadata={"amount": amount, "description": description},
+                resource_type="wallet",
+                resource_id=user_id,
+                user_id=user_id
+            )
+            return True
+        except InsufficientCreditsError:
+            raise
         except Exception as e:
             logger.error(f"Error deducting credits: {e}")
-            return False
+            raise
     
     # Audit Logging
     async def log_action(
