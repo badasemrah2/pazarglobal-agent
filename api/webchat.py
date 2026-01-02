@@ -1109,7 +1109,10 @@ async def process_webchat_message(
             return payload
         finalize_response = _finalize_response
 
-        raw_user_id = session.get("user_id") or user_id
+        # IMPORTANT: frontend may omit user_id for some calls.
+        # If we normalize None -> uuid4(), we get a different user per request,
+        # causing drafts/images to appear "lost" and the flow to loop asking for photos.
+        raw_user_id = session.get("user_id") or user_id or session_id
         normalized_user_id = normalize_user_id(raw_user_id)
         if session.get("user_id") != normalized_user_id:
             session["user_id"] = normalized_user_id
@@ -1357,6 +1360,37 @@ async def process_webchat_message(
             return await finalize_response({
                 "success": True,
                 "message": welcome + hint,
+                "data": {"type": "conversation", "intent": "small_talk"},
+                "intent": "small_talk",
+            })
+
+        # GLOBAL CANCEL OVERRIDE:
+        # Users may say "satmaktan vazgeçtim" / "iptal" while in any flow.
+        # Clear the locked intent so routing can start fresh. Do not interfere with
+        # publish/delete deterministic flow, which already has its own cancel semantics.
+        if is_cancel_command(message_body) and session.get("locked_intent") != "publish_or_delete":
+            # Best-effort: reset the underlying draft in DB so old fields don't leak
+            # into the next listing flow (single-draft-per-user model).
+            try:
+                draft_id = session.get("active_draft_id")
+                if not draft_id and user_id:
+                    latest = await supabase_client.get_latest_draft_for_user(user_id)
+                    draft_id = (latest or {}).get("id")
+                if isinstance(draft_id, str) and draft_id:
+                    await supabase_client.clear_pending_publish_state(draft_id)
+                    await supabase_client.reset_draft(draft_id, phone_number=session_id)
+            except Exception:
+                pass
+
+            session.pop("locked_intent", None)
+            session["intent"] = None
+            session["active_draft_id"] = None
+            session["pending_media_urls"] = []
+            session["pending_media_analysis"] = []
+            session_dirty = True
+            return await finalize_response({
+                "success": True,
+                "message": "Tamam. Bu işlemi iptal ettim. İstersen ürün arayabilir ya da yeni bir ilan oluşturmaya başlayabilirsin.",
                 "data": {"type": "conversation", "intent": "small_talk"},
                 "intent": "small_talk",
             })
@@ -2012,7 +2046,9 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
         if "pending_media_urls" not in session:
             session["pending_media_urls"] = []
 
-    raw_user_id = session.get("user_id") or chat_message.user_id
+    # Keep user identity stable even if the frontend omits user_id.
+    # Falling back to session_id prevents creating a new anonymous UUID per request.
+    raw_user_id = session.get("user_id") or chat_message.user_id or chat_message.session_id
     normalized_user_id = normalize_user_id(raw_user_id)
     session["user_id"] = normalized_user_id
 
