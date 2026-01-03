@@ -797,13 +797,36 @@ class SupabaseClient:
             if not result.data:
                 raise RuntimeError("Wallet balance update failed")
 
-            self.client.table("wallet_transactions").insert({
+            # Best-effort: record the transaction. Some Supabase deployments enforce a CHECK constraint
+            # on wallet_transactions.kind (e.g., allowed enum values differ by environment). We should
+            # not fail a publish after the wallet balance is already updated.
+            tx_payload_base = {
                 "user_id": user_id,
                 "amount_bigint": -amount,
-                "kind": "debit",
                 "reference": description,
-                "metadata": {}
-            }).execute()
+                "metadata": {},
+            }
+            tx_kinds_to_try = [
+                "debit",  # preferred
+                "spend",
+                "usage",
+                "credit",  # fallback for environments that only allow 'credit'/'debit' variants
+            ]
+            inserted = False
+            last_err: Exception | None = None
+            for kind in tx_kinds_to_try:
+                try:
+                    payload = dict(tx_payload_base)
+                    payload["kind"] = kind
+                    self.client.table("wallet_transactions").insert(payload).execute()
+                    inserted = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
+            if not inserted:
+                logger.warning(f"wallet_transactions insert failed (continuing): {last_err}")
+
             await self.log_action(
                 action="deduct_credits",
                 metadata={"amount": amount, "description": description},

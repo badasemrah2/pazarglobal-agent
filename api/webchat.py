@@ -1491,28 +1491,18 @@ async def process_webchat_message(
                         meta = {"analysis": analysis_by_url[url]}
                     await supabase_client.add_listing_image(draft_id, url, metadata=meta)
 
-                # Best-effort: seed vision_product/category from first analysis
+                # Best-effort: store vision_product, but do NOT auto-write category from vision here.
+                # Otherwise, the subsequent explicit create command (e.g. "ilan oluştur") can trigger
+                # the "start new listing" reset heuristic (draft_has_non_media_content), wiping newly
+                # uploaded photos and causing a photo-request loop.
                 first_analysis = None
                 if isinstance(analyses, list) and analyses:
                     first = analyses[0]
                     if isinstance(first, dict):
                         first_analysis = first.get("analysis")
-                if isinstance(first_analysis, dict):
+                if isinstance(first_analysis, dict) and first_analysis:
                     try:
-                        existing = await supabase_client.get_draft(draft_id)
-                        listing_data = (existing or {}).get("listing_data") or {}
-                        if not (listing_data.get("category") or "").strip():
-                            suggested = str(first_analysis.get("category") or "").strip()
-                            if suggested:
-                                await supabase_client.update_draft_category(draft_id, suggested, vision_product=first_analysis)
-                        else:
-                            # still store vision_product
-                            existing_category = str(listing_data.get("category") or "").strip()
-                            await supabase_client.update_draft_category(
-                                draft_id,
-                                existing_category or "Diğer",
-                                vision_product=first_analysis,
-                            )
+                        await supabase_client.update_draft_vision_product(draft_id, first_analysis)
                     except Exception:
                         pass
 

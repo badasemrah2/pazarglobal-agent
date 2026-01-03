@@ -31,6 +31,7 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
         def __init__(self):
             self.drafts: dict[str, dict[str, Any]] = {}
             self._id = 0
+            self.reset_calls: list[str] = []
 
         async def create_draft(self, user_id: str, phone_number: str) -> dict[str, Any]:
             self._id += 1
@@ -56,6 +57,19 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
             d["listing_data"]["category"] = category
             if vision_product is not None:
                 d["vision_product"] = vision_product
+            return True
+
+        async def update_draft_vision_product(self, draft_id: str, vision_product: dict[str, Any]) -> bool:
+            d = self.drafts[draft_id]
+            d["vision_product"] = vision_product
+            return True
+
+        async def reset_draft(self, draft_id: str, phone_number: str | None = None) -> bool:
+            # Mimic production behavior: reset wipes images + listing fields.
+            self.reset_calls.append(draft_id)
+            d = self.drafts[draft_id]
+            d["listing_data"] = {"title": None, "description": None, "price": None, "category": None}
+            d["images"] = []
             return True
 
     fake_supabase = FakeSupabase()
@@ -98,6 +112,9 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
 
     # Should ask for title next (since we only attached images)
     assert "Ürünün adı" in r2["message"]
+
+    # Regression: should NOT have reset the draft just because vision included a category.
+    assert fake_supabase.reset_calls == []
 
 
 @pytest.mark.asyncio
@@ -168,6 +185,7 @@ async def test_missing_user_id_uses_session_id_stable_identity(monkeypatch: Monk
             self.drafts: dict[str, dict[str, Any]] = {}
             self._id = 0
             self.created_user_ids: list[str] = []
+            self.reset_calls: list[str] = []
 
         async def create_draft(self, user_id: str, phone_number: str) -> dict[str, Any]:
             self.created_user_ids.append(user_id)
@@ -209,6 +227,14 @@ async def test_missing_user_id_uses_session_id_stable_identity(monkeypatch: Monk
             d["vision_product"] = vision_product
             return True
 
+        async def reset_draft(self, draft_id: str, phone_number: str | None = None) -> bool:
+            # If production code incorrectly calls reset on 'ilan oluştur', we'd lose images and loop.
+            self.reset_calls.append(draft_id)
+            d = self.drafts[draft_id]
+            d["listing_data"] = {"title": None, "description": None, "price": None, "category": None}
+            d["images"] = []
+            return True
+
     fake_supabase = FakeSupabase()
     monkeypatch.setattr(webchat, "supabase_client", fake_supabase)
 
@@ -244,6 +270,7 @@ async def test_missing_user_id_uses_session_id_stable_identity(monkeypatch: Monk
     # Should *not* loop back to requesting photos again.
     assert "fotoğraf" not in r2["message"].lower()
     assert "Ürünün adı" in r2["message"]
+    assert fake_supabase.reset_calls == []
 
 
 @pytest.mark.asyncio
