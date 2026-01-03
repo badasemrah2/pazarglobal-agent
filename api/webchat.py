@@ -1049,9 +1049,79 @@ _COMMAND_ONLY_TOKENS = {
 }
 
 
+_FLOW_CONTROL_PATTERNS: list[re.Pattern[str]] = [
+    # Generic listing intent messages that should not become title/description.
+    re.compile(r"\bilan\b\s*(oluştur|olustur|aç|ac|başlat|baslat|ver|yayınla|yayinla)\b", re.IGNORECASE),
+    re.compile(r"\bilan\b.*\b(verm(e|ek)|satmak|satış|satis|vermek\s+istiyorum|istiyorum)\b", re.IGNORECASE),
+    re.compile(r"\btasla(?:k|ğ)\b.*\b(oluştur|olustur|aç|ac|başlat|baslat|kullanmak\s+istiyorum|istiyorum)\b", re.IGNORECASE),
+    # Category uncertainty / delegation
+    re.compile(r"\bkategori\b.*\b(bilmiyorum|emin\s+değilim|emin\s+degilim|otomatik|sen\s+seç|sen\s+sec)\b", re.IGNORECASE),
+]
+
+
 def is_command_only_message(message: str) -> bool:
     msg = (message or "").strip().lower()
-    return msg in _COMMAND_ONLY_TOKENS
+    if msg in _COMMAND_ONLY_TOKENS:
+        return True
+
+    # Treat short, flow-control-like meta sentences as commands too.
+    # This prevents inputs like "ilan vermek istiyorum" from being saved as title/description.
+    if not msg:
+        return False
+    if len(msg) > 80:
+        return False
+    word_count = len([w for w in re.split(r"\s+", msg) if w])
+    if word_count > 10:
+        return False
+    for pat in _FLOW_CONTROL_PATTERNS:
+        if pat.search(msg):
+            return True
+    return False
+
+
+def user_requests_auto_category(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if msg in {"otomatik", "otomatik belirle"}:
+        return True
+    if "otomatik" in msg and "kategori" in msg:
+        return True
+    if "kategori" in msg and any(phrase in msg for phrase in [
+        "sen belirle",
+        "sen seç",
+        "sen sec",
+        "bilmiyorum",
+        "emin değilim",
+        "emin degilim",
+    ]):
+        return True
+    return False
+
+
+def infer_category_from_draft(draft: Dict[str, Any]) -> Optional[str]:
+    listing = (draft or {}).get("listing_data") or {}
+    vision = _unwrap_vision_product((draft or {}).get("vision_product"))
+
+    candidates: list[str] = []
+    if isinstance(vision, dict):
+        candidates.append(str(vision.get("category") or "").strip())
+        candidates.append(str(vision.get("product") or "").strip())
+    candidates.append(str(listing.get("title") or "").strip())
+    candidates.append(str(listing.get("description") or "").strip())
+
+    for cand in candidates:
+        if cand:
+            normalized = normalize_category_input(cand)
+            if normalized:
+                return normalized
+
+    combined = " ".join([c for c in candidates if c]).strip()
+    if combined:
+        normalized = normalize_category_input(combined)
+        if normalized:
+            return normalized
+    return None
 
 
 def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
@@ -1090,8 +1160,8 @@ def build_next_step_message(draft: Dict[str, Any]) -> str:
         return "Fiyat nedir? İsterseniz 'kaç para eder' yazın, piyasa verisine göre tahmin söyleyeyim."
     if slot == "category":
         if suggested_category:
-            return f"Kategori nedir? (İsterseniz önerim: {suggested_category})"
-        return "Kategori nedir? (Örn: Elektronik, Otomotiv...)"
+            return f"Kategori nedir? (İsterseniz önerim: {suggested_category}; bilmiyorsanız 'otomatik' yazın)"
+        return "Kategori nedir? (Örn: Elektronik, Otomotiv...; bilmiyorsanız 'otomatik' yazın)"
 
     # Completed
     return "Tüm temel bilgiler tamam. Hazırsanız 'yayınla' yazarak ilanı yayınlayabilirsiniz."
@@ -1919,6 +1989,32 @@ async def process_webchat_message(
 
                 # Category
                 if slot == "category":
+                    # If the user delegates category selection, infer deterministically from the draft (vision/title/desc).
+                    if user_requests_auto_category(message_body) or is_command_only_message(message_body):
+                        inferred = infer_category_from_draft(existing_draft)
+                        if inferred:
+                            ok = await supabase_client.update_draft_category(draft_id, inferred)
+                            updated = await supabase_client.get_draft(draft_id)
+                            if ok or updated:
+                                response_data.update({
+                                    "draft_id": draft_id,
+                                    "draft": updated,
+                                    "type": "draft_update",
+                                })
+                                return await finalize_response({
+                                    "success": True,
+                                    "message": build_next_step_message(updated or existing_draft),
+                                    "data": response_data,
+                                    "intent": intent,
+                                })
+                        # Could not infer — keep prompting for category.
+                        return await finalize_response({
+                            "success": True,
+                            "message": build_next_step_message(existing_draft),
+                            "data": {"type": "slot_prompt", "slot": "category", "draft_id": draft_id},
+                            "intent": intent,
+                        })
+
                     normalized = normalize_category_input(message_body)
                     if normalized:
                         ok = await supabase_client.update_draft_category(draft_id, normalized)
@@ -1937,7 +2033,65 @@ async def process_webchat_message(
                             })
 
                 # Title
-                if slot == "title" and not is_command_only_message(message_body):
+                if slot == "title":
+                    if is_command_only_message(message_body):
+                        # Photo-first flow: if we have images + vision, auto-seed title/description
+                        # and continue instead of saving the command as a title.
+                        try:
+                            listing = (existing_draft or {}).get("listing_data") or {}
+                            images = (existing_draft or {}).get("images") or []
+                            vision = _unwrap_vision_product((existing_draft or {}).get("vision_product"))
+                            has_vision_signal = False
+                            if isinstance(vision, dict):
+                                if str(vision.get("product") or "").strip():
+                                    has_vision_signal = True
+                                if str(vision.get("category") or "").strip():
+                                    has_vision_signal = True
+                                if str(vision.get("condition") or "").strip():
+                                    has_vision_signal = True
+                                if isinstance(vision.get("features"), list) and vision.get("features"):
+                                    has_vision_signal = True
+                                if isinstance(vision.get("features"), str) and vision.get("features").strip():
+                                    has_vision_signal = True
+
+                            if images and has_vision_signal:
+                                if not (str(listing.get("title") or "").strip()):
+                                    seeded_title = generate_title_from_vision(vision)
+                                    if seeded_title:
+                                        await supabase_client.update_draft_title(draft_id, seeded_title)
+                                if not (str(listing.get("description") or "").strip()):
+                                    seeded_desc = generate_description_from_vision(vision)
+                                    if seeded_desc:
+                                        await supabase_client.update_draft_description(draft_id, seeded_desc)
+                                updated = await supabase_client.get_draft(draft_id)
+                                response_data.update({
+                                    "draft_id": draft_id,
+                                    "draft": updated,
+                                    "type": "draft_update",
+                                    "slot": next_missing_slot(updated or existing_draft),
+                                })
+                                return await finalize_response({
+                                    "success": True,
+                                    "message": build_next_step_message(updated or existing_draft),
+                                    "data": response_data,
+                                    "intent": intent,
+                                })
+                        except Exception:
+                            pass
+
+                        return await finalize_response({
+                            "success": True,
+                            "message": build_next_step_message(existing_draft),
+                            "data": {"type": "slot_prompt", "slot": "title", "draft_id": draft_id},
+                            "intent": intent,
+                        })
+                    if looks_like_greeting(message_body):
+                        return await finalize_response({
+                            "success": True,
+                            "message": build_next_step_message(existing_draft),
+                            "data": {"type": "slot_prompt", "slot": "title", "draft_id": draft_id},
+                            "intent": intent,
+                        })
                     if len((message_body or "").strip()) >= 3:
                         ok = await supabase_client.update_draft_title(draft_id, (message_body or "").strip())
                         updated = await supabase_client.get_draft(draft_id)
@@ -1955,7 +2109,65 @@ async def process_webchat_message(
                             })
 
                 # Description
-                if slot == "description" and not is_command_only_message(message_body):
+                if slot == "description":
+                    if is_command_only_message(message_body):
+                        # Photo-first flow: if we have images + vision, auto-seed description (and title if needed)
+                        # and continue instead of saving the command as a description.
+                        try:
+                            listing = (existing_draft or {}).get("listing_data") or {}
+                            images = (existing_draft or {}).get("images") or []
+                            vision = _unwrap_vision_product((existing_draft or {}).get("vision_product"))
+                            has_vision_signal = False
+                            if isinstance(vision, dict):
+                                if str(vision.get("product") or "").strip():
+                                    has_vision_signal = True
+                                if str(vision.get("category") or "").strip():
+                                    has_vision_signal = True
+                                if str(vision.get("condition") or "").strip():
+                                    has_vision_signal = True
+                                if isinstance(vision.get("features"), list) and vision.get("features"):
+                                    has_vision_signal = True
+                                if isinstance(vision.get("features"), str) and vision.get("features").strip():
+                                    has_vision_signal = True
+
+                            if images and has_vision_signal:
+                                if not (str(listing.get("title") or "").strip()):
+                                    seeded_title = generate_title_from_vision(vision)
+                                    if seeded_title:
+                                        await supabase_client.update_draft_title(draft_id, seeded_title)
+                                if not (str(listing.get("description") or "").strip()):
+                                    seeded_desc = generate_description_from_vision(vision)
+                                    if seeded_desc:
+                                        await supabase_client.update_draft_description(draft_id, seeded_desc)
+                                updated = await supabase_client.get_draft(draft_id)
+                                response_data.update({
+                                    "draft_id": draft_id,
+                                    "draft": updated,
+                                    "type": "draft_update",
+                                    "slot": next_missing_slot(updated or existing_draft),
+                                })
+                                return await finalize_response({
+                                    "success": True,
+                                    "message": build_next_step_message(updated or existing_draft),
+                                    "data": response_data,
+                                    "intent": intent,
+                                })
+                        except Exception:
+                            pass
+
+                        return await finalize_response({
+                            "success": True,
+                            "message": build_next_step_message(existing_draft),
+                            "data": {"type": "slot_prompt", "slot": "description", "draft_id": draft_id},
+                            "intent": intent,
+                        })
+                    if looks_like_greeting(message_body):
+                        return await finalize_response({
+                            "success": True,
+                            "message": build_next_step_message(existing_draft),
+                            "data": {"type": "slot_prompt", "slot": "description", "draft_id": draft_id},
+                            "intent": intent,
+                        })
                     if len((message_body or "").strip()) >= 6:
                         ok = await supabase_client.update_draft_description(draft_id, (message_body or "").strip())
                         updated = await supabase_client.get_draft(draft_id)

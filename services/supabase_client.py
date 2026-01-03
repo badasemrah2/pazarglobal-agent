@@ -32,6 +32,29 @@ class SupabaseClient:
     
     def __init__(self):
         self._client: Optional[Client] = None
+        # Some deployments may not have the helper RPC installed in Supabase.
+        # Cache its availability to avoid spamming logs and wasting network calls.
+        self._rpc_update_listing_field_available: Optional[bool] = None
+        self._rpc_update_listing_field_missing_logged: bool = False
+
+    def _rpc_update_listing_field_is_missing(self, exc: Exception) -> bool:
+        msg = str(exc) if exc is not None else ""
+        msg_l = msg.lower()
+        return (
+            "pgrst202" in msg_l
+            or "could not find the function" in msg_l
+            or "update_listing_field" in msg_l and "could not find" in msg_l
+        )
+
+    def _maybe_disable_rpc_update_listing_field(self, exc: Exception) -> None:
+        if self._rpc_update_listing_field_is_missing(exc):
+            self._rpc_update_listing_field_available = False
+            if not self._rpc_update_listing_field_missing_logged:
+                logger.warning(
+                    "Supabase RPC public.update_listing_field is missing; using direct updates for drafts. "
+                    "(You can deploy supabase_rpc_update_listing_field.sql to enable atomic patching.)"
+                )
+                self._rpc_update_listing_field_missing_logged = True
     
     @property
     def client(self) -> Client:
@@ -172,6 +195,45 @@ class SupabaseClient:
         if normalized:
             return normalized.get("image_url")
         return None
+
+    def _fallback_listing_keywords(self, *, title: str, category: str, description: str) -> Dict[str, Any]:
+        """Deterministic keyword fallback when LLM keyword generation is unavailable.
+
+        Produces a small, lowercased keyword list derived from title/category/description.
+        """
+        def tokenize(text: str) -> List[str]:
+            t = (text or "").lower()
+            # keep Turkish letters; keep + for room formats like 2+1
+            raw = re.findall(r"[0-9a-zçğıöşü\+]{2,}", t, flags=re.IGNORECASE)
+            return [r.strip("+") if r.endswith("+") else r for r in raw if r]
+
+        stop = {
+            "satılık", "satilik", "kiralık", "kiralik", "urun", "ürün", "esya", "eşya",
+            "temiz", "az", "kullanılmış", "kullanilmis", "iyi", "durumda", "fiyat", "tl",
+            "acil", "hemen", "pazarlik", "pazarlık",
+        }
+
+        words: List[str] = []
+        for src in [title, category, description]:
+            for w in tokenize(src):
+                w = w.strip()
+                if not w or w in stop:
+                    continue
+                if len(w) < 2:
+                    continue
+                words.append(w)
+
+        # Dedupe preserve order
+        seen = set()
+        deduped: List[str] = []
+        for w in words:
+            if w in seen:
+                continue
+            seen.add(w)
+            deduped.append(w)
+
+        deduped = deduped[:12]
+        return {"keywords": deduped, "keywords_text": " ".join(deduped)}
 
     async def get_user_display_name(self, user_id: str) -> Optional[str]:
         """Resolve a friendly user display name from profiles.
@@ -424,16 +486,20 @@ class SupabaseClient:
     
     async def update_draft_title(self, draft_id: str, title: str) -> bool:
         """Update draft title inside listing_data"""
-        try:
-            result = self.client.rpc("update_listing_field", {
-                "listing_id": draft_id,
-                "field_name": "title",
-                "field_value": title
-            }).execute()
-            if result.data:
-                return True
-        except Exception as e:
-            logger.warning(f"RPC update_listing_field failed for title (falling back to direct update): {e}")
+        if self._rpc_update_listing_field_available is not False:
+            try:
+                result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "title",
+                    "field_value": title
+                }).execute()
+                if result.data:
+                    self._rpc_update_listing_field_available = True
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for title (falling back to direct update): {e}")
 
         try:
             draft = await self.get_draft(draft_id)
@@ -453,16 +519,20 @@ class SupabaseClient:
     
     async def update_draft_description(self, draft_id: str, description: str) -> bool:
         """Update draft description inside listing_data"""
-        try:
-            result = self.client.rpc("update_listing_field", {
-                "listing_id": draft_id,
-                "field_name": "description",
-                "field_value": description
-            }).execute()
-            if result.data:
-                return True
-        except Exception as e:
-            logger.warning(f"RPC update_listing_field failed for description (falling back to direct update): {e}")
+        if self._rpc_update_listing_field_available is not False:
+            try:
+                result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "description",
+                    "field_value": description
+                }).execute()
+                if result.data:
+                    self._rpc_update_listing_field_available = True
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for description (falling back to direct update): {e}")
 
         try:
             draft = await self.get_draft(draft_id)
@@ -482,20 +552,24 @@ class SupabaseClient:
     
     async def update_draft_price(self, draft_id: str, price: float) -> bool:
         """Update draft price inside listing_data"""
-        try:
-            result = self.client.rpc("update_listing_field", {
-                "listing_id": draft_id,
-                "field_name": "price",
-                "field_value": price
-            }).execute()
-            if result.data:
-                try:
-                    await self.clear_pending_price_suggestion(draft_id)
-                except Exception:
-                    pass
-                return True
-        except Exception as e:
-            logger.warning(f"RPC update_listing_field failed for price (falling back to direct update): {e}")
+        if self._rpc_update_listing_field_available is not False:
+            try:
+                result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "price",
+                    "field_value": price
+                }).execute()
+                if result.data:
+                    self._rpc_update_listing_field_available = True
+                    try:
+                        await self.clear_pending_price_suggestion(draft_id)
+                    except Exception:
+                        pass
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for price (falling back to direct update): {e}")
 
         try:
             draft = await self.get_draft(draft_id)
@@ -516,20 +590,24 @@ class SupabaseClient:
     
     async def update_draft_category(self, draft_id: str, category: str, vision_product: Dict[str, Any] = None) -> bool:
         """Update draft category inside listing_data and optionally vision_product"""
-        try:
-            rpc_result = self.client.rpc("update_listing_field", {
-                "listing_id": draft_id,
-                "field_name": "category",
-                "field_value": category
-            }).execute()
-            if rpc_result.data:
-                if vision_product is not None:
-                    self.client.table("active_drafts").update({
-                        "vision_product": vision_product
-                    }).eq("id", draft_id).execute()
-                return True
-        except Exception as e:
-            logger.warning(f"RPC update_listing_field failed for category (falling back to direct update): {e}")
+        if self._rpc_update_listing_field_available is not False:
+            try:
+                rpc_result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "category",
+                    "field_value": category
+                }).execute()
+                if rpc_result.data:
+                    self._rpc_update_listing_field_available = True
+                    if vision_product is not None:
+                        self.client.table("active_drafts").update({
+                            "vision_product": vision_product
+                        }).eq("id", draft_id).execute()
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for category (falling back to direct update): {e}")
 
         try:
             draft = await self.get_draft(draft_id)
@@ -552,16 +630,20 @@ class SupabaseClient:
 
     async def update_draft_allow_no_images(self, draft_id: str, allow_no_images: bool) -> bool:
         """Persist user's preference to publish without images (listing_data.allow_no_images)."""
-        try:
-            result = self.client.rpc("update_listing_field", {
-                "listing_id": draft_id,
-                "field_name": "allow_no_images",
-                "field_value": bool(allow_no_images)
-            }).execute()
-            if result.data:
-                return True
-        except Exception as e:
-            logger.warning(f"RPC update_listing_field failed for allow_no_images (falling back to direct update): {e}")
+        if self._rpc_update_listing_field_available is not False:
+            try:
+                result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "allow_no_images",
+                    "field_value": bool(allow_no_images)
+                }).execute()
+                if result.data:
+                    self._rpc_update_listing_field_available = True
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for allow_no_images (falling back to direct update): {e}")
 
         try:
             draft = await self.get_draft(draft_id)
@@ -761,6 +843,37 @@ class SupabaseClient:
                     listing_metadata["keywords_text"] = keywords_text
             except Exception as meta_err:
                 logger.warning(f"Failed to generate listing metadata: {meta_err}")
+
+            # Deterministic fallback: ensure metadata is not empty even when OpenAI is unavailable.
+            try:
+                title_f = str(listing_data.get("title") or "").strip() if isinstance(listing_data, dict) else ""
+                category_f = str(listing_data.get("category") or "").strip() if isinstance(listing_data, dict) else ""
+                desc_f = str(listing_data.get("description") or "").strip() if isinstance(listing_data, dict) else ""
+                if not listing_metadata.get("keywords") and title_f:
+                    fallback = self._fallback_listing_keywords(title=title_f, category=category_f, description=desc_f)
+                    if fallback.get("keywords"):
+                        listing_metadata.update(fallback)
+            except Exception:
+                pass
+
+            # Align with frontend fields used in listing cards.
+            user_name = None
+            user_phone = None
+            try:
+                user_name = await self.get_user_display_name(user_id)
+            except Exception:
+                user_name = None
+            try:
+                user_phone = await self.get_user_phone(user_id)
+            except Exception:
+                user_phone = None
+
+            if not user_phone and isinstance(listing_data, dict):
+                user_phone = (listing_data.get("contact_phone") or "").strip() or None
+
+            # Add provenance to metadata so we can debug multi-channel write paths.
+            listing_metadata.setdefault("source", "agent")
+            listing_metadata.setdefault("created_via", "webchat")
             
             # Insert into listings
             result = self.client.table("listings").insert({
@@ -769,6 +882,8 @@ class SupabaseClient:
                 "description": listing_data.get("description"),
                 "price": listing_data.get("price"),
                 "category": listing_data.get("category"),
+                "user_name": user_name,
+                "user_phone": user_phone,
                 "status": "active",
                 "image_url": primary_image_url,
                 "images": image_urls,

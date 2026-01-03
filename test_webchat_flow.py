@@ -195,6 +195,108 @@ async def test_command_only_does_not_trigger_hallucinated_title_when_images_exis
     assert "Ürünün adı" in r["message"]
 
 
+@pytest.mark.asyncio
+async def test_meta_intent_message_is_not_saved_as_title(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": None, "description": None, "price": None, "category": None},
+                    "images": [],
+                    "vision_product": {},
+                }
+            }
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def update_draft_title(self, draft_id: str, title: str) -> bool:
+            # This should NOT be called for meta/command messages.
+            raise AssertionError("Title should not be updated from a meta intent message")
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_meta"] = {
+        "user_id": "u_meta",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    class BoomComposer:
+        async def orchestrate_listing_creation(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("ComposerAgent should not run for meta/flow-control messages")
+
+    monkeypatch.setattr(webchat, "ComposerAgent", lambda: BoomComposer())
+
+    r = await webchat.process_webchat_message(
+        message_body="ilan vermek istiyorum",
+        session_id="s_meta",
+        user_id="u_meta",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    assert "Ürünün adı" in r["message"]
+
+
+@pytest.mark.asyncio
+async def test_auto_category_selection_uses_vision_when_user_does_not_know(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": "iPhone 14", "description": "Temiz", "price": 1000, "category": None},
+                    "images": [],
+                    "vision_product": {"category": "Elektronik", "product": "iPhone 14"},
+                }
+            }
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def update_draft_category(self, draft_id: str, category: str, vision_product: dict[str, Any] | None = None) -> bool:
+            self.drafts[draft_id]["listing_data"]["category"] = category
+            return True
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_cat"] = {
+        "user_id": "u_cat",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    class BoomComposer:
+        async def orchestrate_listing_creation(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("ComposerAgent should not run when category is deterministically inferred")
+
+    monkeypatch.setattr(webchat, "ComposerAgent", lambda: BoomComposer())
+
+    r = await webchat.process_webchat_message(
+        message_body="kategori bilmiyorum otomatik belirle",
+        session_id="s_cat",
+        user_id="u_cat",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    assert "Fotoğraf" in r["message"]
+
+
 def test_vision_blocks_can_be_suppressed(monkeypatch: MonkeyPatch) -> None:
     webchat = import_webchat(monkeypatch)
 
