@@ -152,10 +152,6 @@ def is_search_command(message: str) -> bool:
         "listele",
         "göster",
         "goster",
-        "ara ",
-        " ara",
-        "bul ",
-        " bul",
         "search",
         "find",
     ]):
@@ -1046,10 +1042,14 @@ def normalize_category_input(message: str) -> Optional[str]:
     # Keep this intentionally small and conservative to avoid misclassifying insults/random text as a category.
     mapping = {
         "otomotiv": "Otomotiv",
+        "oto": "Otomotiv",
         "vasita": "Otomotiv",
         "taşıt": "Otomotiv",
         "tasit": "Otomotiv",
         "araba": "Otomotiv",
+        "araç": "Otomotiv",
+        "arac": "Otomotiv",
+        "otomobil": "Otomotiv",
         "elektronik": "Elektronik",
         "telefon": "Elektronik",
         "bilgisayar": "Elektronik",
@@ -1070,11 +1070,25 @@ def normalize_category_input(message: str) -> Optional[str]:
     if msg in mapping:
         return mapping[msg]
 
-    # Also handle simple forms like "kategori: otomotiv"
-    for key in ["kategori", "category"]:
-        if msg.startswith(f"{key}:"):
-            rest = msg.split(":", 1)[1].strip()
-            return mapping.get(rest) or (rest.title() if rest else None)
+    # Handle forms like "kategori: otomotiv" or "kategorisi otomotiv" or "kategori otomotiv olsun"
+    m = re.search(r"\bkategori(?:si)?\b\s*[:\-]?\s*(.+)$", msg)
+    if m:
+        rest = (m.group(1) or "").strip()
+        # remove common trailing verbs
+        rest = re.sub(r"\b(olsun|yap|yapalım|yapalim|seç|sec|seçelim|secelim|olarak|diye|lütfen|lutfen)\b", " ", rest)
+        rest = re.sub(r"[^0-9a-zA-ZçğıöşüÇĞİÖŞÜ& ]+", " ", rest).strip()
+        tokens = [t for t in rest.split() if t]
+        if tokens:
+            # Try 2-token phrase first (e.g., 'ev yaşam'), then first token.
+            cand2 = " ".join(tokens[:2]).lower()
+            if cand2 in mapping:
+                return mapping[cand2]
+            cand1 = tokens[0].lower()
+            if cand1 in mapping:
+                return mapping[cand1]
+            # As a last resort, accept Title-case for short clean values
+            if len(tokens) <= 2:
+                return " ".join([t.title() for t in tokens]).strip() or None
 
     # For single-token inputs, accept Title-case as a last resort only if it looks like a known category word.
     tokens = [t for t in msg.replace("/", " ").replace(",", " ").split() if t]

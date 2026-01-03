@@ -229,6 +229,24 @@ def test_var_mi_queries_are_treated_as_search(monkeypatch: MonkeyPatch) -> None:
     assert webchat.is_search_command("harddisk var mı") is True
 
 
+def test_kac_para_eder_does_not_trigger_search_command(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    # Regression: "para" contains substring "ara ", which previously caused false search intent.
+    assert webchat.is_search_command("kaç para eder") is False
+    assert webchat.is_search_command("kac para eder") is False
+
+
+def test_category_normalization_accepts_arac_and_phrases(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    assert webchat.normalize_category_input("Araç") == "Otomotiv"
+    assert webchat.normalize_category_input("arac") == "Otomotiv"
+    assert webchat.normalize_category_input("Otomobil") == "Otomotiv"
+    assert webchat.normalize_category_input("Kategori araç olsun") == "Otomotiv"
+    assert webchat.normalize_category_input("Taslak ilanın kategorisi araç olsun") == "Otomotiv"
+
+
 @pytest.mark.asyncio
 async def test_router_publish_misclassification_is_sanitized_to_search(monkeypatch: MonkeyPatch) -> None:
     webchat = import_webchat(monkeypatch)
