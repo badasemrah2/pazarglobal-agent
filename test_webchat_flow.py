@@ -237,6 +237,15 @@ def test_kac_para_eder_does_not_trigger_search_command(monkeypatch: MonkeyPatch)
     assert webchat.is_search_command("kac para eder") is False
 
 
+def test_draft_show_is_not_treated_as_search(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    assert webchat.is_search_command("ilan taslağını göster") is False
+    assert webchat.is_search_command("taslak durumunu goster") is False
+    assert webchat.is_show_draft_command("ilan taslağını göster") is True
+    assert webchat.is_show_draft_command("taslak durumunu goster") is True
+
+
 def test_category_normalization_accepts_arac_and_phrases(monkeypatch: MonkeyPatch) -> None:
     webchat = import_webchat(monkeypatch)
 
@@ -245,6 +254,30 @@ def test_category_normalization_accepts_arac_and_phrases(monkeypatch: MonkeyPatc
     assert webchat.normalize_category_input("Otomobil") == "Otomotiv"
     assert webchat.normalize_category_input("Kategori araç olsun") == "Otomotiv"
     assert webchat.normalize_category_input("Taslak ilanın kategorisi araç olsun") == "Otomotiv"
+
+    # Ensure outputs align with supported category labels used by frontend
+    assert webchat.normalize_category_input("giyim") in {"Giyim & Aksesuar", "Moda & Aksesuar"}
+    assert webchat.normalize_category_input("hizmet") == "Hizmetler"
+
+
+def test_emlak_classification_recognizes_common_terms_and_room_format() -> None:
+    from services.category_library import classify_category
+
+    assert classify_category("havuzlu villa 3+1 satılık") == "Emlak"
+    assert classify_category("dubleks daire 2+1 kiralık") == "Emlak"
+
+    # Avoid false positives: "2+1" can appear in electronics contexts (e.g., speaker systems)
+    assert classify_category("2+1 hoparlör satılık") != "Emlak"
+
+
+def test_category_library_classifies_common_products(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    assert webchat.normalize_category_input("buzdolabı satıyorum") == "Ev & Yaşam"
+    assert webchat.normalize_category_input("buz dolabı satmak istiyorum") == "Ev & Yaşam"
+    assert webchat.normalize_category_input("iphone 13 siyah") == "Elektronik"
+    assert webchat.normalize_category_input("laptop arıyorum") == "Elektronik"
+    assert webchat.normalize_category_input("citroen c3 2018") == "Otomotiv"
 
 
 @pytest.mark.asyncio
@@ -418,6 +451,7 @@ async def test_global_cancel_resets_locked_intent_and_draft(monkeypatch: MonkeyP
     monkeypatch.setattr(webchat, "supabase_client", fake_supabase)
 
     webchat.IN_MEMORY_SESSION_CACHE.clear()
+
     webchat.IN_MEMORY_SESSION_CACHE["s_cancel"] = {
         "user_id": "u_cancel",
         "intent": "create_listing",
@@ -438,6 +472,95 @@ async def test_global_cancel_resets_locked_intent_and_draft(monkeypatch: MonkeyP
     assert r["intent"] == "small_talk"
     assert fake_supabase.reset_called_with, "Draft should be reset on global cancel"
     assert fake_supabase.cleared_pending_publish == ["d1"]
+
+
+@pytest.mark.asyncio
+async def test_show_draft_command_returns_status_without_cancel(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": "X", "description": "Y", "price": 10, "category": "Elektronik"},
+                    "images": [],
+                    "vision_product": {},
+                }
+            }
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_show"] = {
+        "user_id": "u_show",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    r = await webchat.process_webchat_message(
+        message_body="ilan taslağını göster",
+        session_id="s_show",
+        user_id="u_show",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    assert r["data"]["type"] == "draft_status"
+    assert "📋 Taslak durumu" in r["message"]
+
+
+@pytest.mark.asyncio
+async def test_refusing_images_does_not_trigger_global_cancel(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    assert webchat.user_refuses_images("Resim yüklemek istemiyorum resimsiz yayınlayacağım") is True
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": None, "description": None, "price": None, "category": None},
+                    "images": [],
+                    "vision_product": {},
+                }
+            }
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def update_draft_allow_no_images(self, draft_id: str, allow_no_images: bool) -> bool:
+            self.drafts[draft_id]["listing_data"]["allow_no_images"] = bool(allow_no_images)
+            return True
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_noimg"] = {
+        "user_id": "u_noimg",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    r = await webchat.process_webchat_message(
+        message_body="Resim yüklemek istemiyorum resimsiz yayınlayacağım",
+        session_id="s_noimg",
+        user_id="u_noimg",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    # The message includes a publish intent ('yayınlayacağım'), so publish_or_delete is acceptable here.
+    assert r["intent"] in {"create_listing", "publish_or_delete"}, r
+    assert "yayınlama işlemini iptal" not in r["message"].lower()
 
 
 @pytest.mark.asyncio

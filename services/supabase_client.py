@@ -550,6 +550,35 @@ class SupabaseClient:
             logger.error(f"Error updating category: {e}")
             return False
 
+    async def update_draft_allow_no_images(self, draft_id: str, allow_no_images: bool) -> bool:
+        """Persist user's preference to publish without images (listing_data.allow_no_images)."""
+        try:
+            result = self.client.rpc("update_listing_field", {
+                "listing_id": draft_id,
+                "field_name": "allow_no_images",
+                "field_value": bool(allow_no_images)
+            }).execute()
+            if result.data:
+                return True
+        except Exception as e:
+            logger.warning(f"RPC update_listing_field failed for allow_no_images (falling back to direct update): {e}")
+
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["allow_no_images"] = bool(allow_no_images)
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
+        except Exception as e:
+            logger.error(f"Error updating allow_no_images: {e}")
+            return False
+
     async def update_draft_vision_product(self, draft_id: str, vision_product: Dict[str, Any]) -> bool:
         """Update draft vision_product without mutating listing_data/category."""
         try:

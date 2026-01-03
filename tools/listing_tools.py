@@ -131,6 +131,19 @@ class SearchListingsTool(BaseTool):
         search_text: Optional[str] = None,
         limit: int = 20
     ) -> Dict[str, Any]:
+        # Normalize category to canonical DB value so searches don't miss listings.
+        # Example: UI/LLM may send "Vasıta" but DB stores "Otomotiv".
+        if category:
+            try:
+                from services.category_library import normalize_category_id
+
+                normalized = normalize_category_id(category)
+                if normalized:
+                    category = normalized
+            except Exception:
+                # best-effort; keep original
+                pass
+
         listings = await supabase_client.search_listings(
             category=category,
             min_price=min_price,

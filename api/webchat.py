@@ -95,6 +95,10 @@ def is_create_listing_command(message: str) -> bool:
     if not msg:
         return False
 
+    # Common typo tolerance
+    if "ialn" in msg and "vermek istiyorum" in msg:
+        return True
+
     # Explicit create/sell commands
     if msg in {
         "ilan oluştur",
@@ -127,9 +131,71 @@ def is_create_listing_command(message: str) -> bool:
     ])
 
 
+def is_show_draft_command(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if "taslak" not in msg and "taslağ" not in msg and "taslag" not in msg:
+        return False
+    return any(token in msg for token in [
+        "göster",
+        "goster",
+        "durum",
+        "status",
+        "güncel",
+        "guncel",
+        "güncelle",
+        "guncelle",
+        "bak",
+        "görüntüle",
+        "goruntule",
+    ])
+
+
+def user_refuses_images(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+    if any(token in msg for token in [
+        "resimsiz",
+        "fotoğrafsız",
+        "fotografsiz",
+        "resim yok",
+        "fotoğraf yok",
+        "fotograf yok",
+        "fotoğraf eklemeyeceğim",
+        "fotograf eklemeyecegim",
+        "resim eklemeyeceğim",
+        "resim eklemeyecegim",
+        "resim yüklemek istemiyorum",
+        "resim yuklemek istemiyorum",
+        "fotoğraf yüklemek istemiyorum",
+        "fotograf yuklemek istemiyorum",
+        "fotoğraf eklemek istemiyorum",
+        "fotograf eklemek istemiyorum",
+    ]):
+        return True
+
+    # Fallback: handle unicode/typo variations by intent-based matching.
+    mentions_image = any(tok in msg for tok in ["resim", "foto", "fotoğraf", "fotograf", "görsel", "gorsel"])
+    refuses = any(tok in msg for tok in [
+        "istemiyorum",
+        "yüklemek istemiyorum",
+        "yuklemek istemiyorum",
+        "eklemek istemiyorum",
+        "eklemeyeceğim",
+        "eklemeyecegim",
+    ])
+    return bool(mentions_image and refuses)
+
+
 def is_search_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
+        return False
+
+    # Draft/status queries should never be treated as marketplace search.
+    if "taslak" in msg or "taslağ" in msg or "taslag" in msg:
         return False
 
     # Availability-style queries (very common in Turkish): "bilgisayar var mı?".
@@ -150,14 +216,15 @@ def is_search_command(message: str) -> bool:
         "ilanları",
         "ilanlari",
         "listele",
-        "göster",
-        "goster",
         "search",
         "find",
     ]):
         return True
 
     # Word-boundary guard for short verbs like "ara" and "bul" to avoid matching inside other words.
+    # IMPORTANT: do NOT treat bare "göster" as search unless the user mentions listings/products.
+    if bool(re.search(r"\b(goster|göster)\b", msg)) and not ("ilan" in msg or "ürün" in msg or "urun" in msg):
+        return False
     return bool(re.search(r"\b(ara|bul|listele|goster|göster)\b", msg))
 
 
@@ -261,7 +328,8 @@ def draft_is_publishable(draft: Dict[str, Any]) -> bool:
         return False
     if not (listing.get("category") and str(listing.get("category")).strip()):
         return False
-    if not images:
+    allow_no_images = bool(isinstance(listing, dict) and listing.get("allow_no_images"))
+    if not allow_no_images and not images:
         return False
     return True
 
@@ -306,6 +374,9 @@ def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> b
     msg = (message or "").strip().lower()
     if not msg:
         return False
+    # Explicit switch to a different/new listing should reset the single draft.
+    if any(phrase in msg for phrase in ["başka ilan", "baska ilan", "yeni ilan", "farklı ilan", "farkli ilan"]):
+        return draft_has_any_content(draft)
     if not is_create_listing_command(msg):
         return False
     # Don't reset when user says "devam"; they likely want to continue the current draft.
@@ -327,7 +398,7 @@ async def handle_publish_or_delete_flow(
     """Deterministic publish flow (no LLM): avoids looping confirmations and fake costs."""
 
     # Allow users to exit the publish/delete flow with a general cancel phrase.
-    if is_cancel_command(message_body):
+    if is_cancel_command(message_body) and not user_refuses_images(message_body):
         try:
             draft_id = session.get("active_draft_id")
             if not draft_id and user_id:
@@ -361,7 +432,6 @@ async def handle_publish_or_delete_flow(
         }
 
     # Read draft
-    from services import supabase_client
     draft = await supabase_client.get_draft(draft_id)
     if not draft:
         return {
@@ -374,6 +444,17 @@ async def handle_publish_or_delete_flow(
     listing_data = draft.get("listing_data") or {}
     if not isinstance(listing_data, dict):
         listing_data = {}
+
+    # If the user explicitly wants to publish without photos, persist that preference.
+    if user_refuses_images(message_body):
+        try:
+            await supabase_client.update_draft_allow_no_images(draft_id, True)
+            draft = await supabase_client.get_draft(draft_id) or draft
+            listing_data = (draft or {}).get("listing_data") or listing_data
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+        except Exception:
+            pass
 
     session_pending = session.get("pending_publish")
     db_pending = listing_data.get("_pending_publish") if isinstance(listing_data, dict) else None
@@ -717,7 +798,7 @@ def build_draft_status_message(draft: Dict[str, Any], include_vision: bool = Tru
         price_value = f"{price} ₺" if isinstance(price, (int, float)) else str(price)
         add_line("Fiyat", price_value)
     else:
-        missing.append("tahmini fiyat")
+        missing.append("fiyat")
 
     category = listing.get("category")
     if category:
@@ -725,8 +806,9 @@ def build_draft_status_message(draft: Dict[str, Any], include_vision: bool = Tru
     else:
         missing.append("kategori")
 
+    allow_no_images = bool(isinstance(listing, dict) and listing.get("allow_no_images"))
     add_line("Fotoğraflar", f"{len(images)} adet" if images else "henüz eklenmedi")
-    if not images:
+    if not images and not allow_no_images:
         missing.append("ürün fotoğrafları")
 
     vision = draft.get("vision_product")
@@ -977,9 +1059,7 @@ def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
     images = (draft or {}).get("images") or []
     # DEBUG: log draft state to diagnose photo-loss loop
     logger.debug(f"next_missing_slot: draft_id={draft.get('id')}, images_count={len(images)}, listing_keys={list(listing.keys())}")
-    # Ask for images first only if none exists (keeps flow predictable)
-    if not images:
-        return "images"
+    allow_no_images = bool(isinstance(listing, dict) and listing.get("allow_no_images"))
     if not (listing.get("title") or "").strip():
         return "title"
     if not (listing.get("description") or "").strip():
@@ -988,6 +1068,8 @@ def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
         return "price"
     if not (listing.get("category") or "").strip():
         return "category"
+    if not images and not allow_no_images:
+        return "images"
     return None
 
 
@@ -999,7 +1081,7 @@ def build_next_step_message(draft: Dict[str, Any]) -> str:
         suggested_category = str(vision.get("category") or vision.get("product") or "").strip()
 
     if slot == "images":
-        return "İlanı hazırlayabilmem için lütfen 1-2 fotoğraf yükleyin."
+        return "Fotoğraf eklemek ister misiniz? İsterseniz fotoğraf gönderebilir veya 'resimsiz' yazarak resimsiz devam edebilirsiniz."
     if slot == "title":
         return "Ürünün adı nedir? (Örn: 'iPhone 14 128GB siyah')"
     if slot == "description":
@@ -1050,6 +1132,9 @@ def normalize_category_input(message: str) -> Optional[str]:
         "araç": "Otomotiv",
         "arac": "Otomotiv",
         "otomobil": "Otomotiv",
+        "v a s i t a": "Otomotiv",
+        "vasıta": "Otomotiv",
+        "vasita": "Otomotiv",
         "elektronik": "Elektronik",
         "telefon": "Elektronik",
         "bilgisayar": "Elektronik",
@@ -1057,18 +1142,53 @@ def normalize_category_input(message: str) -> Optional[str]:
         "ev yaşam": "Ev & Yaşam",
         "ev & yaşam": "Ev & Yaşam",
         "ev ve yaşam": "Ev & Yaşam",
-        "moda": "Moda",
-        "giyim": "Moda",
-        "spor": "Spor",
-        "hobi": "Hobi",
+        "mobilya": "Ev & Yaşam",
+        "dekorasyon": "Ev & Yaşam",
+        "beyaz esya": "Ev & Yaşam",
+        "beyaz eşya": "Ev & Yaşam",
+        "moda": "Moda & Aksesuar",
+        "aksesuar": "Moda & Aksesuar",
+        "giyim": "Moda & Aksesuar",
+        "spor": "Spor & Outdoor",
+        "outdoor": "Spor & Outdoor",
+        "hobi": "Hobi, Koleksiyon & Sanat",
+        "koleksiyon": "Hobi, Koleksiyon & Sanat",
+        "sanat": "Hobi, Koleksiyon & Sanat",
         "emlak": "Emlak",
-        "hizmet": "Hizmet",
+        "hizmet": "Hizmetler",
+        "hizmetler": "Hizmetler",
+        "ustalar": "Hizmetler",
+        "usta": "Hizmetler",
+        "özel ders": "Eğitim & Kurs",
+        "ozel ders": "Eğitim & Kurs",
+        "egitim": "Eğitim & Kurs",
+        "eğitim": "Eğitim & Kurs",
+        "is ilanlari": "İş İlanları",
+        "iş ilanları": "İş İlanları",
+        "is ilani": "İş İlanları",
+        "iş ilanı": "İş İlanları",
+        "dijital": "Dijital Ürün & Hizmetler",
+        "abonelik": "Dijital Ürün & Hizmetler",
+        "yazilim": "Dijital Ürün & Hizmetler",
+        "yazılım": "Dijital Ürün & Hizmetler",
+        "yedek parca": "Yedek Parça & Aksesuar",
+        "yedek parça": "Yedek Parça & Aksesuar",
         "diger": "Diğer",
         "diğer": "Diğer",
+        "genel": "Diğer",
     }
 
     if msg in mapping:
         return mapping[msg]
+
+    # Deterministic library-based classification (brands + product keywords)
+    try:
+        from services.category_library import classify_category
+        lib_cat = classify_category(msg)
+        if lib_cat:
+            return lib_cat
+    except Exception:
+        pass
 
     # Handle forms like "kategori: otomotiv" or "kategorisi otomotiv" or "kategori otomotiv olsun"
     m = re.search(r"\bkategori(?:si)?\b\s*[:\-]?\s*(.+)$", msg)
@@ -1086,6 +1206,15 @@ def normalize_category_input(message: str) -> Optional[str]:
             cand1 = tokens[0].lower()
             if cand1 in mapping:
                 return mapping[cand1]
+
+            # Library-based classification on the extracted segment
+            try:
+                from services.category_library import classify_category
+                lib_cat = classify_category(rest)
+                if lib_cat:
+                    return lib_cat
+            except Exception:
+                pass
             # As a last resort, accept Title-case for short clean values
             if len(tokens) <= 2:
                 return " ".join([t.title() for t in tokens]).strip() or None
@@ -1151,6 +1280,28 @@ def extract_vision_search_query(analyses: List[Dict[str, Any]]) -> str:
     return " ".join(uniq[:10]).strip()
 
 router = APIRouter(prefix="/webchat", tags=["webchat"])
+
+
+@router.get("/categories")
+async def get_categories() -> Dict[str, Any]:
+    """Return supported categories for frontend dropdown/filter consistency."""
+    try:
+        from services.category_library import get_supported_categories, get_category_options
+        return {
+            "categories": get_supported_categories(),
+            "options": get_category_options(),
+        }
+    except Exception as e:
+        logger.error(f"Failed to load categories: {e}")
+        # Fail safe: return a minimal set
+        return {
+            "categories": ["Elektronik", "Otomotiv", "Diğer"],
+            "options": [
+                {"id": "Elektronik", "label": "Elektronik"},
+                {"id": "Otomotiv", "label": "Otomotiv"},
+                {"id": "Diğer", "label": "Genel / Diğer"},
+            ],
+        }
 
 
 class ChatMessage(BaseModel):
@@ -1521,11 +1672,37 @@ async def process_webchat_message(
                 "intent": "small_talk",
             })
 
+        # DRAFT STATUS OVERRIDE:
+        # Allow users to ask for the draft status at any time without forcing a cancel or switching intents.
+        if is_show_draft_command(message_body):
+            try:
+                draft = None
+                draft_id = session.get("active_draft_id")
+                if isinstance(draft_id, str) and draft_id:
+                    draft = await supabase_client.get_draft(draft_id)
+                if not draft and user_id:
+                    draft = await supabase_client.get_latest_draft_for_user(user_id)
+                if draft:
+                    return await finalize_response({
+                        "success": True,
+                        "message": build_draft_status_message(draft, include_vision=True),
+                        "data": {"type": "draft_status", "draft_id": draft.get("id"), "draft": draft},
+                        "intent": session.get("intent") or "create_listing",
+                    })
+            except Exception:
+                pass
+            return await finalize_response({
+                "success": False,
+                "message": "Aktif bir taslak bulunamadı. Önce 'ilan oluştur' ile taslak başlatın.",
+                "data": {"type": "draft_status"},
+                "intent": session.get("intent") or "small_talk",
+            })
+
         # GLOBAL CANCEL OVERRIDE:
         # Users may say "satmaktan vazgeçtim" / "iptal" while in any flow.
         # Clear the locked intent so routing can start fresh. Do not interfere with
         # publish/delete deterministic flow, which already has its own cancel semantics.
-        if is_cancel_command(message_body) and session.get("locked_intent") != "publish_or_delete":
+        if is_cancel_command(message_body) and not user_refuses_images(message_body) and session.get("locked_intent") != "publish_or_delete":
             # Best-effort: reset the underlying draft in DB so old fields don't leak
             # into the next listing flow (single-draft-per-user model).
             try:
@@ -1700,9 +1877,28 @@ async def process_webchat_message(
                 except Exception:
                     pass
 
+            # If the user refuses to upload images, allow a no-photo listing.
+            if existing_draft and draft_id and user_refuses_images(message_body):
+                try:
+                    await supabase_client.update_draft_allow_no_images(draft_id, True)
+                    existing_draft = await supabase_client.get_draft(draft_id) or existing_draft
+                except Exception:
+                    pass
+                response_data.update({
+                    "draft_id": draft_id,
+                    "draft": existing_draft,
+                    "type": "draft_update",
+                })
+                return await finalize_response({
+                    "success": True,
+                    "message": "Tamam, resimsiz devam edelim. " + build_next_step_message(existing_draft),
+                    "data": response_data,
+                    "intent": intent,
+                })
+
             # Deterministic slot filling: if the draft is missing exactly one next slot,
             # treat the user's next message as that slot input (avoid depending on sticky session state).
-            if existing_draft and draft_id and is_cancel_command(message_body):
+            if existing_draft and draft_id and is_cancel_command(message_body) and not user_refuses_images(message_body):
                 # User wants to stop this flow.
                 try:
                     session.pop("locked_intent", None)

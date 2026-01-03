@@ -13,6 +13,8 @@ from typing import Dict, Any
 import asyncio
 import json
 from loguru import logger
+import re
+from config import settings
 
 
 class CategorySearchAgent(BaseAgent):
@@ -80,6 +82,45 @@ class SearchComposerAgent(BaseAgent):
         """
         try:
             message_lower = user_message.lower()
+
+            # Deterministic category inference (prevents false 0 results)
+            inferred_category = None
+            inferred_category_results = []
+            try:
+                from services.category_library import classify_category
+
+                inferred_category = classify_category(user_message)
+            except Exception:
+                inferred_category = None
+
+            # If the query is mostly a category word (e.g. "araba arıyorum"), do a pure category search.
+            # Passing search_text in that case can AND-filter everything out.
+            def _category_only_search_text(msg: str) -> str | None:
+                s = (msg or "").strip().lower()
+                if not s:
+                    return None
+                tokens = [t for t in re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ]+", s) if t]
+                stop = {
+                    "ariyorum", "arıyorum", "arıyorum", "bakiyorum", "bakıyorum", "bakiyorum", "var", "mi", "mu",
+                    "varmi", "varmı", "istiyorum", "lazim", "lazım", "satilik", "satılık",
+                }
+                # If no meaningful tokens beyond stopwords, treat as category-only.
+                meaningful = [t for t in tokens if t not in stop and len(t) >= 3]
+                return user_message if len(meaningful) >= 2 else None
+
+            if inferred_category:
+                if getattr(settings, "debug", False):
+                    logger.info(f"[search] inferred_category={inferred_category} query={user_message!r}")
+                try:
+                    tool_res = await search_listings_tool.execute(
+                        category=inferred_category,
+                        search_text=_category_only_search_text(user_message),
+                        limit=20,
+                    )
+                    if tool_res.get("success") and tool_res.get("data", {}).get("listings"):
+                        inferred_category_results = tool_res["data"]["listings"]
+                except Exception:
+                    inferred_category_results = []
 
             # If the user is asking a category classification question (not searching listings),
             # answer directly to avoid confusing "0 ilan bulundu" responses.
@@ -152,6 +193,13 @@ class SearchComposerAgent(BaseAgent):
             # Combine and deduplicate results
             all_listings = []
             seen_ids = set()
+
+            # First merge deterministic category results (high recall)
+            for listing in inferred_category_results:
+                listing_id = (listing or {}).get("id") if isinstance(listing, dict) else None
+                if listing_id and listing_id not in seen_ids:
+                    all_listings.append(listing)
+                    seen_ids.add(listing_id)
             
             for result in results:
                 if isinstance(result, dict) and result.get("success"):

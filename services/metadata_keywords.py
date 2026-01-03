@@ -78,6 +78,7 @@ async def generate_listing_keywords(
         "{\"keywords\": [string, ...]}. "
         "Kurallar: Türkçe yaz; 6-12 arası anahtar kelime üret; hepsi küçük harf olsun; "
         "noktalama/emoji yok; tekrar yok. "
+        "İstisna: emlak ilanlarında oda formatı gibi ifadeler (1+1, 2+1, 3+1 vb.) kullanılabilir. "
         "Sadece çok genel olmayan ama aramayı kolaylaştıran terimler üret: "
         "ürün türü, kategori, marka, model, varyant, eş anlamlı/üst sınıf terimler (ör: araba/otomobil/araç), "
         "ve ilgili kullanım alanı. "
@@ -100,6 +101,7 @@ async def generate_listing_keywords(
     user = (
         "Aşağıdaki ilan bilgisinden arama için anahtar kelimeler üret. "
         "Örnek: 'citroen c3' için 'araba', 'otomobil', 'araç' gibi üst terimler ekle.\n\n"
+        "Eğer kategori emlak ise uygun oldukça şu tür terimleri ekle: villa, dubleks, triplex, havuzlu, 1+1/2+1 gibi oda formatları.\n\n"
         f"ILAN_JSON: {json.dumps(payload, ensure_ascii=False)}"
     )
 
