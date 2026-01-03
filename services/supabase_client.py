@@ -7,6 +7,7 @@ from typing import Optional, Dict, List, Any
 from loguru import logger
 import httpx
 import re
+import json
 
 from .metadata_keywords import generate_listing_keywords
 
@@ -63,21 +64,99 @@ class SupabaseClient:
         url: str = ""
         metadata: Dict[str, Any] = {}
 
+        def to_public_url_if_needed(candidate: str) -> str:
+            """Convert storage paths to public URLs when possible."""
+            c = (candidate or "").strip()
+            if not c:
+                return ""
+            if c.startswith(("http://", "https://")):
+                return c
+            # Already a storage URL path, missing hostname.
+            if c.startswith("/storage/"):
+                base = (getattr(settings, "supabase_url", "") or "").strip().rstrip("/")
+                return f"{base}{c}" if base else c
+
+            # Heuristic: treat as a storage object path in the default bucket.
+            # Example stored value: "9054.../temp_xxx.jpg"
+            base = (getattr(settings, "supabase_url", "") or "").strip().rstrip("/")
+            if base and not any(ch in c for ch in ["{", "}", "\n", "\r", " "]):
+                path = c.lstrip("/")
+                return f"{base}/storage/v1/object/public/product-images/{path}"
+            return c
+
+        url_re = re.compile(r"https?://[^\s\)\]\"']+")
+
+        def extract_first_url(value: Any, depth: int = 0) -> str:
+            """Extract a usable http(s) URL from nested dict/list/JSON/markdown strings."""
+            if depth > 4:
+                return ""
+            if value is None:
+                return ""
+
+            if isinstance(value, dict):
+                for key in ["image_url", "public_url", "url", "storage_path", "path"]:
+                    if key in value:
+                        found = extract_first_url(value.get(key), depth + 1)
+                        if found:
+                            return found
+                # Fallback: scan dict values
+                for v in value.values():
+                    found = extract_first_url(v, depth + 1)
+                    if found:
+                        return found
+                return ""
+
+            if isinstance(value, list):
+                for item in value:
+                    found = extract_first_url(item, depth + 1)
+                    if found:
+                        return found
+                return ""
+
+            if isinstance(value, str):
+                s = value.strip()
+                if not s:
+                    return ""
+
+                # Markdown image/link like ![x](https://...)
+                md_match = re.search(r"\((https?://[^\s\)]+)\)", s)
+                if md_match:
+                    return md_match.group(1)
+
+                # JSON payload stored as string (can be nested multiple times)
+                if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+                    try:
+                        parsed = json.loads(s)
+                        found = extract_first_url(parsed, depth + 1)
+                        if found:
+                            return found
+                    except Exception:
+                        pass
+
+                # Raw URL inside a noisy string
+                m = url_re.search(s)
+                if m:
+                    return m.group(0)
+
+                # Storage path fallback (no http)
+                return to_public_url_if_needed(s)
+
+            return ""
+
         if isinstance(entry, dict):
             raw_url = entry.get("image_url") or entry.get("public_url") or entry.get("url") or entry.get("path")
-            if isinstance(raw_url, str):
-                url = raw_url.strip()
+            url = extract_first_url(raw_url)
             raw_meta = entry.get("metadata")
             if isinstance(raw_meta, dict):
                 metadata = raw_meta
         elif isinstance(entry, str):
-            url = entry.strip()
+            url = extract_first_url(entry)
         else:
             return None
 
         if not url:
             return None
-        return {"image_url": url, "metadata": metadata}
+        return {"image_url": to_public_url_if_needed(url), "metadata": metadata}
 
     def _normalize_images(self, images: List[Any]) -> List[Dict[str, Any]]:
         """Normalize any image list into [{image_url, metadata}, ...]."""
@@ -776,7 +855,72 @@ class SupabaseClient:
                     query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
             
             result = query.limit(limit).execute()
-            return result.data or []
+            rows = result.data or []
+
+            # Normalize image_url/images for frontend + chat rendering.
+            # - Ensure image_url is a usable public URL
+            # - Ensure images is a list[str] of usable public URLs (no metadata objects)
+            normalized_rows: List[Dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+
+                # Collect URLs from both image_url and images fields
+                urls: List[str] = []
+                primary = self._extract_image_url(row.get("image_url"))
+                if primary:
+                    urls.append(primary)
+
+                images_field = row.get("images")
+                parsed_images: Any = images_field
+                # Some schemas store images as a JSON string; attempt to parse.
+                if isinstance(images_field, str):
+                    s = images_field.strip()
+                    if s:
+                        try:
+                            parsed_images = json.loads(s)
+                        except Exception:
+                            parsed_images = images_field
+
+                if isinstance(parsed_images, list):
+                    for img in parsed_images:
+                        u = self._extract_image_url(img)
+                        if u:
+                            urls.append(u)
+                else:
+                    # If still a string (possibly noisy JSON/markdown), try extracting a URL.
+                    u = self._extract_image_url(parsed_images)
+                    if u:
+                        urls.append(u)
+
+                # Dedup, preserve order
+                seen: set[str] = set()
+                clean_urls: List[str] = []
+                for u in urls:
+                    if isinstance(u, str):
+                        uu = u.strip()
+                        if uu and uu not in seen:
+                            clean_urls.append(uu)
+                            seen.add(uu)
+
+                # Final normalize via _normalize_image_entry/to_public_url_if_needed
+                # (handles storage-path -> public URL conversion)
+                final_urls: List[str] = []
+                for u in clean_urls:
+                    norm = self._normalize_image_entry(u)
+                    if norm and norm.get("image_url"):
+                        final_urls.append(str(norm["image_url"]))
+
+                if final_urls:
+                    row["image_url"] = final_urls[0]
+                    row["images"] = final_urls
+                else:
+                    # Keep a consistent type for callers
+                    row["images"] = []
+
+                normalized_rows.append(row)
+
+            return normalized_rows
         except Exception as e:
             logger.error(f"Error searching listings: {e}")
             return []
