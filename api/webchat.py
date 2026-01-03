@@ -131,6 +131,11 @@ def is_search_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
         return False
+
+    # Availability-style queries (very common in Turkish): "bilgisayar var mı?".
+    # These should be treated as search/browse intent even if the user doesn't say "ara".
+    if bool(re.search(r"\bvar\s*m[ıi]\b", msg)) or any(token in msg for token in ["varmı", "varmi", "var mı", "var mi"]):
+        return True
     # Common Turkish search/browse phrases
     if any(phrase in msg for phrase in [
         "arıyorum",
@@ -205,7 +210,48 @@ def is_cancel_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
         return False
-    return any(token in msg for token in ["iptal", "vazgeç", "vazgec", "hayır", "hayir", "boşver", "bosver"])
+    # Treat "istemiyorum"-style refusals as a cancel as well to prevent users getting
+    # stuck in a flow (especially create_listing) when they don't know the keyword.
+    return any(token in msg for token in [
+        "iptal",
+        "vazgeç",
+        "vazgec",
+        "vazgeçtim",
+        "vazgectim",
+        "hayır",
+        "hayir",
+        "boşver",
+        "bosver",
+        "istemiyorum",
+        "istemiyom",
+        "satmak istemiyorum",
+        "ilan oluşturmak istemiyorum",
+        "ilan olusturmak istemiyorum",
+        "gerek yok",
+        "bırak",
+        "birak",
+    ])
+
+
+def sanitize_classified_intent(message: str, classified_intent: str | None) -> str | None:
+    """Post-process router output to avoid accidental lock-in and wrong flows.
+
+    The LLM router can occasionally return intents that require state (e.g. publish/delete)
+    even when the user didn't ask for them. This function constrains those cases.
+    """
+    if not classified_intent:
+        return classified_intent
+
+    msg = (message or "").strip().lower()
+
+    # Never enter publish/delete unless the user explicitly requested it.
+    if classified_intent == "publish_or_delete" and not (is_publish_command(msg) or is_delete_command(msg)):
+        # If it looks like a product query, prefer search.
+        if is_search_command(msg):
+            return "search_listings"
+        return "small_talk"
+
+    return classified_intent
 
 
 def draft_is_publishable(draft: Dict[str, Any]) -> bool:
@@ -284,6 +330,30 @@ async def handle_publish_or_delete_flow(
 ) -> Dict[str, Any]:
     """Deterministic publish flow (no LLM): avoids looping confirmations and fake costs."""
 
+    # Allow users to exit the publish/delete flow with a general cancel phrase.
+    if is_cancel_command(message_body):
+        try:
+            draft_id = session.get("active_draft_id")
+            if not draft_id and user_id:
+                latest = await supabase_client.get_latest_draft_for_user(user_id)
+                draft_id = (latest or {}).get("id")
+            if isinstance(draft_id, str) and draft_id:
+                await supabase_client.clear_pending_publish_state(draft_id)
+        except Exception:
+            pass
+
+        session.pop("locked_intent", None)
+        session["intent"] = None
+        session["pending_publish"] = None
+        session_dirty = True
+        return {
+            "success": True,
+            "message": "Tamam. Yayınlama işlemini iptal ettim. İstersen ürün arayabilir ya da ilan oluşturmaya başlayabilirsin.",
+            "data": {"type": "conversation", "intent": "small_talk"},
+            "intent": "small_talk",
+            "_session_dirty": session_dirty,
+        }
+
     # Only support publish for now (delete can be added similarly)
     draft_id = session.get("active_draft_id")
     if not draft_id:
@@ -348,7 +418,8 @@ async def handle_publish_or_delete_flow(
                 preview_data,
                 cost,
                 balance,
-                highlight=edit_result.get("message")
+                highlight=edit_result.get("message"),
+                include_vision=not bool(session.get("vision_explained"))
             )
             return {
                 "success": True,
@@ -407,6 +478,8 @@ async def handle_publish_or_delete_flow(
         session_dirty = True
         await supabase_client.set_pending_publish_state(draft_id, pending)
         message_text = format_preview_message(preview_data, cost, pending.get("balance"))
+        if bool(session.get("vision_explained")):
+            message_text = format_preview_message(preview_data, cost, pending.get("balance"), include_vision=False)
         return {
             "success": True,
             "message": message_text,
@@ -424,7 +497,7 @@ async def handle_publish_or_delete_flow(
     if not draft_is_publishable(draft):
         return {
             "success": True,
-            "message": build_draft_status_message(draft),
+            "message": build_draft_status_message(draft, include_vision=not bool(session.get("vision_explained"))),
             "data": {"type": "draft_update"},
             "intent": "create_listing",
             "_session_dirty": session_dirty
@@ -450,7 +523,7 @@ async def handle_publish_or_delete_flow(
 
     return {
         "success": True,
-        "message": format_preview_message(preview_data, cost, balance),
+        "message": format_preview_message(preview_data, cost, balance, include_vision=not bool(session.get("vision_explained"))),
         "data": {
             "type": "publish_preview",
             "draft_id": draft_id,
@@ -555,8 +628,71 @@ def normalize_user_id(raw_id: Optional[str]) -> str:
     return str(uuid.uuid4())
 
 
-def build_draft_status_message(draft: Dict[str, Any]) -> str:
-    """Generate a friendly status message about the current draft state."""
+def _unwrap_vision_product(vision: Any) -> Dict[str, Any]:
+    """Return the inner vision dict.
+
+    Some flows may store vision_product directly as the analysis dict, while others
+    may store a wrapper like {"image_url": ..., "analysis": {...}}.
+    """
+    if isinstance(vision, dict) and isinstance(vision.get("analysis"), dict):
+        return vision.get("analysis") or {}
+    return vision if isinstance(vision, dict) else {}
+
+
+def generate_title_from_vision(vision: Any) -> str:
+    v = _unwrap_vision_product(vision)
+    product = str(v.get("product") or v.get("category") or "").strip()
+    condition = str(v.get("condition") or "").strip()
+    features = v.get("features")
+
+    feature_txt = ""
+    if isinstance(features, list) and features:
+        feature_txt = ", ".join([str(f).strip() for f in features[:2] if str(f).strip()])
+    elif isinstance(features, str) and features.strip():
+        feature_txt = features.strip()
+
+    base = product or "Ürün"
+    parts: List[str] = [base]
+    if feature_txt:
+        parts.append(feature_txt)
+    elif condition:
+        parts.append(condition)
+
+    title = " - ".join([p for p in parts if p])
+    title = " ".join(title.split())
+    return title[:100].rstrip(" -")
+
+
+def generate_description_from_vision(vision: Any) -> str:
+    v = _unwrap_vision_product(vision)
+    if not v:
+        return ""
+    product = str(v.get("product") or v.get("category") or "Ürün").strip()
+    condition = str(v.get("condition") or "").strip()
+    features = v.get("features")
+
+    feature_txt = ""
+    if isinstance(features, list) and features:
+        feature_txt = ", ".join([str(f).strip() for f in features[:4] if str(f).strip()])
+    elif isinstance(features, str) and features.strip():
+        feature_txt = features.strip()
+
+    sentences: List[str] = []
+    if product:
+        sentences.append(f"{product} satışa hazır.")
+    if condition:
+        sentences.append(f"Durum: {condition}.")
+    if feature_txt:
+        sentences.append(f"Öne çıkan özellikler: {feature_txt}.")
+    sentences.append("Detay için mesaj atabilirsiniz.")
+    return " ".join(" ".join(sentences).split())
+
+
+def build_draft_status_message(draft: Dict[str, Any], include_vision: bool = True) -> str:
+    """Generate a friendly status message about the current draft state.
+
+    include_vision controls whether we print the vision summary block.
+    """
     listing = draft.get("listing_data") or {}
     images = draft.get("images") or []
     summary_lines: List[str] = []
@@ -598,7 +734,10 @@ def build_draft_status_message(draft: Dict[str, Any]) -> str:
         missing.append("ürün fotoğrafları")
 
     vision = draft.get("vision_product")
-    if isinstance(vision, dict):
+    if isinstance(vision, dict) and isinstance(vision.get("analysis"), dict):
+        vision = vision.get("analysis")
+
+    if include_vision and isinstance(vision, dict):
         vision_category = vision.get("category") or vision.get("product")
         vision_condition = vision.get("condition")
         features = vision.get("features")
@@ -674,7 +813,8 @@ def format_preview_message(
     preview: Dict[str, Any],
     cost: int,
     balance: Optional[float] = None,
-    highlight: Optional[str] = None
+    highlight: Optional[str] = None,
+    include_vision: bool = True
 ) -> str:
     lines: List[str] = ["📝 Yayın öncesi kontrol:"]
 
@@ -695,7 +835,7 @@ def format_preview_message(
     lines.append(f"• Fotoğraflar: {image_count} adet")
 
     vision = preview.get("vision")
-    if isinstance(vision, dict):
+    if include_vision and isinstance(vision, dict):
         vision_lines: List[str] = []
         if vision.get("condition"):
             vision_lines.append(f"Durum: {vision['condition']}")
@@ -1281,6 +1421,9 @@ async def process_webchat_message(
                         pass
 
                 message_text = format_media_analysis_message(session.get("pending_media_analysis") or [])
+                # Mark that we already explained vision to the user for this media batch.
+                session["vision_explained"] = True
+                session_dirty = True
                 return await finalize_response({
                     "success": True,
                     "message": message_text,
@@ -1399,6 +1542,14 @@ async def process_webchat_message(
         intent = session.get("intent")
         locked_intent = session.get("locked_intent")
 
+        # If we somehow ended up in publish/delete without an explicit user request and without
+        # a locked publish/delete flow, drop it so we can route normally.
+        if intent == "publish_or_delete" and locked_intent != "publish_or_delete":
+            if not (is_publish_command(message_body) or is_delete_command(message_body)):
+                session["intent"] = None
+                intent = None
+                session_dirty = True
+
         # INTENT SWITCH ERGONOMICS:
         # If the user is locked in create_listing but says a clear search command (e.g. "benzer ara"),
         # don't silently ignore it. Guide them to the explicit cancel keyword.
@@ -1443,7 +1594,7 @@ async def process_webchat_message(
 
         if not intent:
             router_agent = IntentRouterAgent()
-            intent = await router_agent.classify_intent(message_body)
+            intent = sanitize_classified_intent(message_body, await router_agent.classify_intent(message_body))
             session["intent"] = intent
             session_dirty = True
             if not redis_disabled:
@@ -1782,6 +1933,41 @@ async def process_webchat_message(
                         "data": {"type": "slot_prompt"},
                         "intent": intent
                     })
+
+                # AUTO-SEED TITLE/DESCRIPTION:
+                # If the user came from the photo-first flow and explicitly said "ilan oluştur",
+                # don't ask again for product name/description. Seed them from vision_product.
+                try:
+                    listing = (draft or {}).get("listing_data") or {}
+                    images = (draft or {}).get("images") or []
+                    vision = _unwrap_vision_product((draft or {}).get("vision_product"))
+                    has_vision_signal = False
+                    if isinstance(vision, dict):
+                        if str(vision.get("product") or "").strip():
+                            has_vision_signal = True
+                        if str(vision.get("category") or "").strip():
+                            has_vision_signal = True
+                        if str(vision.get("condition") or "").strip():
+                            has_vision_signal = True
+                        if isinstance(vision.get("features"), list) and vision.get("features"):
+                            has_vision_signal = True
+                        if isinstance(vision.get("features"), str) and vision.get("features").strip():
+                            has_vision_signal = True
+
+                    if images and has_vision_signal:
+                        if not (str(listing.get("title") or "").strip()):
+                            seeded_title = generate_title_from_vision(vision)
+                            if seeded_title:
+                                await supabase_client.update_draft_title(draft_id, seeded_title)
+                        if not (str(listing.get("description") or "").strip()):
+                            seeded_desc = generate_description_from_vision(vision)
+                            if seeded_desc:
+                                await supabase_client.update_draft_description(draft_id, seeded_desc)
+                        # Re-read to compute next slot accurately
+                        draft = await supabase_client.get_draft(draft_id)
+                except Exception:
+                    pass
+
                 prompt = build_next_step_message(draft)
                 slot = next_missing_slot(draft)
                 return await finalize_response({
@@ -1815,7 +2001,7 @@ async def process_webchat_message(
                 # (Full summary is still available via build_draft_status_message if needed.)
                 slot = next_missing_slot(draft)
                 if slot is None:
-                    response_text = build_draft_status_message(draft)
+                    response_text = build_draft_status_message(draft, include_vision=not bool(session.get("vision_explained")))
                 else:
                     response_text = build_next_step_message(draft)
                 
@@ -2071,6 +2257,8 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
     analyses = await analyze_media_with_vision(chat_message.media_urls)
     session["pending_media_analysis"] = analyses
     message_text = format_media_analysis_message(analyses)
+    # This message is the one-time user-facing vision explanation for this upload.
+    session["vision_explained"] = True
 
     # IMPORTANT (non-sticky sessions): persist uploaded media into the active draft.
     # The frontend uses /media/analyze, and the follow-up "ilan oluştur" message may

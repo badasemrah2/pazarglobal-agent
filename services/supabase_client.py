@@ -599,6 +599,19 @@ class SupabaseClient:
             listing_data = draft.get("listing_data") or {}
             images = self._normalize_images(draft.get("images") or [])
 
+            # Persist images in a frontend-compatible format.
+            # - Some environments use listings.images as text[]
+            # - Some use listings.images as jsonb
+            # A plain list[str] works for both, while list[dict] breaks text[].
+            image_urls: List[str] = []
+            for img in images:
+                if not isinstance(img, dict):
+                    continue
+                url = img.get("image_url")
+                if isinstance(url, str) and url.strip():
+                    image_urls.append(url.strip())
+            primary_image_url = image_urls[0] if image_urls else None
+
             if cost > 0:
                 balance = await self.get_wallet_balance(user_id)
                 balance_int = int(balance) if balance is not None else None
@@ -649,7 +662,8 @@ class SupabaseClient:
                 "price": listing_data.get("price"),
                 "category": listing_data.get("category"),
                 "status": "active",
-                "images": images,
+                "image_url": primary_image_url,
+                "images": image_urls,
                 "metadata": listing_metadata
             }).execute()
             
@@ -669,14 +683,13 @@ class SupabaseClient:
                         raise wallet_err
 
                 # Persist product_images records (only after wallet deduction succeeds)
-                for img in images:
+                for url in image_urls:
                     try:
-                        public_url = img.get("image_url")
-                        if not public_url:
+                        if not url:
                             continue
                         self.client.table("product_images").insert({
                             "listing_id": listing_id,
-                            "public_url": public_url
+                            "public_url": url
                         }).execute()
                     except Exception as e:
                         logger.warning(f"Failed to copy image to product_images: {e}")

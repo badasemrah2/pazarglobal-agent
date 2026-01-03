@@ -20,6 +20,16 @@ Critical Rules:
 - Once intent is determined, system routes to the appropriate workflow; follow-up like “show details of listing X” stays in the same workflow
 - Return ONLY the intent name in the structured output
 
+Routing Heuristics (Turkish-first):
+- If the user asks availability like “X var mı/varmi/varmı?”, “mevcut mu?”, “bulunur mu?” => search_listings.
+  Examples: “bilgisayar var mı”, “laptop var mi?”, “harddisk varmı”, “iphone 13 mevcut mu?”
+- Use publish_or_delete ONLY when the user explicitly asks to publish or delete.
+  Publish keywords: “yayınla/yayinla/publish”
+  Delete keywords: “sil/kaldır/kaldir/delete”
+  If those keywords are NOT present, NEVER choose publish_or_delete.
+- If the user says they don't want to proceed: “iptal”, “vazgeç/vazgeçtim”, “boşver”, “istemiyorum”, “ilan oluşturmak istemiyorum”, “satmak istemiyorum”
+  => small_talk (reset / exit flow).
+
 Output format: {"intent": "create_listing|publish_or_delete|search_listings|small_talk"}
 """
 

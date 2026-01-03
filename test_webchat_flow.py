@@ -64,6 +64,16 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
             d["vision_product"] = vision_product
             return True
 
+        async def update_draft_title(self, draft_id: str, title: str) -> bool:
+            d = self.drafts[draft_id]
+            d.setdefault("listing_data", {})["title"] = title
+            return True
+
+        async def update_draft_description(self, draft_id: str, description: str) -> bool:
+            d = self.drafts[draft_id]
+            d.setdefault("listing_data", {})["description"] = description
+            return True
+
         async def reset_draft(self, draft_id: str, phone_number: str | None = None) -> bool:
             # Mimic production behavior: reset wipes images + listing fields.
             self.reset_calls.append(draft_id)
@@ -110,8 +120,9 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
     assert r2["intent"] == "create_listing"
     assert r2["data"]["type"] in {"slot_prompt", "draft_update"}
 
-    # Should ask for title next (since we only attached images)
-    assert "Ürünün adı" in r2["message"]
+    # New behavior: title+description are auto-seeded from vision; next slot becomes price.
+    assert r2["data"].get("slot") == "price"
+    assert "Fiyat" in r2["message"]
 
     # Regression: should NOT have reset the draft just because vision included a category.
     assert fake_supabase.reset_calls == []
@@ -144,6 +155,14 @@ async def test_command_only_does_not_trigger_hallucinated_title_when_images_exis
         async def update_draft_category(self, draft_id: str, category: str, vision_product: dict[str, Any] | None = None) -> bool:
             return True
 
+        async def update_draft_title(self, draft_id: str, title: str) -> bool:
+            self.drafts[draft_id]["listing_data"]["title"] = title
+            return True
+
+        async def update_draft_description(self, draft_id: str, description: str) -> bool:
+            self.drafts[draft_id]["listing_data"]["description"] = description
+            return True
+
     fake_supabase = FakeSupabase()
     monkeypatch.setattr(webchat, "supabase_client", fake_supabase)
 
@@ -174,6 +193,78 @@ async def test_command_only_does_not_trigger_hallucinated_title_when_images_exis
 
     assert r["success"] is True
     assert "Ürünün adı" in r["message"]
+
+
+def test_vision_blocks_can_be_suppressed(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    draft = {
+        "id": "d1",
+        "listing_data": {"title": "X", "description": "Y", "price": None, "category": None},
+        "images": [{"image_url": "https://example.com/x.jpg", "metadata": {}}],
+        "vision_product": {"product": "iPhone", "condition": "İyi", "features": ["128GB"]},
+    }
+
+    msg_no_vision = webchat.build_draft_status_message(draft, include_vision=False)
+    assert "Görsel analizi" not in msg_no_vision
+
+    preview = {
+        "title": "X",
+        "description": "Y",
+        "price": None,
+        "category": None,
+        "images": ["https://example.com/x.jpg"],
+        "vision": draft["vision_product"],
+    }
+    prev_no_vision = webchat.format_preview_message(preview, cost=0, balance=None, include_vision=False)
+    assert "Görsel analizi" not in prev_no_vision
+
+
+def test_var_mi_queries_are_treated_as_search(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    assert webchat.is_search_command("bilgisayar var mı") is True
+    assert webchat.is_search_command("bilgisayar varmı") is True
+    assert webchat.is_search_command("laptop var mi?") is True
+    assert webchat.is_search_command("harddisk var mı") is True
+
+
+@pytest.mark.asyncio
+async def test_router_publish_misclassification_is_sanitized_to_search(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    # Force no-redis mode so we don't depend on external services.
+    monkeypatch.setattr(webchat.redis_client, "disabled", True, raising=False)
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+
+    class FakeRouter:
+        async def classify_intent(self, message: str) -> str:
+            # Simulate an LLM/router mistake.
+            return "publish_or_delete"
+
+    monkeypatch.setattr(webchat, "IntentRouterAgent", lambda: FakeRouter())
+
+    class FakeSearch:
+        async def orchestrate_search(self, query: str) -> dict[str, Any]:
+            return {
+                "success": True,
+                "message": "(fake) arama sonucu",
+                "listings": [],
+                "count": 0,
+                "listings_full": [],
+            }
+
+    monkeypatch.setattr(webchat, "SearchComposerAgent", lambda: FakeSearch())
+
+    r = await webchat.process_webchat_message(
+        message_body="bilgisayar var mı",
+        session_id="s_search_1",
+        user_id="u_search_1",
+        media_urls=None,
+    )
+
+    # Should NOT lock into publish/delete and should route as search.
+    assert r["intent"] == "search_listings"
 
 
 @pytest.mark.asyncio

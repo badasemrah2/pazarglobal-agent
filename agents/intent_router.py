@@ -28,7 +28,7 @@ class IntentRouterAgent(BaseAgent):
         try:
             messages = [
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"Classify this message: {user_message}"}
+                {"role": "user", "content": f"Bu mesajın niyetini sınıflandır: {user_message}"}
             ]
             
             # Use function calling for structured output

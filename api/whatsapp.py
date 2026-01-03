@@ -51,6 +51,10 @@ def is_search_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
         return False
+
+    # Availability-style queries: "bilgisayar var mı?" should be treated as a search intent.
+    if bool(re.search(r"\bvar\s*m[ıi]\b", msg)) or any(token in msg for token in ["varmı", "varmi", "var mı", "var mi"]):
+        return True
     if any(phrase in msg for phrase in [
         "arıyorum",
         "ariyorum",
