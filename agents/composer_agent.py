@@ -92,6 +92,59 @@ class ComposerAgent(BaseAgent):
                     "error": "Draft not found",
                     "code": "missing_listing_id"
                 }
+
+            draft_payload = current_draft.get("data") or {}
+            listing_now = (draft_payload or {}).get("listing_data") or {}
+            if not isinstance(listing_now, dict):
+                listing_now = {}
+
+            def _filled_str(value: Any) -> bool:
+                return isinstance(value, str) and value.strip() != ""
+
+            def _wants_explicit_edit(msg: str, field: str) -> bool:
+                """Conservative edit detection.
+
+                Webchat flow already supports deterministic slot filling and preview edits.
+                Composer should not overwrite fields unless the user clearly asks to.
+                """
+
+                m = (msg or "").strip().lower()
+                if not m:
+                    return False
+
+                edit_verbs = [
+                    "değiştir",
+                    "degistir",
+                    "güncelle",
+                    "guncelle",
+                    "düzenle",
+                    "duzenle",
+                    "revize",
+                    "yenile",
+                    "güncel",
+                    "guncel",
+                    "olsun",
+                ]
+
+                if field == "title":
+                    keys = ["başlık", "baslik", "title", "isim", "ad", "ürün adı", "urun adi"]
+                elif field == "description":
+                    keys = ["açıklama", "aciklama", "detay", "description"]
+                elif field == "price":
+                    keys = ["fiyat", "tl", "₺", "try", "lira"]
+                else:
+                    keys = []
+
+                if any(k in m for k in keys) and any(v in m for v in edit_verbs):
+                    return True
+
+                # Strong patterns: "fiyat 15000", "başlık: ...", "açıklama: ..."
+                if field == "price" and ("fiyat" in m and re.search(r"\b\d{2,}\b", m)):
+                    return True
+                if field in {"title", "description"} and re.search(r"\b(baslik|başlık|aciklama|açıklama|title|description)\b\s*[:\-]", m):
+                    return True
+
+                return False
             
             # Context for all agents
             context = {
@@ -117,18 +170,27 @@ class ComposerAgent(BaseAgent):
             }
 
             tasks = []
-            if not (is_command_only and all_media_urls):
-                tasks.extend([
-                    self.title_agent.run(user_message, context),
-                    self.description_agent.run(user_message, context)
-                ])
+            title_filled = _filled_str(listing_now.get("title"))
+            description_filled = _filled_str(listing_now.get("description"))
+            price_filled = listing_now.get("price") is not None
 
-            # Only run PriceAgent when user actually provided a price signal.
-            # This prevents hallucinated or cached prices from being (re)written on commands like "ilan oluştur".
+            # Only fill missing fields by default; do not overwrite populated fields.
+            # Overwrites are allowed only when the user explicitly asks to edit.
+            want_title = (not title_filled) or _wants_explicit_edit(user_message, "title")
+            want_description = (not description_filled) or _wants_explicit_edit(user_message, "description")
+
+            if not (is_command_only and all_media_urls):
+                if want_title:
+                    tasks.append(self.title_agent.run(user_message, context))
+                if want_description:
+                    tasks.append(self.description_agent.run(user_message, context))
+
+            # Price: only fill missing, or explicitly update when the user asks.
             msg = (user_message or "").lower()
             has_price_number = bool(re.search(r"\b\d{2,}\b", msg))
             has_currency_hint = any(tok in msg for tok in ["₺", "tl", "try", "lira", "fiyat"])
-            if has_price_number and has_currency_hint:
+            want_price = (not price_filled) or _wants_explicit_edit(user_message, "price")
+            if want_price and has_price_number and (has_currency_hint or "fiyat" in msg):
                 tasks.append(self.price_agent.run(user_message, context))
             
             # Add image agent for each media URL provided

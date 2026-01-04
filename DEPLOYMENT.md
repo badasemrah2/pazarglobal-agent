@@ -21,14 +21,14 @@ railway login
 
 ### 2. Yeni Proje Oluştur
 
-**Seçenek A: GitHub ile (Önerilen)**
+#### Seçenek A: GitHub ile (Önerilen)
 
 1. [Railway Dashboard](https://railway.app/dashboard) açın
 2. "New Project" → "Deploy from GitHub repo" seçin
 3. `pazarglobal-agent` repository'sini seçin
 4. Railway otomatik olarak `railway.json` ve `Procfile` algılayacak
 
-**Seçenek B: CLI ile**
+#### Seçenek B: CLI ile
 
 ```bash
 cd pazarglobal-agent
@@ -39,6 +39,7 @@ railway up
 ### 3. Redis Servis Ekle
 
 Railway dashboard'da:
+
 1. Projenize tıklayın
 2. "+ New" → "Database" → "Add Redis"
 3. Redis otomatik olarak oluşturulacak
@@ -47,39 +48,70 @@ Railway dashboard'da:
 
 Railway dashboard → "Variables" sekmesine gidin ve şunları ekleyin:
 
-#### OpenAI
-```
+#### Agent API (pazarglobal-agent) - OpenAI
+
+```env
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4-turbo-preview
 OPENAI_VISION_MODEL=gpt-4o-mini
 ```
 
-#### Supabase
-```
+#### Agent API (pazarglobal-agent) - Supabase
+
+```env
 SUPABASE_URL=https://xxx.supabase.co
 SUPABASE_KEY=eyJ...
 SUPABASE_SERVICE_KEY=eyJ...
 ```
 
-#### Redis (Otomatik oluşturuldu)
-```
+#### Agent API (pazarglobal-agent) - Redis (Otomatik oluşturuldu)
+
+```env
 REDIS_URL=${{Redis.REDIS_URL}}
 ```
 
-#### Twilio (WhatsApp için)
-```
-TWILIO_ACCOUNT_SID=AC...
-TWILIO_AUTH_TOKEN=...
-TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
-```
+#### Agent API (pazarglobal-agent) - API Config
 
-#### API Config
-```
+```env
 API_ENV=production
 DEBUG=false
 LOG_LEVEL=INFO
 WEBHOOK_BASE_URL=https://your-app.railway.app
 ```
+
+#### WhatsApp Bridge (pazarglobal-whatsapp-bridge)
+
+WhatsApp entegrasyonu güncel mimaride ayrı bir Railway servisidir ve Twilio webhook’u bu servise vurur.
+
+Bridge için gerekli env’ler:
+
+```env
+# Bridge → Supabase Edge gate
+EDGE_FUNCTION_URL=https://YOUR_PROJECT.supabase.co/functions/v1/whatsapp-traffic-controller
+SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+SUPABASE_SERVICE_KEY=eyJ...  # server-to-server (service role)
+
+# Twilio
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
+
+# Optional
+SUPABASE_STORAGE_BUCKET=product-images
+AGENT_BACKEND_URL=https://your-agent.railway.app
+WHATSAPP_LOCAL_DETAIL_SHORTCIRCUIT=false
+```
+
+#### Supabase Edge Function (whatsapp-traffic-controller)
+
+Supabase projesinde Edge function env olarak (Supabase Dashboard → Edge Functions → Secrets):
+
+```env
+# Edge → Agent API
+BACKEND_URL=https://your-agent.railway.app
+```
+
+Not: Edge function Supabase’in kendi `SUPABASE_URL` ve `SUPABASE_SERVICE_ROLE_KEY` secret’larını kullanır.
 
 ### 5. Deploy
 
@@ -200,22 +232,21 @@ CREATE POLICY "Service role bypass" ON transactions FOR ALL USING (true);
 
 1. [Twilio Console](https://console.twilio.com) → "Messaging" → "Try it out" → "Send a WhatsApp message"
 2. "Sandbox Settings" tıklayın
-3. "WHEN A MESSAGE COMES IN" webhook URL'sini ayarlayın:
-   ```
-   https://your-app.railway.app/whatsapp/webhook
-   ```
+3. "WHEN A MESSAGE COMES IN" webhook URL'sini ayarlayın: <https://your-bridge.railway.app/webhook/whatsapp>
 4. HTTP Method: `POST`
 5. Save
 
 ### Test
 
 WhatsApp'tan Twilio sandbox numarasına mesaj gönderin:
-```
+
+```text
 join [your-sandbox-code]
 ```
 
 Sonra test mesajı:
-```
+
+```text
 Merhaba!
 ```
 
@@ -239,6 +270,7 @@ curl https://your-app.railway.app/health
 ```
 
 Beklenen response:
+
 ```json
 {
   "status": "healthy",
@@ -252,6 +284,7 @@ Beklenen response:
 ### Railway Metrics
 
 Railway dashboard'da:
+
 - CPU usage
 - Memory usage
 - Network traffic
@@ -260,6 +293,7 @@ Railway dashboard'da:
 ### Custom Logging
 
 Logları görüntüle:
+
 ```bash
 railway logs --follow
 ```
@@ -273,6 +307,7 @@ veya Dashboard → "Observability" sekmesi
 Railway, GitHub'a her push'ta otomatik deploy eder.
 
 Branch ayarları:
+
 1. Railway dashboard → "Settings" → "Source"
 2. "Branch" seçin (main/master)
 3. Her commit otomatik deploy olur
@@ -298,11 +333,13 @@ railway variables
 ### Connection Errors
 
 1. Redis bağlantısını kontrol et:
+
    ```bash
    railway run python -c "import redis; r = redis.from_url('$REDIS_URL'); print(r.ping())"
    ```
 
 2. Supabase bağlantısını kontrol et:
+
    ```bash
    curl https://YOUR_SUPABASE_URL/rest/v1/
    ```
@@ -367,6 +404,7 @@ app.add_middleware(
 ### Rate Limiting
 
 Rate limiting zaten aktif:
+
 - 60 request/dakika
 - 1000 request/saat
 
@@ -381,12 +419,14 @@ Rate limiting zaten aktif:
 ### Horizontal Scaling
 
 Railway Pro plan ile:
+
 1. Dashboard → "Settings" → "Deploy"
 2. "Replicas" ayarını artırın
 
 ### Vertical Scaling
 
 Resource limits artırın:
+
 1. Dashboard → "Settings" → "Resources"
 2. CPU/Memory limit'leri ayarlayın
 

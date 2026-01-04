@@ -19,7 +19,7 @@ OpenAI SDK tabanlı, paralel agent mimarisi ile çalışan PazarGlobal marketpla
 
 ## 📁 Proje Yapısı
 
-```
+```text
 pazarglobal-agent/
 ├── agents/                 # Tüm AI agentlar
 │   ├── base_agent.py      # Base agent class
@@ -65,6 +65,7 @@ cp .env.example .env
 ```
 
 Gerekli değişkenleri doldurun:
+
 - `OPENAI_API_KEY`: OpenAI API anahtarı
 - `SUPABASE_URL`: Supabase project URL
 - `SUPABASE_SERVICE_KEY`: Supabase service key
@@ -98,10 +99,13 @@ API şu adreste çalışacak: `http://localhost:8000`
 
 ### WhatsApp Webhook
 
-Twilio'da webhook URL'ini ayarlayın:
-```
-https://your-domain.railway.app/whatsapp/webhook
-```
+Güncel mimaride Twilio webhook **doğrudan Agent API’ye değil**, WhatsApp Bridge servisine gider:
+
+<https://your-bridge.railway.app/webhook/whatsapp>
+
+Bridge, mesajı Supabase Edge `whatsapp-traffic-controller` fonksiyonuna yollar (PIN + 10dk session gate) ve Edge, backend’e `/agent/run` üzerinden forward eder.
+
+Not: Agent API içindeki `/whatsapp/*` route’ları doğrudan-Twilio entegrasyonu için opsiyonel/legacy kalabilir.
 
 ### WebChat REST API
 
@@ -180,6 +184,7 @@ Railway dashboard'da tüm environment variables'ları ekleyin.
 ### 3. Redis Ekle
 
 Railway'de Redis service ekleyin:
+
 ```bash
 railway add
 # Redis seçin
@@ -197,7 +202,7 @@ railway up
 
 ### Create Listing Flow
 
-```
+```text
 User Message
     ↓
 IntentRouter → "create_listing"
@@ -215,7 +220,7 @@ Response to User
 
 ### Publish Flow
 
-```
+```text
 User: "yayınla"
     ↓
 PublishDeleteAgent
@@ -229,7 +234,7 @@ Listing Published
 
 ### Search Flow
 
-```
+```text
 User: "iPhone aramak istiyorum"
     ↓
 SearchComposerAgent
@@ -288,11 +293,13 @@ class MyAgent(BaseAgent):
 ## 📊 Monitoring
 
 Loglar için:
+
 ```bash
 tail -f logs/app.log
 ```
 
 Railway'de logs:
+
 ```bash
 railway logs
 ```

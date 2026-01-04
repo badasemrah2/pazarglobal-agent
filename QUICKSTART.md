@@ -41,11 +41,13 @@ pip install -r requirements.txt
 ### 3. Redis Başlat (1 dakika)
 
 **Docker ile (en kolay):**
+
 ```bash
 docker run -d -p 6379:6379 --name redis redis:alpine
 ```
 
 **veya Windows için Redis:**
+
 - [Redis for Windows](https://github.com/microsoftarchive/redis/releases) indir
 - Çalıştır
 
@@ -56,12 +58,13 @@ docker run -d -p 6379:6379 --name redis redis:alpine
 python main.py
 ```
 
-API çalışıyor: http://localhost:8000
+API çalışıyor: <http://localhost:8000>
 
 ### 5. Test Et
 
 **Browser'da aç:**
-```
+
+```text
 http://localhost:8000/docs
 ```
 
@@ -148,13 +151,14 @@ export async function sendMessage(sessionId: string, message: string) {
 
 ### 3. ChatBox'ta Kullan
 
-Mevcut `ChatBox.tsx` dosyanızı güncelleyin (detaylı kod `FRONTEND_INTEGRATION.md` dosyasında).
+Mevcut `ChatBox.tsx` dosyanızı güncelleyin
+(detaylı kod `FRONTEND_INTEGRATION.md` dosyasında).
 
 ## 🎯 Temel Kullanım Senaryoları
 
 ### Senaryo 1: İlan Oluşturma
 
-```
+```text
 User: "iPhone 13 Pro 256GB satmak istiyorum, sıfır kutusunda, fiyat 25000 TL"
 
 Agent: 
@@ -164,12 +168,14 @@ Agent:
 📄 Açıklama: Sıfır kutusunda iPhone 13 Pro 256GB
 💰 Fiyat: 25000 TL
 
-Değişiklik yapmak ister misiniz? Yoksa yayınlamak için 'yayınla' yazın.
+Değişiklik yapmak ister misiniz?
+Yoksa yayınlamak için 'yayınla' yazın.
+
 ```
 
 ### Senaryo 2: İlan Düzenleme
 
-```
+```text
 User: "Fiyatı 24000 TL yap"
 
 Agent:
@@ -178,7 +184,7 @@ Agent:
 
 ### Senaryo 3: İlan Yayınlama
 
-```
+```text
 User: "yayınla"
 
 Agent:
@@ -194,7 +200,7 @@ Agent:
 
 ### Senaryo 4: İlan Arama
 
-```
+```text
 User: "20000 TL altında iPhone ara"
 
 Agent:
@@ -213,7 +219,7 @@ Agent:
 
 ### Senaryo 5: Genel Sohbet
 
-```
+```text
 User: "PazarGlobal nedir?"
 
 Agent:
@@ -251,8 +257,14 @@ Tüm seçenekler için `.env.example` dosyasına bakın.
 
 ### WhatsApp (Twilio için)
 
-- `POST /whatsapp/webhook` - WhatsApp mesajları
-- `GET /whatsapp/webhook` - Webhook verify
+WhatsApp entegrasyonu güncel mimaride **ayrı bir servis** üzerinden çalışır:
+
+- WhatsApp Bridge: `POST /webhook/whatsapp`
+
+Twilio Console webhook URL örneği: <https://your-bridge.railway.app/webhook/whatsapp>
+
+Bridge ayrıca Supabase Edge `whatsapp-traffic-controller` (PIN + 10dk session gate)
+üzerinden Agent API `/agent/run`’a forward eder.
 
 ### Utility
 
@@ -363,11 +375,12 @@ Herşey çalışıyorsa:
 - [ ] Redis'e bağlanabiliyor
 - [ ] Supabase'e bağlanabiliyor
 
-## 🎉 Tebrikler!
+## 🎉 Tebrikler
 
-PazarGlobal Agent sisteminiz çalışıyor! 
+PazarGlobal Agent sisteminiz çalışıyor!
 
 Sorularınız için:
+
 - README.md - Genel bakış
 - FRONTEND_INTEGRATION.md - Frontend bağlantısı
 - DEPLOYMENT.md - Production deployment

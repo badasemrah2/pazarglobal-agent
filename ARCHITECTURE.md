@@ -1,70 +1,67 @@
-# 🏗️ Sistem Mimarisi
+# 🏗️ Sistem Mimarisi (Güncel)
 
-Bu doküman, PazarGlobal Agent sisteminin teknik mimarisini detaylı olarak açıklar.
+Bu doküman, PazarGlobal Agent sisteminin **güncel** teknik mimarisini açıklar.
+
+Bu workspace’te mimari 3 ayrı repo olarak kurgulanır:
+
+- **pazarglobal-frontend**: WebChat paneli (lokalde çalışıyor).
+- **pazarglobal-agent**: FastAPI Agent API (Railway deploy). İstekler burada işlenir (özellikle `/agent/run`).
+- **pazarglobal-whatsapp-bridge**: Twilio WhatsApp webhook → **Supabase Edge WhatsApp Traffic Controller** → Agent API köprüsü (Railway deploy).
 
 ## 📐 Genel Mimari
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        User Interfaces                          │
-│                                                                 │
-│    ┌──────────────┐         ┌──────────────┐                  │
-│    │   WhatsApp   │         │   WebChat    │                  │
-│    │   (Twilio)   │         │  (Frontend)  │                  │
-│    └──────┬───────┘         └──────┬───────┘                  │
-└───────────┼────────────────────────┼──────────────────────────┘
-            │                        │
-            │        FastAPI         │
-            │        Webhooks        │
-            ▼                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      API Layer (FastAPI)                         │
-│                                                                  │
-│  ┌──────────────────┐        ┌────────────────────┐            │
-│  │ WhatsApp Router  │        │  WebChat Router    │            │
-│  │  /whatsapp/*     │        │   /webchat/*       │            │
-│  └────────┬─────────┘        └─────────┬──────────┘            │
-└───────────┼──────────────────────────────┼───────────────────────┘
-            │                              │
-            └──────────────┬───────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Intent Router Agent                           │
-│                                                                  │
-│  Classifies user intent into:                                   │
-│  • create_listing                                               │
-│  • publish_or_delete                                            │
-│  • search_listings                                              │
-│  • small_talk                                                   │
-└───────────────────────┬─────────────────────────────────────────┘
-                        │
-        ┌───────────────┼───────────────┬───────────────┐
-        │               │               │               │
-        ▼               ▼               ▼               ▼
-┌───────────────┐ ┌──────────┐ ┌─────────────┐ ┌────────────┐
-│  Create       │ │ Publish  │ │   Search    │ │ Small Talk │
-│  Listing      │ │ Delete   │ │   Listing   │ │   Agent    │
-│  Workflow     │ │  Agent   │ │  Workflow   │ │            │
-└───────────────┘ └──────────┘ └─────────────┘ └────────────┘
+```text
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              User Interfaces                               │
+│                                                                           │
+│  ┌──────────────┐                                     ┌──────────────┐   │
+│  │   WhatsApp    │                                     │   WebChat    │   │
+│  │   (Twilio)    │                                     │  (Frontend)  │   │
+│  └──────┬────────┘                                     └──────┬───────┘   │
+│         │                                                      │           │
+└─────────┼──────────────────────────────────────────────────────┼───────────┘
+          │                                                      │
+          ▼                                                      ▼
+┌───────────────────────────────┐                    ┌──────────────────────┐
+│ WhatsApp Bridge (Railway)      │                    │ Agent API (FastAPI)  │
+│ /webhook/whatsapp              │                    │ WebChat: /webchat/*  │
+└──────────────┬────────────────┘                    │ Core:   /agent/run    │
+               │                                     └──────────┬───────────┘
+               ▼                                                │
+┌───────────────────────────────┐                               │
+│ Supabase Edge Function         │                               │
+│ whatsapp-traffic-controller    │                               │
+│ (PIN + 10min session gate)     │                               │
+└──────────────┬────────────────┘                               │
+               │                                                │
+               └───────────────────────────────►────────────────┘
+                               forward
 ```
 
-## 🔄 Create Listing Workflow (Detaylı)
+## 🔄 Create Listing Workflow (Güncel / Hibrit)
 
-```
+Create Listing akışı pratikte **hibrit** çalışır:
+
+- **Deterministik katman (webchat.py)**: slot-filling, preview/edit, “image-first” buffer, kategori çıkarımı gibi kararlar kod ile verilir.
+- **LLM katmanı (ComposerAgent + alt agentlar)**: eksik alanları tool’lar üzerinden doldurma/iyileştirme yapar.
+
+Bu sayede Railway’de sticky session olmadığı senaryolarda bile akış “kendi kendine toparlayabilir”.
+
+```text
 User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
                     ↓
-        ┌───────────────────────┐
-        │   Composer Agent      │
-        │  (Orchestrator)       │
-        └───────┬───────────────┘
+        ┌──────────────────────────────┐
+        │ WebChat Workflow Engine      │
+        │ (deterministic slot filling) │
+        └──────────┬───────────────────┘
                 │
-                │ 1. Create Draft (draft_id = XXX)
+                │ 1. Draft recover / create (active_drafts)
                 │
                 ├──────────────────────────────────┐
                 │                                  │
-                │  Parallel Execution              │
-                │  (All use SAME draft_id)        │
+                │  2. Optional LLM extraction      │
+                │  (ComposerAgent only for missing  │
+                │   fields or explicit edits)       │
                 │                                  │
     ┌───────────┼──────────┬──────────┬───────────┼────────┐
     │           │          │          │           │        │
@@ -80,8 +77,8 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
      │            │ ()         │           │             │
      └────────────┴────────────┴───────────┴─────────────┘
                               │
-                              │ All outputs checked
-                              │ for SAME listing_id
+                              │ 3. Draft integrity guard
+                              │ (tek draft_id kuralı)
                               ▼
                     ┌──────────────────┐
                     │  Composer Agent  │
@@ -99,9 +96,9 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
             └──────────────┘   └──────────────┘
 ```
 
-## 🗄️ Data Flow
+## 🗄️ Data Flow (Güncel)
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │                     State Management                          │
 │                                                               │
@@ -110,18 +107,19 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
 │  │  (State)   │         │ (Persistent) │                    │
 │  └────────────┘         └──────────────┘                    │
 │                                                               │
-│  • Session State        • active_drafts                      │
-│  • Intent              • listings                            │
-│  • Active Draft ID     • listing_images                      │
-│  • Message History     • wallets                             │
-│  • Rate Limiting       • transactions                        │
-│                        • audit_logs                          │
+│  • Session State        • active_drafts                       │
+│  • locked_intent        • listings                            │
+│  • active_draft_id      • product_images / listing images     │
+│  • message history      • wallets / wallet_transactions       │
+│  • rate limit           • audit_logs                          │
 └──────────────────────────────────────────────────────────────┘
+
+Not: Supabase şeması repo içinde [pazarglobal-agent/supabase_table_schema.md](pazarglobal-agent/supabase_table_schema.md) dosyasında özetlenmiştir.
 ```
 
 ## 🛠️ Tool System Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │                    Base Tool Class                        │
 │                                                           │
@@ -145,7 +143,7 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
 
 ## 🤖 Agent Architecture
 
-```
+```text
 ┌────────────────────────────────────────────────────────────┐
 │                   Base Agent Class                          │
 │                                                             │
@@ -178,7 +176,7 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
 
 ## 🔐 Security & State Management
 
-```
+```text
 ┌────────────────────────────────────────────────────────────┐
 │                    Security Layers                          │
 └────────────────────────────────────────────────────────────┘
@@ -197,7 +195,7 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
          │
          ▼
 ┌────────────────────────────────────────────────────────────┐
-│  Redis (TTL: 24 hours)                                     │
+│  Redis (opsiyonel)                                          │
 │                                                             │
 │  session:{id} →                                            │
 │    {                                                        │
@@ -206,6 +204,10 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
 │      "active_draft_id": "...",                             │
 │      "phone_number": "..."                                 │
 │    }                                                        │
+Redis yoksa veya load-balancer nedeniyle istek farklı instance’a düşerse:
+
+- `active_draft_id` DB’den (Supabase `active_drafts`) deterministik olarak **recover** edilir.
+- “image-first” akışında `pending_media_urls` gibi geçici bilgiler in-memory olabilir; kritik state DB’ye yazılır.
 │                                                             │
 │  messages:{id} → List of messages (last 100)              │
 └────────────────────────────────────────────────────────────┘
@@ -215,7 +217,7 @@ User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
 
 ### REST API (WebChat)
 
-```
+```text
 Client                    Server
   │                         │
   │ POST /session/new       │
@@ -240,7 +242,7 @@ Client                    Server
 
 ### WebSocket (Real-time)
 
-```
+```text
 Client                    Server
   │                         │
   │ WS Connect              │
@@ -269,29 +271,65 @@ Client                    Server
 
 ### WhatsApp (Webhook)
 
+```text
+Twilio                 WhatsApp Bridge              Supabase Edge Fn               Agent API
+        │                        │                              │                         │
+        │ POST /twilio webhook    │                              │                         │
+        ├───────────────────────►│                              │                         │
+        │ Form: {From, Body, Media}                             │                         │
+        │                        │ POST /functions/.../whatsapp-traffic-controller         │
+        │                        ├─────────────────────────────►│                         │
+        │                        │ {source:"whatsapp", phone, message, history, media}   │
+        │                        │                              │  if no session → require_pin
+        │                        │                              │  if PIN → verify_pin RPC + open 10min session
+        │                        │                              │  if session → forward /agent/run
+        │                        │                              ├────────────────────────►│
+        │                        │                              │  {user_id, phone, message, history, media, session_token}
+        │                        │                              │                         │
+        │                        │                              │◄────────────────────────┤
+        │                        │◄─────────────────────────────┤
+        │◄───────────────────────┤
+        │  Twilio API: send msg   │
+        ├────────────────────────►
+        │  Delivers to WhatsApp
+        │
 ```
-Twilio                    Server
-  │                         │
-  │ POST /whatsapp/webhook  │
-  ├────────────────────────►│
-  │ Form: {From, Body}      │
-  │                         │
-  │         [Process]       │
-  │         Session →       │
-  │         Agent →         │
-  │         OpenAI →        │
-  │                         │
-  │ ◄────────────────────────┤
-  │   TwiML Response        │
-  │                         │
-  ├────────────────────────►│
-  │   Delivers to WhatsApp  │
-  │                         │
-```
+
+Not: Güncel WhatsApp entegrasyonunda backend’in ana entrypoint’i `/agent/run`’dır (Edge function buraya forward eder). FastAPI içindeki `/whatsapp/*` route’ları doğrudan-Twilio entegrasyonu için opsiyonel/legacy kalabilir.
+
+### WhatsApp Security Gate (Supabase Edge Traffic Controller)
+
+WhatsApp kanalında güvenlik için mesajlar Agent API’ye gitmeden önce **Supabase Edge Function** üzerinden geçer:
+
+- **Edge function:** `pazarglobal-frontend/supabase/functions/whatsapp-traffic-controller/index.ts`
+- **Amaç:** WhatsApp hesabı ele geçirilse bile, saldırganın agent aksiyonlarını tetiklemesini zorlaştırmak (PIN + kısa süreli oturum).
+
+Davranış (özet):
+
+- Kullanıcı için **aktif session** varsa (varsayılan $10$ dakika) istek **backend’e forward** edilir.
+- Session yoksa:
+        - Mesaj $4$-$6$ haneli sayıysa PIN kabul edilir → `verify_pin` RPC çağrılır.
+        - PIN doğruysa `user_sessions` içine yeni bir session açılır (10dk) ve kullanıcıya “giriş başarılı” mesajı döner.
+        - PIN değilse kullanıcıdan PIN istenir (`require_pin: true`).
+- Kullanıcı “iptal/vazgeç/çık/stop…” derse session kapatılır.
+- Edge ayrıca backend response’unda “operation completed” sezilirse session’ı kapatmayı dener (şu an `backendData.intent` içinde `complet` araması).
+
+Bu gate’in kullandığı Supabase objeleri:
+
+- `user_sessions` tablosu: zamanlı oturum takibi (`is_active`, `expires_at`, `last_activity`, `end_reason`)
+- `verify_pin` RPC: telefon + PIN doğrulama (PIN hash/lockout mantığı DB tarafında)
+
+İlgili env/config (yüksek seviye):
+
+- WhatsApp Bridge → Edge:
+        - `EDGE_FUNCTION_URL` (bridge’in çağırdığı Edge endpoint)
+        - `SUPABASE_SERVICE_KEY` (server-to-server auth için)
+- Edge → Agent API:
+        - `BACKEND_URL` (Edge’in forward edeceği base backend URL)
 
 ## 📊 OpenAI Integration Pattern
 
-```
+```text
 Agent receives user message
         │
         ▼
@@ -339,7 +377,7 @@ Agent receives user message
 
 ## 🔄 Deployment Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────┐
 │                    Railway Platform                       │
 │                                                           │
@@ -353,7 +391,7 @@ Agent receives user message
 │  └────────────────────────────────────────────────────┘  │
 │                                                           │
 │  ┌────────────────────────────────────────────────────┐  │
-│  │              Redis Service                          │  │
+│  │              Redis Service (opsiyonel)              │  │
 │  │                                                     │  │
 │  │  • Managed Redis Instance                          │  │
 │  │  • Automatic Backups                               │  │
@@ -362,43 +400,109 @@ Agent receives user message
 └──────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────┐
+│          Railway Platform (2. Service - Bridge)           │
+│                                                           │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │     WhatsApp Bridge (pazarglobal-whatsapp-bridge)  │  │
+│  │  • Twilio webhook alır                             │  │
+│  │  • Mesajı Supabase Edge gate’e iletir              │  │
+│  │  • Gate sonrası Agent API (/agent/run) çağrılır    │  │
+│  └────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
 │                  External Services                        │
 │                                                           │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │
 │  │  OpenAI  │  │ Supabase │  │  Twilio  │  │ Frontend│ │
-│  │   API    │  │    DB    │  │ WhatsApp │  │  Vercel │ │
+│  │   API    │  │ DB+Edge  │  │ WhatsApp │  │  Local  │ │
 │  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │
 └──────────────────────────────────────────────────────────┘
+
 ```
+
+Not: Frontend deploy stratejisi ayrı olabilir; bu doküman workspace’teki güncel durumu (frontend local) baz alır.
+
+## 🔁 Workflow’lar (Güncel davranış)
+
+### 1) Create Listing
+
+Ana hedef: `active_drafts` içinde tek bir `draft_id` üzerinde ilerlemek ve kullanıcıya **sadece bir sonraki eksik alanı** sormak.
+
+- Deterministik parçalar (WebChat):
+        - `locked_intent` ile sticky workflow
+        - `next_missing_slot()` ile slot prompt
+        - tek mesajdan alan çıkarımı (`extract_listing_fields_from_freeform`)
+        - kategori auto-infer (`infer_category_from_draft`)
+        - image-first buffer + vision özetini draft’a yazma
+- LLM parçaları (ComposerAgent):
+        - draft create/read
+        - Title/Description/Price/Image agentlarını **sadece gerekirse** çalıştırır
+        - “tek draft_id” guard
+
+### 2) Publish / Delete
+
+WebChat tarafında publish akışı **deterministiktir** (LLM döngüsü yok):
+
+- Önce draft publishable mı kontrol edilir (başlık/açıklama/fiyat/kategori + foto ya da allow_no_images)
+- Önizleme hazırlanır (preview)
+- Kullanıcı `evet/onayla` derse tool çağrılır:
+        - `get_wallet_balance_tool` (bilgi amaçlı)
+        - `publish_listing_tool` (draft → listings, kredi düşümü, log)
+
+Not: `PublishDeleteAgent` repo’da mevcut olsa da WebChat path’inde asıl kontrol/UX `handle_publish_or_delete_flow` içindedir.
+
+### 3) Search
+
+SearchComposerAgent paralel arama yapıp sonuçları birleştirir; “listing atomikliği” guard’ı ile farklı ilanların alanlarını karıştırmaz.
+
+## 🧰 Kritik Tool’lar (Özet)
+
+- Draft:
+        - `create_draft`, `read_draft`, `update_title`, `update_description`, `update_price`
+- Image:
+        - `process_image`
+- Publish:
+        - `publish_listing`
+- Wallet:
+        - `get_wallet_balance` (ve gerekiyorsa debit/deduct)
+- Search:
+        - `search_listings`, `get_market_price_data`
 
 ## 🎯 Design Principles
 
 ### 1. **Explicit over Implicit**
+
 - Clear agent responsibilities
 - Explicit tool definitions
 - No framework magic
 
 ### 2. **Deterministic Behavior**
+
 - Same input → Same output
 - Predictable workflows
 - Testable components
 
 ### 3. **ID-Centric State**
-- All operations centered on `listing_id`
+
+- All operations centered on `draft_id` (taslak) ve `listing_id` (yayın)
 - Prevents data conflicts
 - Easy to audit
 
 ### 4. **Parallel Execution with Guards**
+
 - Agents run in parallel for speed
 - Composer validates consistency
 - Abort on conflicts
 
 ### 5. **Tool-Driven Architecture**
+
 - Agents call tools (not direct DB)
 - Tools encapsulate business logic
 - Easy to mock/test
 
 ### 6. **Separation of Concerns**
+
 - Agents: AI logic
 - Tools: Business operations
 - Services: Infrastructure
@@ -407,16 +511,19 @@ Agent receives user message
 ## 📈 Scalability Considerations
 
 ### Horizontal Scaling
+
 - Stateless API layer
 - Redis for shared state
 - Load balancer ready
 
 ### Vertical Scaling
+
 - Async Python (asyncio)
 - Parallel agent execution
 - Connection pooling
 
 ### Performance Optimizations
+
 - Redis caching
 - OpenAI streaming (future)
 - Database connection pooling
@@ -424,7 +531,7 @@ Agent receives user message
 
 ## 🔍 Monitoring & Observability
 
-```
+```text
 ┌────────────────────────────────────────────────────────┐
 │                    Logging Stack                        │
 │                                                         │
