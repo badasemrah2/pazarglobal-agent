@@ -32,6 +32,9 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
             self.drafts: dict[str, dict[str, Any]] = {}
             self._id = 0
             self.reset_calls: list[str] = []
+            self.buffer_set_calls: list[str] = []
+            self.buffer_clear_calls: list[str] = []
+            self.add_image_calls: list[str] = []
 
         async def create_draft(self, user_id: str, phone_number: str) -> dict[str, Any]:
             self._id += 1
@@ -47,9 +50,34 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
         async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
             return self.drafts.get(draft_id)
 
+        async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
+            if not self.drafts:
+                return None
+            latest_id = sorted(self.drafts.keys())[-1]
+            return self.drafts[latest_id]
+
         async def add_listing_image(self, listing_id: str, image_url: str, metadata: dict[str, Any] | None = None) -> bool:
+            self.add_image_calls.append(image_url)
             d = self.drafts[listing_id]
             d.setdefault("images", []).append({"image_url": image_url, "metadata": metadata or {}})
+            return True
+
+        async def set_buffered_media(self, draft_id: str, media_urls: list[str], analyses: list[dict[str, Any]]) -> bool:
+            self.buffer_set_calls.append(draft_id)
+            d = self.drafts[draft_id]
+            ld = d.get("listing_data") or {}
+            ld["_buffered_media_urls"] = list(media_urls)
+            ld["_buffered_media_analysis"] = list(analyses)
+            d["listing_data"] = ld
+            return True
+
+        async def clear_buffered_media(self, draft_id: str) -> bool:
+            self.buffer_clear_calls.append(draft_id)
+            d = self.drafts[draft_id]
+            ld = d.get("listing_data") or {}
+            ld.pop("_buffered_media_urls", None)
+            ld.pop("_buffered_media_analysis", None)
+            d["listing_data"] = ld
             return True
 
         async def update_draft_category(self, draft_id: str, category: str, vision_product: dict[str, Any] | None = None) -> bool:
@@ -105,12 +133,17 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
     )
 
     assert r1["success"] is True
-    assert r1["data"]["type"] == "media_analysis"
+    assert r1["data"]["type"] == "media_action_required"
     assert r1["intent"] is None
+    assert "Bu görsel ile ne yapmak istiyorsunuz" in r1["message"]
 
-    # 2) User says 'ilan oluştur': should consume buffered media into a draft and ask next slot.
+    # Should have buffered media in draft listing_data, but NOT added images yet.
+    assert fake_supabase.buffer_set_calls, "Buffered media should be persisted for non-sticky sessions"
+    assert fake_supabase.add_image_calls == []
+
+    # 2) User chooses listing flow: should consume buffered media into draft.images and start create_listing.
     r2 = await webchat.process_webchat_message(
-        message_body="ilan oluştur",
+        message_body="ilan",
         session_id=session_id,
         user_id="u1",
         media_urls=None,
@@ -118,14 +151,126 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
 
     assert r2["success"] is True
     assert r2["intent"] == "create_listing"
-    assert r2["data"]["type"] in {"slot_prompt", "draft_update"}
+    assert r2["data"]["type"] == "create_listing_intro"
+    assert "Ürün adı" in r2["message"]
 
-    # New behavior: title+description are auto-seeded from vision; next slot becomes price.
-    assert r2["data"].get("slot") == "price"
-    assert "Fiyat" in r2["message"]
+    # Buffered media should have been cleared from draft.
+    assert fake_supabase.buffer_clear_calls, "Buffered media should be cleared after consumption"
 
-    # Regression: should NOT have reset the draft just because vision included a category.
+    # Regression: should NOT have reset the draft.
     assert fake_supabase.reset_calls == []
+
+
+@pytest.mark.asyncio
+async def test_locked_create_listing_image_add_updates_counter_without_restart(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": "X", "description": "Y", "price": 10, "location": "İstanbul", "category": "Elektronik"},
+                    "images": [{"image_url": "https://example.com/1.jpg", "metadata": {}}],
+                    "vision_product": {},
+                }
+            }
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
+            return self.drafts.get("d1")
+
+        async def add_listing_image(self, listing_id: str, image_url: str, metadata: dict[str, Any] | None = None) -> bool:
+            d = self.drafts[listing_id]
+            d.setdefault("images", []).append({"image_url": image_url, "metadata": metadata or {}})
+            return True
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    async def fake_analyze_media(media_urls: list[str]) -> list[dict[str, Any]]:
+        return [{"image_url": media_urls[0], "analysis": {"product": "X", "safety_flags": []}}]
+
+    monkeypatch.setattr(webchat, "analyze_media_with_vision", fake_analyze_media)
+
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_img_add"] = {
+        "user_id": "u_img_add",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    r = await webchat.process_webchat_message(
+        message_body="",
+        session_id="s_img_add",
+        user_id="u_img_add",
+        media_urls=["https://example.com/2.jpg"],
+    )
+
+    assert r["success"] is True
+    assert r["intent"] == "create_listing"
+    assert r["data"]["type"] == "image_added"
+    assert "2 / 5" in r["message"]
+
+
+@pytest.mark.asyncio
+async def test_pre_intent_price_slot_is_applied_without_intent_routing(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {
+                        "title": "iPhone 14",
+                        "description": "Temiz cihaz",
+                        "price": None,
+                        "category": None,
+                    },
+                    "images": [],
+                    "vision_product": {},
+                }
+            }
+
+        async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
+            return self.drafts.get("d1")
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def update_draft_price(self, draft_id: str, price: float) -> bool:
+            self.drafts[draft_id]["listing_data"]["price"] = price
+            return True
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    # Ensure there's no sticky session/intent; simulate non-sticky instances.
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+
+    # If we reach intent routing, fail the test. The deterministic slot recovery should return early.
+    class BoomIntentRouter:
+        async def classify_intent(self, *_args: Any, **_kwargs: Any) -> str:
+            raise AssertionError("IntentRouterAgent should not be called for pre-intent price slot recovery")
+
+    monkeypatch.setattr(webchat, "IntentRouterAgent", lambda: BoomIntentRouter())
+
+    r = await webchat.process_webchat_message(
+        message_body="1200000 tl",
+        session_id="s_price",
+        user_id="u_price",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    assert r["intent"] == "create_listing"
+    assert r["data"]["type"] == "draft_update"
+    assert "lokasyon" in r["message"].lower(), "Next missing slot after price should be location"
+    assert r["data"].get("price") == 1200000.0
 
 
 @pytest.mark.asyncio
@@ -294,7 +439,7 @@ async def test_auto_category_selection_uses_vision_when_user_does_not_know(monke
     )
 
     assert r["success"] is True
-    assert "Fotoğraf" in r["message"]
+    assert "Lokasyon" in r["message"]
 
 
 def test_vision_blocks_can_be_suppressed(monkeypatch: MonkeyPatch) -> None:
@@ -499,7 +644,7 @@ async def test_missing_user_id_uses_session_id_stable_identity(monkeypatch: Monk
         media_urls=["https://example.com/img1.jpg"],
     )
     assert r1["success"] is True
-    assert r1["data"]["type"] == "media_analysis"
+    assert r1["data"]["type"] == "media_action_required"
 
     # Then the user says 'ilan oluştur' again without user_id.
     r2 = await webchat.process_webchat_message(
@@ -513,7 +658,7 @@ async def test_missing_user_id_uses_session_id_stable_identity(monkeypatch: Monk
     assert r2["intent"] == "create_listing"
     # Should *not* loop back to requesting photos again.
     assert "fotoğraf" not in r2["message"].lower()
-    assert "Ürünün adı" in r2["message"]
+    assert "Ürün adı" in r2["message"]
     assert fake_supabase.reset_calls == []
 
 

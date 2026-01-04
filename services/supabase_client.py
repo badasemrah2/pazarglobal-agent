@@ -628,6 +628,95 @@ class SupabaseClient:
             logger.error(f"Error updating category: {e}")
             return False
 
+    async def update_draft_location(self, draft_id: str, location: str) -> bool:
+        """Update draft location inside listing_data."""
+        if self._rpc_update_listing_field_available is not False:
+            try:
+                result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "location",
+                    "field_value": location
+                }).execute()
+                if result.data:
+                    self._rpc_update_listing_field_available = True
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for location (falling back to direct update): {e}")
+
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["location"] = location
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
+        except Exception as e:
+            logger.error(f"Error updating location: {e}")
+            return False
+
+    async def set_buffered_media(self, draft_id: str, media_urls: List[str], analyses: List[Dict[str, Any]]) -> bool:
+        """Persist image-first buffered media to draft.listing_data.
+
+        This intentionally does NOT write to active_drafts.images. It is used to survive
+        non-sticky sessions when Redis is disabled.
+        """
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+
+            safe_urls: List[str] = []
+            for u in media_urls or []:
+                if isinstance(u, str) and u.strip():
+                    safe_urls.append(u.strip())
+            # keep max 5 buffered URLs
+            safe_urls = list(dict.fromkeys(safe_urls))[:5]
+
+            safe_analyses: List[Dict[str, Any]] = []
+            if isinstance(analyses, list):
+                for a in analyses[:5]:
+                    if isinstance(a, dict) and a.get("image_url"):
+                        safe_analyses.append(a)
+
+            listing_data["_buffered_media_urls"] = safe_urls
+            listing_data["_buffered_media_analysis"] = safe_analyses
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Error setting buffered media: {e}")
+            return False
+
+    async def clear_buffered_media(self, draft_id: str) -> bool:
+        """Remove buffered media keys from draft.listing_data."""
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data.pop("_buffered_media_urls", None)
+            listing_data.pop("_buffered_media_analysis", None)
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Error clearing buffered media: {e}")
+            return False
+
     async def update_draft_allow_no_images(self, draft_id: str, allow_no_images: bool) -> bool:
         """Persist user's preference to publish without images (listing_data.allow_no_images)."""
         if self._rpc_update_listing_field_available is not False:
@@ -882,6 +971,7 @@ class SupabaseClient:
                 "description": listing_data.get("description"),
                 "price": listing_data.get("price"),
                 "category": listing_data.get("category"),
+                "location": listing_data.get("location") if isinstance(listing_data, dict) else None,
                 "user_name": user_name,
                 "user_phone": user_phone,
                 "status": "active",
