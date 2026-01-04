@@ -169,6 +169,57 @@ def is_show_draft_command(message: str) -> bool:
     ])
 
 
+def is_help_or_next_step_query(message: str) -> bool:
+    """Return True when the user asks what to do next (meta/help), not slot content.
+
+    This prevents messages like "şimdi ne yapmalıyım" from being accidentally persisted
+    as title/description/location during deterministic slot filling.
+    """
+
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+
+    # Keep this intentionally conservative: match explicit "what next" phrases.
+    triggers = [
+        "şimdi ne yapmalıyım",
+        "simdi ne yapmaliyim",
+        "ne yapmalıyım",
+        "ne yapmaliyim",
+        "ne yapacağım",
+        "ne yapacagim",
+        "ne yapayım",
+        "ne yapayim",
+        "ne yapmam lazım",
+        "ne yapmam lazim",
+        "bundan sonra",
+        "sonra ne",
+        "sonraki adım",
+        "sonraki adim",
+        "nasıl devam",
+        "nasil devam",
+        "nasıl ilerleyelim",
+        "nasil ilerleyelim",
+        "ne yapacağız",
+        "ne yapacagiz",
+        "yardım",
+        "yardim",
+        "help",
+    ]
+    if any(t in msg for t in triggers):
+        return True
+
+    # Common short form: "ne yapayım?" / "ne yapcam" etc.
+    if bool(re.search(r"\b(ne\s+yap(ay[ıi]m|maliyim|acag[ıi]m|mam\s+lazim))\b", msg)):
+        return True
+
+    # If the user explicitly asks a question about next steps.
+    if ("ne yap" in msg or "next" in msg) and "?" in msg:
+        return True
+
+    return False
+
+
 def user_refuses_images(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
@@ -728,18 +779,234 @@ def classify_media_action_choice(message: str) -> Optional[str]:
     if user_asks_market_price(msg) or any(tok in msg for tok in ["fiyat", "kaç para", "kac para", "piyasa", "araştır"]):
         return "price_research"
     return None
+def format_create_listing_intro_message(draft: Optional[Dict[str, Any]] = None) -> str:
+    """Hybrid UX: let user answer in one message, but we can still ask missing parts."""
 
+    example_title = ""
+    example_desc = ""
+    try:
+        vision = _unwrap_vision_product((draft or {}).get("vision_product")) if isinstance(draft, dict) else {}
+        if isinstance(vision, dict) and vision:
+            example_title = generate_title_from_vision(vision)
+            example_desc = generate_description_from_vision(vision)
+    except Exception:
+        example_title = ""
+        example_desc = ""
 
-def format_create_listing_intro_message() -> str:
-    return (
-        "Anladım. İlan oluşturmak için aşağıdaki bilgileri paylaşır mısınız?\n\n"
+    example_block = ""
+    if example_title or example_desc:
+        ex_lines: List[str] = ["Örnek (istersen tek mesajda böyle yazabilirsin):"]
+        if example_title:
+            ex_lines.append(f"• Ürün adı: {example_title}")
+        if example_desc:
+            ex_lines.append(f"• Kısa açıklama: {example_desc}")
+        ex_lines.append("• Lokasyon: Bursa / İstanbul")
+        ex_lines.append("• Durum: sıfır / 2. el")
+        ex_lines.append("• Fiyat: 18.000 TL")
+        example_block = "\n".join(ex_lines)
+
+    base = (
+        "Anladım. İlanını hazırlamak için aşağıdaki bilgileri yazabilirsin.\n\n"
         "• Ürün adı\n"
         "• Kısa açıklama\n"
-        "• Fiyat\n"
-        "• Lokasyon\n\n"
-        "İstersen tek mesajda, istersen parça parça yazabilirsin.\n"
+        "• Lokasyon\n"
+        "• Durum (sıfır / 2. el)\n"
+        "• Fiyat\n\n"
+        "İstersen hepsini tek mesajda yaz; eksik olursa ben sorarım.\n"
         "Dilersen ilanına eklemek için daha sonra da resim gönderebilirsin."
     )
+
+    if example_block:
+        return base + "\n\n" + example_block
+    return base
+
+
+def parse_condition_input(message: str) -> Optional[str]:
+    msg = (message or "").strip().lower()
+    if not msg:
+        return None
+    if any(tok in msg for tok in ["2.el", "2 el", "ikinci el", "2.el", "second", "used"]):
+        return "2. El"
+    if any(tok in msg for tok in ["sıfır", "sifir", "yeni", "new"]):
+        return "Sıfır"
+    return None
+
+
+def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
+    """Best-effort extraction from a single freeform user message.
+
+    Goal: support power-user one-shot messages like:
+    "iphone 14 2.el bursa fiyat 18000 tl temiz"
+    Without relying on LLM.
+    """
+
+    text = (message or "").strip()
+    if not text:
+        return {}
+
+    lowered = text.lower()
+
+    price = parse_price_input(text)
+    location = parse_location_input(text)
+    condition = parse_condition_input(text)
+
+    # Remove obvious tokens for title extraction
+    title_candidate = text
+    # Strip price-like parts
+    title_candidate = re.sub(r"\b(fiyat|price)\b\s*[:=]?\s*\d+[\d\.\,\s]*\s*(tl|₺)?", " ", title_candidate, flags=re.IGNORECASE)
+    title_candidate = re.sub(r"\b\d{1,3}(?:[\.,]\d{3})+\b", " ", title_candidate)
+    title_candidate = re.sub(r"\b\d{3,6}\b\s*(tl|₺)\b", " ", title_candidate, flags=re.IGNORECASE)
+    title_candidate = re.sub(r"\b(tl|₺)\b", " ", title_candidate, flags=re.IGNORECASE)
+    # Strip condition tokens
+    title_candidate = re.sub(r"\b(2\s*\.?\s*el|ikinci\s*el|sıfır|sifir|yeni)\b", " ", title_candidate, flags=re.IGNORECASE)
+    # Strip common filler words
+    title_candidate = re.sub(r"\b(temiz|az\s*kullanılmış|az\s*kullanilmis|acil|satılık|satilik)\b", " ", title_candidate, flags=re.IGNORECASE)
+
+    if location:
+        # remove location occurrence (best effort)
+        title_candidate = re.sub(re.escape(location), " ", title_candidate, flags=re.IGNORECASE)
+
+    title_candidate = " ".join(title_candidate.split()).strip()
+
+    # Description: keep the original message as fallback short description
+    description = ""
+    # If user explicitly wrote a long-ish sentence, preserve it.
+    if len(text) >= 10:
+        # Avoid using the whole string if it is mostly title+numbers.
+        description = text
+
+    # If user asks to publish/cancel etc, do not treat as listing content.
+    if is_publish_command(lowered) or is_cancel_command(lowered) or is_show_draft_command(lowered):
+        return {}
+
+    fields: Dict[str, Any] = {}
+    if title_candidate and len(title_candidate) >= 3:
+        fields["title"] = title_candidate
+    if description and len(description.strip()) >= 6:
+        fields["description"] = description.strip()
+    if price is not None:
+        fields["price"] = float(price)
+    if location:
+        fields["location"] = location
+    if condition:
+        fields["condition"] = condition
+    return fields
+
+
+def draft_ready_for_preview(draft: Dict[str, Any]) -> bool:
+    listing = (draft or {}).get("listing_data") or {}
+    if not isinstance(listing, dict):
+        return False
+    title = str(listing.get("title") or "").strip()
+    location = str(listing.get("location") or "").strip()
+    price = listing.get("price")
+    return bool(title and location and price is not None)
+
+
+def format_ready_preview_message(draft: Dict[str, Any]) -> str:
+    preview = build_draft_preview_payload(draft)
+    price = preview.get("price")
+    if isinstance(price, (int, float)):
+        price_text = f"{int(price):,} ₺".replace(",", ".")
+    else:
+        price_text = str(price) if price else "—"
+
+    image_count = int(preview.get("image_count") or 0)
+    lines: List[str] = [
+        "✨ Harika! İlanını vitrinlik hale getirdim. Önizleme:",
+        f"• Başlık: {preview.get('title') or '—'}",
+        f"• Açıklama: {preview.get('description') or '—'}",
+        f"• Fiyat: {price_text}",
+        f"• Kategori: {preview.get('category') or '—'}",
+        f"• Lokasyon: {preview.get('location') or '—'}",
+        f"• Fotoğraflar: {image_count} / 5",
+        "",
+        "Yayınlamak için 'yayınla' yazabilirsin.",
+        "Düzenlemek için: 'başlık: ...', 'açıklama: ...', 'fiyat: ...', 'lokasyon: ...' yazabilirsin.",
+        "Daha fazla fotoğraf eklemek için yeni fotoğraf gönderebilirsin.",
+    ]
+    return "\n".join(lines)
+
+
+async def maybe_enrich_title_description(
+    draft_id: str,
+    draft: Dict[str, Any],
+    user_message: str,
+) -> Optional[Dict[str, str]]:
+    """Generate 'wow' title/description without inventing facts.
+
+    Disabled automatically for tests (OPENAI_API_KEY='test') and on any failure.
+    """
+
+    try:
+        if not draft_id:
+            return None
+        if str(getattr(settings, "openai_api_key", "") or "").strip().lower() in {"test", ""}:
+            return None
+
+        listing = (draft or {}).get("listing_data") or {}
+        if not isinstance(listing, dict):
+            listing = {}
+
+        title = str(listing.get("title") or "").strip()
+        description = str(listing.get("description") or "").strip()
+
+        # Only enrich when the content is missing/too short (avoid rewriting user's polished text).
+        needs_title = (not title) or (len(title) < 10) or (title.lower() in {"ürün", "urun"})
+        needs_desc = (not description) or (len(description) < 40)
+        if not (needs_title or needs_desc):
+            return None
+
+        vision = _unwrap_vision_product((draft or {}).get("vision_product"))
+        images = (draft or {}).get("images") or []
+        image_count = len(images) if isinstance(images, list) else 0
+
+        system = (
+            "Sen bir pazar yeri ilan editörüsün. Görevin: kullanıcının verdiği bilgileri daha akıcı ve vitrinde güçlü bir Türkçe ilan metnine dönüştürmek.\n"
+            "KATI KURAL: Kullanıcı söylemediyse ASLA yeni bilgi uydurma (kutu/fatura/garanti/orijinallik/çiziksiz/hediye/ücretsiz kargo vb).\n"
+            "Emin olmadığın hiçbir detayı kesin ifade etme.\n"
+            "Çıktı SADECE JSON olmalı: {\"title\": \"...\", \"description\": \"...\"}.\n"
+            "Title max 100 karakter. Description 200-500 karakter hedefle, madde işaretleri kullanabilirsin.\n"
+            "Dil: Türkçe. Emoji kullanma."
+        )
+
+        known = {
+            "user_message": user_message,
+            "existing_title": title,
+            "existing_description": description,
+            "price": listing.get("price"),
+            "location": listing.get("location"),
+            "category": listing.get("category"),
+            "condition": listing.get("condition"),
+            "vision": vision if isinstance(vision, dict) else {},
+            "image_count": image_count,
+        }
+        user = "Elimdeki bilgiler:\n" + json.dumps(known, ensure_ascii=False)
+        resp = await openai_client.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.6,
+            max_tokens=500,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # If model didn't output JSON, bail out safely.
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        out_title = str(parsed.get("title") or "").strip()
+        out_desc = str(parsed.get("description") or "").strip()
+        if not out_title and not out_desc:
+            return None
+        return {"title": out_title, "description": out_desc}
+    except Exception:
+        return None
 
 
 def _extract_buffered_media_from_draft(draft: Optional[Dict[str, Any]]) -> tuple[list[str], list[Dict[str, Any]]]:
@@ -1951,9 +2218,15 @@ async def process_webchat_message(
                     session["pending_media_analysis"] = []
                     session_dirty = True
 
+                intro_draft = None
+                try:
+                    intro_draft = await supabase_client.get_draft(draft_id) if draft_id else draft
+                except Exception:
+                    intro_draft = draft
+
                 return await finalize_response({
                     "success": True,
-                    "message": format_create_listing_intro_message(),
+                    "message": format_create_listing_intro_message(intro_draft),
                     "data": {"type": "create_listing_intro", "draft_id": draft_id},
                     "intent": "create_listing",
                 })
@@ -2421,6 +2694,109 @@ async def process_webchat_message(
                     pass
 
                 slot = next_missing_slot(existing_draft)
+
+                # Dynamic fallback: user asks what to do next while we're waiting for slot content.
+                # Do NOT persist this meta/help message into listing fields.
+                if is_help_or_next_step_query(message_body):
+                    data_type: str
+                    data_payload: Dict[str, Any]
+                    if slot:
+                        data_type = "slot_prompt"
+                        data_payload = {"type": data_type, "slot": slot, "draft_id": draft_id}
+                    else:
+                        data_type = "conversation"
+                        data_payload = {"type": data_type, "intent": intent, "draft_id": draft_id}
+
+                    return await finalize_response({
+                        "success": True,
+                        "message": build_next_step_message(existing_draft),
+                        "data": data_payload,
+                        "intent": intent,
+                    })
+
+                # If the draft is already ready (minimum set), allow inline edits and show a preview
+                # without forcing the publish flow.
+                if draft_ready_for_preview(existing_draft):
+                    edit_request = extract_preview_edit(message_body)
+                    if edit_request:
+                        edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"])
+                        if edit_result.get("success"):
+                            updated_draft = edit_result.get("draft") or await supabase_client.get_draft(draft_id) or existing_draft
+                            return await finalize_response({
+                                "success": True,
+                                "message": format_ready_preview_message(updated_draft),
+                                "data": {"type": "draft_ready", "draft_id": draft_id, "preview": build_draft_preview_payload(updated_draft)},
+                                "intent": intent,
+                            })
+                        return await finalize_response({
+                            "success": False,
+                            "message": edit_result.get("message") or "Değişiklik kaydedilemedi.",
+                            "data": {"type": "draft_ready", "draft_id": draft_id},
+                            "intent": intent,
+                        })
+
+                # Hybrid: try extracting multiple fields from one freeform message.
+                if not is_command_only_message(message_body) and not looks_like_greeting(message_body):
+                    extracted = extract_listing_fields_from_freeform(message_body)
+                    if extracted:
+                        listing_now = (existing_draft or {}).get("listing_data") or {}
+                        if not isinstance(listing_now, dict):
+                            listing_now = {}
+
+                        try:
+                            if extracted.get("price") is not None and listing_now.get("price") is None:
+                                await supabase_client.update_draft_price(draft_id, float(extracted["price"]))
+                        except Exception:
+                            pass
+                        try:
+                            if extracted.get("location") and not str(listing_now.get("location") or "").strip():
+                                await supabase_client.update_draft_location(draft_id, str(extracted["location"]))
+                        except Exception:
+                            pass
+                        try:
+                            if extracted.get("title") and not str(listing_now.get("title") or "").strip():
+                                await supabase_client.update_draft_title(draft_id, str(extracted["title"]))
+                        except Exception:
+                            pass
+                        try:
+                            current_desc = str(listing_now.get("description") or "").strip()
+                            if extracted.get("description") and (not current_desc or len(current_desc) < 20):
+                                await supabase_client.update_draft_description(draft_id, str(extracted["description"]))
+                        except Exception:
+                            pass
+                        try:
+                            if extracted.get("condition") and hasattr(supabase_client, "update_draft_condition"):
+                                if not str(listing_now.get("condition") or "").strip():
+                                    await supabase_client.update_draft_condition(draft_id, str(extracted["condition"]))
+                        except Exception:
+                            pass
+
+                        refreshed = await supabase_client.get_draft(draft_id)
+                        if refreshed:
+                            existing_draft = refreshed
+                            slot = next_missing_slot(existing_draft)
+
+                # If we have the minimum set, optionally enrich and show a "wow" preview.
+                if draft_ready_for_preview(existing_draft):
+                    enriched = await maybe_enrich_title_description(draft_id, existing_draft, message_body)
+                    if enriched:
+                        try:
+                            if enriched.get("title"):
+                                await supabase_client.update_draft_title(draft_id, enriched["title"])
+                            if enriched.get("description"):
+                                await supabase_client.update_draft_description(draft_id, enriched["description"])
+                            updated = await supabase_client.get_draft(draft_id)
+                            if updated:
+                                existing_draft = updated
+                        except Exception:
+                            pass
+
+                    return await finalize_response({
+                        "success": True,
+                        "message": format_ready_preview_message(existing_draft),
+                        "data": {"type": "draft_ready", "draft_id": draft_id, "preview": build_draft_preview_payload(existing_draft)},
+                        "intent": intent,
+                    })
 
                 # Allow category auto-selection command even if the next missing slot is not
                 # category (e.g. after adding `location` slot). This prevents the flow from

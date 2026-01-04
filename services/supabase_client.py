@@ -672,6 +672,44 @@ class SupabaseClient:
             logger.error(f"Error updating location: {e}")
             return False
 
+    async def update_draft_condition(self, draft_id: str, condition: str) -> bool:
+        """Update draft condition inside listing_data.
+
+        Best-effort: some deployments may not support this field in the RPC.
+        """
+        if self._rpc_update_listing_field_available is not False and "condition" not in self._rpc_update_listing_field_invalid_fields:
+            try:
+                result = self.client.rpc("update_listing_field", {
+                    "listing_id": draft_id,
+                    "field_name": "condition",
+                    "field_value": condition
+                }).execute()
+                if result.data:
+                    self._rpc_update_listing_field_available = True
+                    return True
+            except Exception as e:
+                self._maybe_disable_rpc_update_listing_field(e)
+                if self._rpc_update_listing_field_is_invalid_field(e, "condition"):
+                    self._rpc_update_listing_field_invalid_fields.add("condition")
+                elif self._rpc_update_listing_field_available is not False:
+                    logger.warning(f"RPC update_listing_field failed for condition (falling back to direct update): {e}")
+
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["condition"] = condition
+            updated = self.client.table("active_drafts").update({
+                "listing_data": listing_data,
+            }).eq("id", draft_id).execute()
+            return bool(updated.data)
+        except Exception as e:
+            logger.error(f"Error updating condition: {e}")
+            return False
+
     async def set_buffered_media(self, draft_id: str, media_urls: List[str], analyses: List[Dict[str, Any]]) -> bool:
         """Persist image-first buffered media to draft.listing_data.
 

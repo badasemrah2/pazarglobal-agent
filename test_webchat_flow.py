@@ -218,6 +218,64 @@ async def test_locked_create_listing_image_add_updates_counter_without_restart(m
 
 
 @pytest.mark.asyncio
+async def test_help_message_does_not_fill_title_slot(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": None, "description": None, "price": None, "location": None, "category": None},
+                    "images": [{"image_url": "https://example.com/1.jpg", "metadata": {}}],
+                    "vision_product": {"product": "X", "category": "Elektronik"},
+                }
+            }
+            self.update_title_calls: list[str] = []
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
+            return self.drafts.get("d1")
+
+        async def update_draft_title(self, draft_id: str, title: str) -> bool:
+            self.update_title_calls.append(title)
+            self.drafts[draft_id]["listing_data"]["title"] = title
+            return True
+
+        async def update_draft_category(self, draft_id: str, category: str, vision_product: dict[str, Any] | None = None) -> bool:
+            # Allow auto-category code path to run without errors.
+            self.drafts[draft_id]["listing_data"]["category"] = category
+            return True
+
+    fake_supabase = FakeSupabase()
+    monkeypatch.setattr(webchat, "supabase_client", fake_supabase)
+
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_help"] = {
+        "user_id": "u_help",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    r = await webchat.process_webchat_message(
+        message_body="şimdi ne yapmalıyım",
+        session_id="s_help",
+        user_id="u_help",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
+    assert r["intent"] == "create_listing"
+    assert fake_supabase.update_title_calls == []
+    assert "Ürünün adı" in r["message"]
+
+
+@pytest.mark.asyncio
 async def test_pre_intent_price_slot_is_applied_without_intent_routing(monkeypatch: MonkeyPatch) -> None:
     webchat = import_webchat(monkeypatch)
 
