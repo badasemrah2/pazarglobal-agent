@@ -36,6 +36,9 @@ class SupabaseClient:
         # Cache its availability to avoid spamming logs and wasting network calls.
         self._rpc_update_listing_field_available: Optional[bool] = None
         self._rpc_update_listing_field_missing_logged: bool = False
+        self._rpc_update_listing_field_invalid_fields: set[str] = set()
+        self._wallet_transactions_disabled: bool = False
+        self._wallet_transactions_disabled_logged: bool = False
 
     def _rpc_update_listing_field_is_missing(self, exc: Exception) -> bool:
         msg = str(exc) if exc is not None else ""
@@ -55,6 +58,12 @@ class SupabaseClient:
                     "(You can deploy supabase_rpc_update_listing_field.sql to enable atomic patching.)"
                 )
                 self._rpc_update_listing_field_missing_logged = True
+
+    def _rpc_update_listing_field_is_invalid_field(self, exc: Exception, field_name: str) -> bool:
+        msg = str(exc) if exc is not None else ""
+        msg_l = msg.lower()
+        field_l = (field_name or "").strip().lower()
+        return bool(field_l) and ("invalid field_name" in msg_l and field_l in msg_l)
     
     @property
     def client(self) -> Client:
@@ -630,7 +639,7 @@ class SupabaseClient:
 
     async def update_draft_location(self, draft_id: str, location: str) -> bool:
         """Update draft location inside listing_data."""
-        if self._rpc_update_listing_field_available is not False:
+        if self._rpc_update_listing_field_available is not False and "location" not in self._rpc_update_listing_field_invalid_fields:
             try:
                 result = self.client.rpc("update_listing_field", {
                     "listing_id": draft_id,
@@ -642,7 +651,9 @@ class SupabaseClient:
                     return True
             except Exception as e:
                 self._maybe_disable_rpc_update_listing_field(e)
-                if self._rpc_update_listing_field_available is not False:
+                if self._rpc_update_listing_field_is_invalid_field(e, "location"):
+                    self._rpc_update_listing_field_invalid_fields.add("location")
+                elif self._rpc_update_listing_field_available is not False:
                     logger.warning(f"RPC update_listing_field failed for location (falling back to direct update): {e}")
 
         try:
@@ -1000,9 +1011,19 @@ class SupabaseClient:
                     try:
                         if not url:
                             continue
+                        storage_path = ""
+                        try:
+                            marker = "/storage/v1/object/public/"
+                            if marker in url:
+                                storage_path = url.split(marker, 1)[1]
+                            else:
+                                storage_path = url
+                        except Exception:
+                            storage_path = url
                         self.client.table("product_images").insert({
                             "listing_id": listing_id,
-                            "public_url": url
+                            "public_url": url,
+                            "storage_path": storage_path or url,
                         }).execute()
                     except Exception as e:
                         logger.warning(f"Failed to copy image to product_images: {e}")
@@ -1203,20 +1224,24 @@ class SupabaseClient:
                 "usage",
                 "credit",  # fallback for environments that only allow 'credit'/'debit' variants
             ]
-            inserted = False
-            last_err: Exception | None = None
-            for kind in tx_kinds_to_try:
-                try:
-                    payload = dict(tx_payload_base)
-                    payload["kind"] = kind
-                    self.client.table("wallet_transactions").insert(payload).execute()
-                    inserted = True
-                    break
-                except Exception as e:
-                    last_err = e
-                    continue
-            if not inserted:
-                logger.warning(f"wallet_transactions insert failed (continuing): {last_err}")
+            if not self._wallet_transactions_disabled:
+                inserted = False
+                last_err: Exception | None = None
+                for kind in tx_kinds_to_try:
+                    try:
+                        payload = dict(tx_payload_base)
+                        payload["kind"] = kind
+                        self.client.table("wallet_transactions").insert(payload).execute()
+                        inserted = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        continue
+                if not inserted:
+                    self._wallet_transactions_disabled = True
+                    if not self._wallet_transactions_disabled_logged:
+                        logger.warning(f"wallet_transactions insert failed (disabling future inserts; continuing): {last_err}")
+                        self._wallet_transactions_disabled_logged = True
 
             await self.log_action(
                 action="deduct_credits",

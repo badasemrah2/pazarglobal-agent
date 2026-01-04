@@ -1723,6 +1723,25 @@ async def process_webchat_message(
         all_media_urls = pending_media_urls
         has_media_context = bool(all_media_urls)
 
+        # NON-STICKY RECOVERY (MEDIA):
+        # If Redis is disabled / sessions are not sticky, a user may be in the middle of a
+        # create_listing flow (draft already has user-provided fields), but the in-memory
+        # session loses locked_intent. In that case, treat incoming media as "add photos" to
+        # the latest in-progress draft instead of asking the image-first intent gate.
+        if incoming_media_urls and not session.get("locked_intent") and user_id:
+            try:
+                if not is_create_listing_command(message_body) and not is_search_command(message_body) and not user_asks_market_price(message_body):
+                    latest = await supabase_client.get_latest_draft_for_user(user_id)
+                    if latest and draft_has_non_media_content(latest):
+                        session["intent"] = "create_listing"
+                        session["locked_intent"] = "create_listing"
+                        session["active_draft_id"] = str(latest.get("id") or "")
+                        session_dirty = True
+                        if not redis_disabled:
+                            await redis_client.set_intent(session_id, "create_listing")
+            except Exception:
+                pass
+
         # IMAGE ADD (POST-INTENT):
         # When locked in create_listing, any incoming images are treated as "add images" only.
         # Do NOT re-route intent, do NOT change title/description/category; only safety check + append + counter.
@@ -1757,13 +1776,24 @@ async def process_webchat_message(
                 updated_draft = await supabase_client.get_draft(draft_id)
                 existing_images = (updated_draft or {}).get("images") or []
                 current_count = len(existing_images) if isinstance(existing_images, list) else 0
+                existing_urls: set[str] = set()
+                if isinstance(existing_images, list):
+                    for img in existing_images:
+                        if isinstance(img, dict):
+                            u = img.get("image_url")
+                            if isinstance(u, str) and u:
+                                existing_urls.add(u)
 
                 added = 0
                 blocked = 0
                 ignored = 0
+                duplicates = 0
 
                 for url in incoming_media_urls:
                     if not url:
+                        continue
+                    if url in existing_urls:
+                        duplicates += 1
                         continue
                     if current_count >= 5:
                         ignored += 1
@@ -1786,6 +1816,7 @@ async def process_webchat_message(
                     if ok:
                         added += 1
                         current_count += 1
+                        existing_urls.add(url)
 
                 # Clear session pending media so we don't re-process in later turns
                 session["pending_media_urls"] = []
@@ -1795,6 +1826,8 @@ async def process_webchat_message(
                 msg_parts = []
                 if added:
                     msg_parts.append(f"Resim eklendi. Şu an {current_count} / 5 resim eklediniz.")
+                elif duplicates and not (blocked or ignored):
+                    msg_parts.append("Bu görsel zaten ekli.")
                 if blocked:
                     msg_parts.append("Bazı görsellerde uyarı tespit ettim; onları eklemedim.")
                 if ignored:
