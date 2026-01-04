@@ -2404,6 +2404,22 @@ async def process_webchat_message(
                 })
 
             if existing_draft and draft_id:
+                # AUTO CATEGORY (NO PROMPT):
+                # Avoid asking the user "Kategori nedir?" which causes hesitation.
+                # If category is missing, infer it deterministically from vision/title/description and persist it.
+                try:
+                    listing_auto = (existing_draft or {}).get("listing_data") or {}
+                    if isinstance(listing_auto, dict) and not str(listing_auto.get("category") or "").strip():
+                        inferred = infer_category_from_draft(existing_draft)
+                        category_to_set = inferred or "Diğer"
+                        ok = await supabase_client.update_draft_category(draft_id, category_to_set)
+                        if ok:
+                            refreshed = await supabase_client.get_draft(draft_id)
+                            if refreshed:
+                                existing_draft = refreshed
+                except Exception:
+                    pass
+
                 slot = next_missing_slot(existing_draft)
 
                 # Allow category auto-selection command even if the next missing slot is not
