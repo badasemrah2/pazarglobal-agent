@@ -79,11 +79,13 @@ def _seconds_since(ts: Optional[str], now_iso: Optional[str] = None) -> Optional
 
 
 def _set_fsm_state(session: Dict[str, Any], state: str, intent: Optional[str] = None, reason: Optional[str] = None) -> None:
+    prev_state = session.get("fsm_state")
     session["fsm_state"] = state
     session["fsm_state_reason"] = reason
     session["fsm_state_updated_at"] = _utc_now_iso()
     if intent:
         session["fsm_state_intent"] = intent
+    logger.info(f"FSM state transition: {prev_state} → {state} (reason={reason}, intent={intent})")
 
 
 async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any], detail: Dict[str, Any] | None = None) -> None:
@@ -99,7 +101,10 @@ async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any]
         }
         meta.update(detail)
 
+        logger.info(f"FSM telemetry: event={event}, session={session_id[:8]}..., detail={detail}")
+
         if not hasattr(supabase_client, "log_action"):
+            logger.debug(f"Supabase client lacks log_action, skipping telemetry persist for {event}")
             return
         await supabase_client.log_action(
             action="fsm_event",
@@ -108,9 +113,10 @@ async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any]
             resource_id=session_id,
             user_id=session.get("user_id"),
         )
-    except Exception:
+        logger.debug(f"FSM telemetry persisted to audit_logs: {event}")
+    except Exception as e:
         # Telemetry must never break the flow
-        logger.debug(f"FSM telemetry emit failed for {event}")
+        logger.warning(f"FSM telemetry emit failed for {event}: {e}")
 
 
 def is_resume_command(message: str) -> bool:
@@ -2240,6 +2246,8 @@ async def process_webchat_message(
         session["last_user_at"] = now_iso
         session_dirty = True
 
+        logger.debug(f"Session {session_id[:8]}... inactivity: {inactivity_seconds:.1f}s, locked={session.get('locked_intent')}, fsm_state={session.get('fsm_state')}")
+
         # Auto-park flows after prolonged silence to avoid stale prompts.
         locked_for_timeout = session.get("locked_intent")
         if (
@@ -2268,6 +2276,7 @@ async def process_webchat_message(
 
         # If already parked/timeout, require explicit resume keyword to continue.
         if session.get("fsm_state") in {"parked", "timeout"}:
+            logger.info(f"Session {session_id[:8]}... in {session.get('fsm_state')} state, awaiting resume/cancel")
             if is_resume_command(message_body):
                 restored_intent = session.get("parked_intent") or session.get("fsm_state_intent") or session.get("intent") or session.get("locked_intent") or "create_listing"
                 session["locked_intent"] = restored_intent
@@ -3701,6 +3710,7 @@ async def process_webchat_message(
                         timeout=FSM_COMPOSER_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
+                    logger.warning(f"ComposerAgent timeout after {FSM_COMPOSER_TIMEOUT_SECONDS}s for session {session_id[:8]}...")
                     session["parked_intent"] = intent
                     session["locked_intent"] = None
                     session["intent"] = None
