@@ -1255,6 +1255,23 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error getting wallet balance: {e}")
             return None
+
+    async def get_wallet_transactions(self, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Fetch latest wallet transactions for a user (best-effort)."""
+        try:
+            result = (
+                self.client.table("wallet_transactions")
+                .select("amount_bigint, reference, kind, created_at, metadata")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(max(1, min(limit, 50)))
+                .execute()
+            )
+            return result.data or []
+        except Exception as e:
+            # Some deployments may not have wallet_transactions table; fail-soft.
+            logger.warning(f"Wallet transactions unavailable: {e}")
+            return []
     
     async def deduct_credits(self, user_id: str, amount: int, description: str) -> bool:
         """Deduct credits from user wallet and record transaction"""

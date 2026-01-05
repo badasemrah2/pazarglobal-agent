@@ -15,6 +15,7 @@ from .listing_tools import (
 )
 from .wallet_tools import (
     get_wallet_balance_tool,
+    get_wallet_transactions_tool,
     deduct_credits_tool
 )
 from .image_tools import (
@@ -33,6 +34,7 @@ __all__ = [
     "search_listings_tool",
     "market_price_tool",
     "get_wallet_balance_tool",
+    "get_wallet_transactions_tool",
     "deduct_credits_tool",
     "process_image_tool"
 ]

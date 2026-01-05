@@ -81,6 +81,35 @@ class DeductCreditsTool(BaseTool):
         })
 
 
+class GetWalletTransactionsTool(BaseTool):
+    """Tool to fetch user's wallet transaction history"""
+
+    def get_name(self) -> str:
+        return "get_wallet_transactions"
+
+    def get_description(self) -> str:
+        return "Get the recent wallet transactions for a user"
+
+    def get_parameters(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "description": "User ID"},
+                "limit": {"type": "integer", "description": "Max transactions", "minimum": 1, "maximum": 50},
+            },
+            "required": ["user_id"],
+        }
+
+    async def execute(self, user_id: str, limit: int = 20) -> Dict[str, Any]:
+        try:
+            txs = await supabase_client.get_wallet_transactions(user_id=user_id, limit=limit)
+            return self.format_success({"transactions": txs})
+        except Exception as exc:
+            logger.error(f"Get wallet transactions failed: {exc}")
+            return self.format_error("İşlem geçmişi şu anda alınamadı.")
+
+
 # Tool instances
 get_wallet_balance_tool = GetWalletBalanceTool()
 deduct_credits_tool = DeductCreditsTool()
+get_wallet_transactions_tool = GetWalletTransactionsTool()

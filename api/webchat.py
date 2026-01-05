@@ -1986,6 +1986,69 @@ class ChatResponse(BaseModel):
     intent: Optional[str] = None
 
 
+class WalletBalanceResponse(BaseModel):
+    """Wallet balance API response"""
+    success: bool
+    balance: Optional[int] = None
+    currency: str = "credits"
+    message: Optional[str] = None
+
+
+class WalletTransactionsResponse(BaseModel):
+    """Wallet history API response"""
+    success: bool
+    transactions: List[Dict[str, Any]]
+    message: Optional[str] = None
+
+
+@router.get("/wallet/balance", response_model=WalletBalanceResponse)
+async def get_wallet_balance(session_id: Optional[str] = None, user_id: Optional[str] = None):
+    """Wallet balance endpoint (Sprint 2)."""
+    session: Dict[str, Any] | None = None
+    if not user_id and session_id:
+        session = await load_session_state(session_id)
+        if isinstance(session, dict):
+            user_id = session.get("user_id")
+
+    normalized_user = normalize_user_id(user_id or session_id)
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id or session_id is required")
+
+    try:
+        balance = await supabase_client.get_wallet_balance(normalized_user)
+    except Exception as exc:
+        logger.error(f"Wallet balance fetch failed: {exc}")
+        raise HTTPException(status_code=500, detail="Bakiye şu anda alınamıyor")
+
+    if balance is None:
+        return WalletBalanceResponse(success=False, balance=None, message="Bakiye bulunamadı")
+
+    return WalletBalanceResponse(success=True, balance=int(balance))
+
+
+@router.get("/wallet/history", response_model=WalletTransactionsResponse)
+async def get_wallet_history(limit: int = 20, session_id: Optional[str] = None, user_id: Optional[str] = None):
+    """Wallet transaction history endpoint (Sprint 2)."""
+    session: Dict[str, Any] | None = None
+    if not user_id and session_id:
+        session = await load_session_state(session_id)
+        if isinstance(session, dict):
+            user_id = session.get("user_id")
+
+    normalized_user = normalize_user_id(user_id or session_id)
+    if not normalized_user:
+        raise HTTPException(status_code=400, detail="user_id or session_id is required")
+
+    capped_limit = max(1, min(limit, 50))
+    try:
+        txs = await supabase_client.get_wallet_transactions(normalized_user, limit=capped_limit)
+    except Exception as exc:
+        logger.error(f"Wallet history fetch failed: {exc}")
+        raise HTTPException(status_code=500, detail="İşlem geçmişi şu anda alınamıyor")
+
+    return WalletTransactionsResponse(success=True, transactions=txs or [])
+
+
 class ConnectionManager:
     """WebSocket connection manager"""
     

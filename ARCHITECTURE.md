@@ -186,6 +186,16 @@ Not: Supabase şeması repo içinde [pazarglobal-agent/supabase_table_schema.md]
 └──────────────┘ └──────────┘ └──────────────┘ └───────────┘
 ```
 
+### 💰 Wallet Read APIs (Sprint 2)
+
+- `GET /webchat/wallet/balance` → Kullanıcı bakiyesi (credits)
+- `GET /webchat/wallet/history` → Son işlemler (limit 50, varsayılan 20)
+
+**Tasarım Notları:**
+- `session_id` → `user_id` fallback (kimlik boşsa 400)
+- Supabase `wallets` + `wallet_transactions` tabloları kullanılır
+- Tablo eksikse fail-soft (boş liste döner, servis kesilmez)
+
 ## 🤖 Agent Architecture
 
 ```text
