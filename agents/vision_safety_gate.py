@@ -23,6 +23,8 @@ class VisionSafetyGate:
     """
     
     def __init__(self):
+        self.client: Optional[AsyncOpenAI]
+
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             logger.warning("OPENAI_API_KEY not set, vision safety checks will fail-open")
@@ -116,7 +118,10 @@ class VisionSafetyGate:
         """
         try:
             # Use OpenAI's vision model for content moderation
-            response = await self.client.moderations.create(
+            client = self.client
+            if client is None:
+                raise RuntimeError("OpenAI client missing during image moderation")
+            response = await client.moderations.create(
                 input=image_url,
                 model="omni-moderation-latest"
             )
@@ -195,7 +200,10 @@ class VisionSafetyGate:
             return {"safe": True, "flagged_categories": [], "skipped": True}
         
         try:
-            response = await self.client.moderations.create(
+            client = self.client
+            if client is None:
+                raise RuntimeError("OpenAI client missing during text moderation")
+            response = await client.moderations.create(
                 input=text,
                 model="omni-moderation-latest"
             )
