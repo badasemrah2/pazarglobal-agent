@@ -377,6 +377,31 @@ def is_cancel_command(message: str) -> bool:
     ])
 
 
+def is_wallet_balance_command(message: str) -> bool:
+    """Return True when the user asks about wallet balance/remaining credits."""
+
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+
+    mentions_balance = any(tok in msg for tok in [
+        "kredim",
+        "kredi",
+        "bakiye",
+        "bakiyem",
+        "cuzdan",
+        "cüzdan",
+        "wallet",
+        "balance",
+    ])
+    if not mentions_balance:
+        return False
+
+    # Avoid accidental matches on troubleshooting statements like "kredi düşmüyor".
+    asks_amount = any(tok in msg for tok in ["ne kadar", "kac", "kaç", "goster", "göster", "ogren", "öğren", "soyle", "söyle"])
+    return bool(asks_amount or "kalan" in msg)
+
+
 def sanitize_classified_intent(message: str, classified_intent: str | None) -> str | None:
     # Post-process router output to avoid accidental lock-in and wrong flows.
     #
@@ -617,13 +642,14 @@ async def handle_publish_or_delete_flow(
                 session.pop("pending_publish", None)
                 session["active_draft_id"] = None
                 session["intent"] = None
+                session.pop("locked_intent", None)
                 session_dirty = True
                 listing_id = (result.get("data") or {}).get("listing_id")
                 return {
                     "success": True,
                     "message": f"İlan yayınlandı. İlan ID: {listing_id}" if listing_id else "İlan yayınlandı.",
                     "data": {"type": "publish_delete", "listing_id": listing_id},
-                    "intent": "publish_or_delete",
+                    "intent": "small_talk",
                     "_session_dirty": session_dirty
                 }
             return {
@@ -1259,7 +1285,15 @@ def format_preview_message(
     highlight: Optional[str] = None,
     include_vision: bool = True
 ) -> str:
-    lines: List[str] = ["📝 Yayın öncesi kontrol:"]
+    def _needs_vehicle_detail_prompt(desc: str, category: str) -> bool:
+        cat_l = (category or "").lower()
+        if not any(token in cat_l for token in ["oto", "otomotiv", "araç", "arac", "araba", "otomobil", "vasıta", "vasita", "moto", "motor"]):
+            return False
+        desc_l = (desc or "").lower()
+        keywords = ["km", "kilometre", "tramer", "hasar", "kaza", "boya", "değişen", "degisen"]
+        return not any(k in desc_l for k in keywords)
+
+    lines: List[str] = ["📝 **Yayın Öncesi Kontrol**"]
 
     title = preview.get("title") or "—"
     description = preview.get("description") or "—"
@@ -1272,14 +1306,15 @@ def format_preview_message(
     condition = preview.get("condition") or "—"
     location = preview.get("location") or "—"
     image_count = preview.get("image_count") or 0
+    full_desc = preview.get("full_description") or description
 
-    lines.append(f"• Başlık: {title}")
-    lines.append(f"• Açıklama: {description}")
-    lines.append(f"• Fiyat: {price_text}")
-    lines.append(f"• Durum: {condition}")
-    lines.append(f"• Kategori: {category}")
-    lines.append(f"• Lokasyon: {location}")
-    lines.append(f"• Fotoğraflar: {image_count} adet")
+    lines.append(f"**Başlık:** {title}")
+    lines.append(f"**Açıklama:** {description}")
+    lines.append(f"**Fiyat:** {price_text}")
+    lines.append(f"**Durum:** {condition}")
+    lines.append(f"**Kategori:** {category}")
+    lines.append(f"**Lokasyon:** {location}")
+    lines.append(f"**Fotoğraflar:** {image_count} adet")
 
     vision = preview.get("vision")
     if include_vision and isinstance(vision, dict):
@@ -1296,20 +1331,31 @@ def format_preview_message(
             vision_lines.append(f"Not: {vision_desc}")
         if vision_lines:
             lines.append("")
-            lines.append("🔎 Görsel analizi:")
+            lines.append("🔎 **Görsel analizi**")
             lines.extend(f"• {entry}" for entry in vision_lines)
 
     if highlight:
         lines.append("")
         lines.append(highlight)
 
+    # Optional reminder for automotive listings when key details are missing.
+    if _needs_vehicle_detail_prompt(full_desc, category):
+        lines.append("")
+        lines.append("🚗 **Otomotiv için hatırlatma (isteğe bağlı):**")
+        lines.append("• Km, boya/değişen ve tramer/hasar durumunu eklersen alıcılar için net olur. İstersen açıklamaya ekleyebilirim.")
+
     balance_text = ""
     if balance is not None:
         balance_text = f"Mevcut bakiyeniz: {int(balance)} kredi. "
     lines.append("")
-    lines.append(
-        f"{balance_text}Yayın ücreti {cost} kredi. Onay için 'onayla', düzenleme için 'başlık: ...', 'açıklama: ...', 'fiyat: ...', 'durum: ...', 'kategori: ...', 'lokasyon: ...', iptal için 'iptal' yazabilirsiniz."
-    )
+    lines.append(f"{balance_text}Yayın ücreti {cost} kredi.")
+    lines.append("")
+    lines.append("🛠️ **Komutlar**")
+    lines.append("👉 **Onayla:** onayla")
+    lines.append("👉 **Düzenle:** başlık: ..., açıklama: ..., fiyat: ..., durum: ..., kategori: ..., lokasyon: ...")
+    lines.append("👉 **İptal:** iptal")
+    lines.append("")
+    lines.append("İlanınızda değişiklik yapmak veya yayınlamak için yukarıdaki komutları kullanın.")
 
     return "\n".join(lines)
 
@@ -2542,6 +2588,30 @@ async def process_webchat_message(
                 "message": "Aktif bir taslak bulunamadı. Önce 'ilan oluştur' ile taslak başlatın.",
                 "data": {"type": "draft_status"},
                 "intent": session.get("intent") or "small_talk",
+            })
+
+        # WALLET BALANCE OVERRIDE:
+        # Allow checking remaining credits at any time without getting stuck in a flow.
+        if is_wallet_balance_command(message_body):
+            try:
+                balance_result = await get_wallet_balance_tool.execute(user_id=user_id)
+                if balance_result.get("success"):
+                    balance = (balance_result.get("data") or {}).get("balance")
+                    if balance is not None:
+                        msg = f"Kalan krediniz: {int(balance)} kredi."
+                    else:
+                        msg = "Kalan kredinizi şu an göremiyorum. Lütfen daha sonra tekrar deneyin."
+                else:
+                    msg = "Kalan kredinizi şu an göremiyorum. Lütfen daha sonra tekrar deneyin."
+            except Exception:
+                msg = "Kalan kredinizi şu an göremiyorum. Lütfen daha sonra tekrar deneyin."
+
+            current_intent = session.get("intent") or session.get("locked_intent") or "small_talk"
+            return await finalize_response({
+                "success": True,
+                "message": msg,
+                "data": {"type": "wallet_balance"},
+                "intent": current_intent,
             })
 
         # GLOBAL CANCEL OVERRIDE:

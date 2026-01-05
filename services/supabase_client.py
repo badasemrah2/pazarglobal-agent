@@ -1140,7 +1140,9 @@ class SupabaseClient:
     ) -> List[Dict[str, Any]]:
         """Search listings with filters"""
         try:
-            query = self.client.table("listings").select("*").eq("status", "active")
+            # Some deployments have legacy rows with NULL or 'published' status.
+            # Treat them as visible to avoid silently missing listings.
+            query = self.client.table("listings").select("*").or_("status.eq.active,status.eq.published,status.is.null")
             
             if category:
                 query = query.eq("category", category)

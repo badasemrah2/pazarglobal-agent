@@ -47,6 +47,8 @@ Create Listing akışı pratikte **hibrit** çalışır:
 
 Bu sayede Railway’de sticky session olmadığı senaryolarda bile akış “kendi kendine toparlayabilir”.
 
+> **Manifesto:** ComposerAgent karar vermez, tutarlılığı denetler.
+
 ```text
 User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
                     ↓
@@ -206,11 +208,24 @@ Not: Supabase şeması repo içinde [pazarglobal-agent/supabase_table_schema.md]
 │    }                                                        │
 Redis yoksa veya load-balancer nedeniyle istek farklı instance’a düşerse:
 
+- Redis **varsa** → latency düşer, UX daha akıcı olur (sticky intent + history + kısa süreli state daha hızlı).
+- Redis **yoksa** → sistem bozulmaz; sadece **DB recover** (Supabase `active_drafts`) daha sık devreye girer.
+
 - `active_draft_id` DB’den (Supabase `active_drafts`) deterministik olarak **recover** edilir.
 - “image-first” akışında `pending_media_urls` gibi geçici bilgiler in-memory olabilir; kritik state DB’ye yazılır.
 │                                                             │
 │  messages:{id} → List of messages (last 100)              │
 └────────────────────────────────────────────────────────────┘
+
+## 🧯 Failure Modes (Mini)
+
+| Durum | Sistem Ne Yapar |
+|---|---|
+| LLM timeout / LLM hatası | Deterministik slot soruları ile devam eder; kritik akışlar (publish/delete) deterministiktir |
+| Tool error (DB/RPC/HTTP) | İşlem durdurulur, kullanıcıya hata döner; audit log ile izlenebilirlik korunur |
+| Draft conflict (birden fazla `draft_id` / tutarsız ID) | Akış ABORT edilir; kullanıcıdan yeniden başlatması istenir; audit log’a conflict yazılır |
+| Redis yok / sticky session yok | Draft state Supabase `active_drafts` üzerinden recover edilir; geçici media buffer DB’ye yazılabilir |
+| Edge Function (WhatsApp gate) down | WhatsApp istekleri reject edilir veya güvenli fail-close yapılır; backend’e kontrolsüz forward edilmez |
 ```
 
 ## 🌐 Communication Protocols
