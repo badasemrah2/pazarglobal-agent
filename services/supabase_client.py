@@ -468,6 +468,32 @@ class SupabaseClient:
             logger.warning(f"Failed to persist pending publish state: {e}")
             return False
 
+    async def set_draft_listing_data_flag(self, draft_id: str, flag: str, value: Any = True) -> bool:
+        """Persist an internal flag under listing_data.
+
+        Used to make preview-stage behaviors deterministic across stateless instances.
+        """
+        if not draft_id or not flag:
+            return False
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data[str(flag)] = value
+            updated = (
+                self.client.table("active_drafts")
+                .update({"listing_data": listing_data})
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Failed to persist draft listing_data flag '{flag}': {e}")
+            return False
+
     async def clear_pending_publish_state(self, draft_id: str) -> bool:
         """Remove pending publish metadata from listing_data (if present)."""
         if not draft_id:
@@ -1377,6 +1403,8 @@ class SupabaseClient:
         category: str,
         description: Optional[str] = None,
         condition: Optional[str] = None,
+        vision: Optional[Dict[str, Any]] = None,
+        user_claim: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get a price suggestion using the cached Perplexity pipeline.
 
@@ -1390,7 +1418,9 @@ class SupabaseClient:
             "category": category or "Diğer",
             "title": title or "",
             "description": description or "",
-            "condition": condition or "İyi Durumda",
+            "condition": condition or "2. El",
+            "vision": vision or None,
+            "user_claim": user_claim or "",
         }
         return await self._call_edge_function("ai-assistant-cached", payload)
 

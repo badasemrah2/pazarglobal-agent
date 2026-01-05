@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional
 from loguru import logger
 import asyncio
 import re
+from services.text_normalization import normalize_for_match
 
 
 class ComposerAgent(BaseAgent):
@@ -108,7 +109,7 @@ class ComposerAgent(BaseAgent):
                 Composer should not overwrite fields unless the user clearly asks to.
                 """
 
-                m = (msg or "").strip().lower()
+                m = normalize_for_match(msg)
                 if not m:
                     return False
 
@@ -135,13 +136,19 @@ class ComposerAgent(BaseAgent):
                 else:
                     keys = []
 
-                if any(k in m for k in keys) and any(v in m for v in edit_verbs):
+                keys_norm = [normalize_for_match(k) for k in keys]
+                verbs_norm = [normalize_for_match(v) for v in edit_verbs]
+
+                if any(k and k in m for k in keys_norm) and any(v and v in m for v in verbs_norm):
                     return True
 
                 # Strong patterns: "fiyat 15000", "başlık: ...", "açıklama: ..."
                 if field == "price" and ("fiyat" in m and re.search(r"\b\d{2,}\b", m)):
                     return True
-                if field in {"title", "description"} and re.search(r"\b(baslik|başlık|aciklama|açıklama|title|description)\b\s*[:\-]", m):
+                if field in {"title", "description"} and re.search(
+                    r"\b(baslik|aciklama|title|description)\b\s*[:\-]",
+                    m,
+                ):
                     return True
 
                 return False
@@ -158,7 +165,7 @@ class ComposerAgent(BaseAgent):
             # This ensures comprehensive listing data extraction from any user message
             # If the user message is just a flow command (e.g., "ilan oluştur") and we already have media,
             # avoid generating random titles/descriptions from empty text. Let ImageAgent / vision fill them.
-            normalized_msg = (user_message or "").strip().lower()
+            normalized_msg = normalize_for_match(user_message)
             is_command_only = normalized_msg in {
                 "ilan oluştur",
                 "ilan olustur",
@@ -186,7 +193,7 @@ class ComposerAgent(BaseAgent):
                     tasks.append(self.description_agent.run(user_message, context))
 
             # Price: only fill missing, or explicitly update when the user asks.
-            msg = (user_message or "").lower()
+            msg = normalize_for_match(user_message)
             has_price_number = bool(re.search(r"\b\d{2,}\b", msg))
             has_currency_hint = any(tok in msg for tok in ["₺", "tl", "try", "lira", "fiyat"])
             want_price = (not price_filled) or _wants_explicit_edit(user_message, "price")
@@ -199,7 +206,7 @@ class ComposerAgent(BaseAgent):
                     tasks.append(self.image_agent.run(media_url_item, context))
             else:
                 # Also check if message mentions images without explicit URLs
-                message_lower = user_message.lower()
+                message_lower = normalize_for_match(user_message)
                 if any(word in message_lower for word in ["image", "photo", "resim", "fotoğraf", "görsel", "resim yükle"]):
                     tasks.append(self.image_agent.run(user_message, context))
             

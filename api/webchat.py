@@ -15,13 +15,16 @@ from pydantic import BaseModel
 
 from agents import (
     ComposerAgent,
+    DescriptionAgent,
     IntentRouterAgent,
     PublishDeleteAgent,
     SearchComposerAgent,
     SmallTalkAgent,
+    TitleAgent,
 )
 from config import settings
 from services import openai_client, redis_client, supabase_client
+from services.text_normalization import canonicalize_condition, normalize_for_match
 from tools import get_wallet_balance_tool, publish_listing_tool
 
 
@@ -36,12 +39,16 @@ MEDIA_ANALYSIS_SYSTEM_PROMPT = (
     "Always respond with a single JSON object containing these keys: product (string), "
     "category (string), condition (string), features (array of up to 5 short strings), "
     "description (string), safety_flags (array of short warning strings, empty array when no issues). "
+    "IMPORTANT: The 'condition' field is a VISUAL IMPRESSION from the photo (e.g. 'temiz', 'yıpranmış', 'çok iyi görünüyor'). "
+    "Do NOT infer or state marketplace condition like 'Sıfır'/'2. El'. If unsure, use empty string. "
     "If you are unsure, set the field to an empty string or empty array."
 )
 
 MEDIA_ANALYSIS_USER_PROMPT = (
     "Lütfen görseldeki ürünü analiz et ve yukarıdaki JSON şemasını doldur. "
-    "Ürünün türünü, olası kullanım alanını, durumunu ve dikkat çeken özelliklerini belirt."
+    "Ürünün türünü, olası kullanım alanını, durumunu ve dikkat çeken özelliklerini belirt. "
+    "Durum alanını 'görsel izlenim' olarak yaz (örn: 'temiz', 'yıpranmış', 'çok iyi görünüyor'). "
+    "'Sıfır/2. El' gibi kesin çıkarım yapma."
 )
 
 
@@ -86,29 +93,35 @@ def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
 
 
 def is_publish_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
-    return any(token in msg for token in [
-        "yayınla",
-        "yayınla!",
-        "yayinla",
-        "yayina",
-        "yayınlamak",
-        "yayinlamak",
-        "publish",
-    ])
+    return any(
+        (t := normalize_for_match(token)) and t in msg
+        for token in [
+            "yayınla",
+            "yayınla!",
+            "yayinla",
+            "yayina",
+            "yayınlamak",
+            "yayinlamak",
+            "publish",
+        ]
+    )
 
 
 def is_delete_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
-    return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
+    return any(
+        (t := normalize_for_match(token)) and t in msg
+        for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"]
+    )
 
 
 def is_create_listing_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
 
@@ -118,55 +131,55 @@ def is_create_listing_command(message: str) -> bool:
 
     # Explicit create/sell commands
     if msg in {
-        "ilan oluştur",
         "ilan olustur",
         "ilan ver",
         "ilan vermek istiyorum",
         "ilan koymak istiyorum",
         "ilan girmek istiyorum",
         "sat",
-        "satıyorum",
         "satiyorum",
         "satmak istiyorum",
     }:
         return True
 
-    return any(phrase in msg for phrase in [
-        "ilan oluştur",
-        "ilan olustur",
-        "ilan ver",
-        "ilan vermek istiyorum",
-        "ilan koymak istiyorum",
-        "ilan girmek istiyorum",
-        "satmak istiyorum",
-        "satıyorum",
-        "satiyorum",
-        "satacağım",
-        "satacagim",
-        "satışa koy",
-        "satisa koy",
-    ])
+    return any(
+        phrase in msg
+        for phrase in [
+            "ilan olustur",
+            "ilan ver",
+            "ilan vermek istiyorum",
+            "ilan koymak istiyorum",
+            "ilan girmek istiyorum",
+            "satmak istiyorum",
+            "satiyorum",
+            "satacagim",
+            "satisa koy",
+        ]
+    )
 
 
 def is_show_draft_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
     if "taslak" not in msg and "taslağ" not in msg and "taslag" not in msg:
         return False
-    return any(token in msg for token in [
-        "göster",
-        "goster",
-        "durum",
-        "status",
-        "güncel",
-        "guncel",
-        "güncelle",
-        "guncelle",
-        "bak",
-        "görüntüle",
-        "goruntule",
-    ])
+    return any(
+        (t := normalize_for_match(token)) and t in msg
+        for token in [
+            "göster",
+            "goster",
+            "durum",
+            "status",
+            "güncel",
+            "guncel",
+            "güncelle",
+            "guncelle",
+            "bak",
+            "görüntüle",
+            "goruntule",
+        ]
+    )
 
 
 def is_help_or_next_step_query(message: str) -> bool:
@@ -176,7 +189,7 @@ def is_help_or_next_step_query(message: str) -> bool:
     as title/description/location during deterministic slot filling.
     """
 
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
 
@@ -221,10 +234,10 @@ def is_help_or_next_step_query(message: str) -> bool:
 
 
 def user_refuses_images(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
-    if any(token in msg for token in [
+    if any((t := normalize_for_match(token)) and t in msg for token in [
         "resimsiz",
         "fotoğrafsız",
         "fotografsiz",
@@ -245,8 +258,8 @@ def user_refuses_images(message: str) -> bool:
         return True
 
     # Fallback: handle unicode/typo variations by intent-based matching.
-    mentions_image = any(tok in msg for tok in ["resim", "foto", "fotoğraf", "fotograf", "görsel", "gorsel"])
-    refuses = any(tok in msg for tok in [
+    mentions_image = any((t := normalize_for_match(tok)) and t in msg for tok in ["resim", "foto", "fotoğraf", "fotograf", "görsel", "gorsel"])
+    refuses = any((t := normalize_for_match(tok)) and t in msg for tok in [
         "istemiyorum",
         "yüklemek istemiyorum",
         "yuklemek istemiyorum",
@@ -258,7 +271,7 @@ def user_refuses_images(message: str) -> bool:
 
 
 def is_search_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
 
@@ -297,7 +310,7 @@ def is_search_command(message: str) -> bool:
 
 
 def is_browse_all_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
     return msg in {
@@ -318,11 +331,11 @@ def is_browse_all_command(message: str) -> bool:
 
 
 def is_confirm_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
     # Common confirmations + typos
-    return any(token in msg for token in [
+    return any((t := normalize_for_match(token)) and t in msg for token in [
         "onayla",
         "onaylıyorum",
         "onayliyorum",
@@ -338,12 +351,12 @@ def is_confirm_command(message: str) -> bool:
 
 
 def is_cancel_command(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
     # Treat "istemiyorum"-style refusals as a cancel as well to prevent users getting
     # stuck in a flow (especially create_listing) when they don't know the keyword.
-    return any(token in msg for token in [
+    return any((t := normalize_for_match(token)) and t in msg for token in [
         "iptal",
         "vazgeç",
         "vazgec",
@@ -393,6 +406,8 @@ def draft_is_publishable(draft: Dict[str, Any]) -> bool:
         return False
     if listing.get("price") is None:
         return False
+    if not (listing.get("condition") and str(listing.get("condition")).strip()):
+        return False
     if not (listing.get("category") and str(listing.get("category")).strip()):
         return False
     allow_no_images = bool(isinstance(listing, dict) and listing.get("allow_no_images"))
@@ -411,6 +426,8 @@ def draft_has_any_content(draft: Dict[str, Any]) -> bool:
         val = listing.get(key)
         if isinstance(val, str) and val.strip():
             return True
+    if isinstance(listing.get("condition"), str) and str(listing.get("condition") or "").strip():
+        return True
     if listing.get("price") is not None:
         return True
     return False
@@ -427,6 +444,8 @@ def draft_has_non_media_content(draft: Dict[str, Any]) -> bool:
         val = listing.get(key)
         if isinstance(val, str) and val.strip():
             return True
+    if isinstance(listing.get("condition"), str) and str(listing.get("condition") or "").strip():
+        return True
     if listing.get("price") is not None:
         return True
     return False
@@ -438,11 +457,11 @@ def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> b
     This avoids mixing data when the platform enforces one active draft per user.
     Keep conservative: only reset on explicit create/sell phrases, not on 'devam'.
     """
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
     # Explicit switch to a different/new listing should reset the single draft.
-    if any(phrase in msg for phrase in ["başka ilan", "baska ilan", "yeni ilan", "farklı ilan", "farkli ilan"]):
+    if any(phrase in msg for phrase in ["baska ilan", "yeni ilan", "farkli ilan"]):
         return draft_has_any_content(draft)
     if not is_create_listing_command(msg):
         return False
@@ -726,7 +745,7 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
             parts.append(f"ürün: {product}")
         condition = analysis.get("condition")
         if condition:
-            parts.append(f"durum: {condition}")
+            parts.append(f"görsel izlenim: {condition}")
         features = analysis.get("features")
         if isinstance(features, list) and features:
             parts.append("özellikler: " + ", ".join(features[:3]))
@@ -810,7 +829,7 @@ def format_create_listing_intro_message(draft: Optional[Dict[str, Any]] = None) 
         "• Ürün adı\n"
         "• Kısa açıklama\n"
         "• Lokasyon\n"
-        "• Durum (sıfır / 2. el)\n"
+        "• Durum (Sıfır / 2. El / Az Kullanılmış - opsiyonel)\n"
         "• Fiyat\n\n"
         "İstersen hepsini tek mesajda yaz; eksik olursa ben sorarım.\n"
         "Dilersen ilanına eklemek için daha sonra da resim gönderebilirsin."
@@ -822,14 +841,9 @@ def format_create_listing_intro_message(draft: Optional[Dict[str, Any]] = None) 
 
 
 def parse_condition_input(message: str) -> Optional[str]:
-    msg = (message or "").strip().lower()
-    if not msg:
-        return None
-    if any(tok in msg for tok in ["2.el", "2 el", "ikinci el", "2.el", "second", "used"]):
-        return "2. El"
-    if any(tok in msg for tok in ["sıfır", "sifir", "yeni", "new"]):
-        return "Sıfır"
-    return None
+    # Use canonical labels users are familiar with in marketplace UIs.
+    # Map common informal phrases ("iyi durumda", "temiz", "orta"...) into these.
+    return canonicalize_condition(message)
 
 
 def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
@@ -858,9 +872,14 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     title_candidate = re.sub(r"\b\d{3,6}\b\s*(tl|₺)\b", " ", title_candidate, flags=re.IGNORECASE)
     title_candidate = re.sub(r"\b(tl|₺)\b", " ", title_candidate, flags=re.IGNORECASE)
     # Strip condition tokens
-    title_candidate = re.sub(r"\b(2\s*\.?\s*el|ikinci\s*el|sıfır|sifir|yeni)\b", " ", title_candidate, flags=re.IGNORECASE)
+    title_candidate = re.sub(
+        r"\b(2\s*\.?\s*el|ikinci\s*el|sıfır|sifir|yeni|az\s*kullanılmış|az\s*kullanilmis|yeni\s*gibi|like\s*new)\b",
+        " ",
+        title_candidate,
+        flags=re.IGNORECASE,
+    )
     # Strip common filler words
-    title_candidate = re.sub(r"\b(temiz|az\s*kullanılmış|az\s*kullanilmis|acil|satılık|satilik)\b", " ", title_candidate, flags=re.IGNORECASE)
+    title_candidate = re.sub(r"\b(acil|satılık|satilik)\b", " ", title_candidate, flags=re.IGNORECASE)
 
     if location:
         # remove location occurrence (best effort)
@@ -900,7 +919,8 @@ def draft_ready_for_preview(draft: Dict[str, Any]) -> bool:
     title = str(listing.get("title") or "").strip()
     location = str(listing.get("location") or "").strip()
     price = listing.get("price")
-    return bool(title and location and price is not None)
+    condition = str(listing.get("condition") or "").strip()
+    return bool(title and location and price is not None and condition)
 
 
 def format_ready_preview_message(draft: Dict[str, Any]) -> str:
@@ -917,6 +937,7 @@ def format_ready_preview_message(draft: Dict[str, Any]) -> str:
         f"• Başlık: {preview.get('title') or '—'}",
         f"• Açıklama: {preview.get('description') or '—'}",
         f"• Fiyat: {price_text}",
+        f"• Durum: {preview.get('condition') or '—'}",
         f"• Kategori: {preview.get('category') or '—'}",
         f"• Lokasyon: {preview.get('location') or '—'}",
         f"• Fotoğraflar: {image_count} / 5",
@@ -933,8 +954,9 @@ async def maybe_enrich_title_description(
     draft: Dict[str, Any],
     user_message: str,
 ) -> Optional[Dict[str, str]]:
-    """Generate 'wow' title/description without inventing facts.
+    """Improve title/description using TitleAgent + DescriptionAgent.
 
+    Uses user beyanı + optional vision 'görsel izlenim'.
     Disabled automatically for tests (OPENAI_API_KEY='test') and on any failure.
     """
 
@@ -951,57 +973,56 @@ async def maybe_enrich_title_description(
         title = str(listing.get("title") or "").strip()
         description = str(listing.get("description") or "").strip()
 
-        # Only enrich when the content is missing/too short (avoid rewriting user's polished text).
-        needs_title = (not title) or (len(title) < 10) or (title.lower() in {"ürün", "urun"})
-        needs_desc = (not description) or (len(description) < 40)
-        if not (needs_title or needs_desc):
+        # If either field is missing, we can't improve safely.
+        if not title or not description:
             return None
 
         vision = _unwrap_vision_product((draft or {}).get("vision_product"))
         images = (draft or {}).get("images") or []
         image_count = len(images) if isinstance(images, list) else 0
 
-        system = (
-            "Sen bir pazar yeri ilan editörüsün. Görevin: kullanıcının verdiği bilgileri daha akıcı ve vitrinde güçlü bir Türkçe ilan metnine dönüştürmek.\n"
-            "KATI KURAL: Kullanıcı söylemediyse ASLA yeni bilgi uydurma (kutu/fatura/garanti/orijinallik/çiziksiz/hediye/ücretsiz kargo vb).\n"
-            "Emin olmadığın hiçbir detayı kesin ifade etme.\n"
-            "Çıktı SADECE JSON olmalı: {\"title\": \"...\", \"description\": \"...\"}.\n"
-            "Title max 100 karakter. Description 200-500 karakter hedefle, madde işaretleri kullanabilirsin.\n"
-            "Dil: Türkçe. Emoji kullanma."
-        )
-
         known = {
             "user_message": user_message,
-            "existing_title": title,
-            "existing_description": description,
+            "user_beyani_title": title,
+            "user_beyani_description": description,
             "price": listing.get("price"),
             "location": listing.get("location"),
             "category": listing.get("category"),
-            "condition": listing.get("condition"),
+            "user_condition": listing.get("condition"),
             "vision": vision if isinstance(vision, dict) else {},
             "image_count": image_count,
         }
-        user = "Elimdeki bilgiler:\n" + json.dumps(known, ensure_ascii=False)
-        resp = await openai_client.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.6,
-            max_tokens=500,
+
+        # TitleAgent: minimal improvement
+        title_agent = TitleAgent()
+        title_msg = (
+            "Aşağıdaki bilgilerle TASLAK başlığını minimal şekilde iyileştir.\n"
+            "Kullanıcı beyanını koru; sadece netleştir ve vitrinde güçlü hale getir.\n\n"
+            + json.dumps(known, ensure_ascii=False)
         )
-        raw = (resp.choices[0].message.content or "").strip()
-        if not raw:
-            return None
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            # If model didn't output JSON, bail out safely.
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        out_title = str(parsed.get("title") or "").strip()
-        out_desc = str(parsed.get("description") or "").strip()
+        title_result = await title_agent.run(title_msg, context={"draft_id": draft_id})
+
+        out_title = ""
+        for call in (title_result or {}).get("tool_calls") or []:
+            if call.get("tool") == "update_title":
+                data = (call.get("result") or {}).get("data") or {}
+                out_title = str(data.get("title") or "").strip()
+
+        # DescriptionAgent: always improve
+        desc_agent = DescriptionAgent()
+        desc_msg = (
+            "Aşağıdaki bilgilerle TASLAK açıklamasını mutlaka iyileştir.\n"
+            "Kullanıcı beyanına sadık kal; varsa görsel izlenimi temkinli şekilde ekle.\n\n"
+            + json.dumps(known, ensure_ascii=False)
+        )
+        desc_result = await desc_agent.run(desc_msg, context={"draft_id": draft_id})
+
+        out_desc = ""
+        for call in (desc_result or {}).get("tool_calls") or []:
+            if call.get("tool") == "update_description":
+                data = (call.get("result") or {}).get("data") or {}
+                out_desc = str(data.get("description") or "").strip()
+
         if not out_title and not out_desc:
             return None
         return {"title": out_title, "description": out_desc}
@@ -1068,8 +1089,8 @@ def generate_title_from_vision(vision: Any) -> str:
     parts: List[str] = [base]
     if feature_txt:
         parts.append(feature_txt)
-    elif condition:
-        parts.append(condition)
+
+    # Never put visual impression into the title; title should be product + key features.
 
     title = " - ".join([p for p in parts if p])
     title = " ".join(title.split())
@@ -1094,7 +1115,7 @@ def generate_description_from_vision(vision: Any) -> str:
     if product:
         sentences.append(f"{product} satışa hazır.")
     if condition:
-        sentences.append(f"Durum: {condition}.")
+        sentences.append(f"Görsel izlenim: {condition}.")
     if feature_txt:
         sentences.append(f"Öne çıkan özellikler: {feature_txt}.")
     sentences.append("Detay için mesaj atabilirsiniz.")
@@ -1136,6 +1157,12 @@ def build_draft_status_message(draft: Dict[str, Any], include_vision: bool = Tru
     else:
         missing.append("fiyat")
 
+    condition = listing.get("condition")
+    if condition:
+        add_line("Durum", str(condition))
+    else:
+        missing.append("durum (Sıfır / 2. El)")
+
     category = listing.get("category")
     if category:
         add_line("Kategori", category)
@@ -1160,7 +1187,7 @@ def build_draft_status_message(draft: Dict[str, Any], include_vision: bool = Tru
         if vision_category:
             vision_lines.append(f"Ürün türü: {vision_category}")
         if vision_condition:
-            vision_lines.append(f"Durum: {vision_condition}")
+            vision_lines.append(f"Görsel izlenim: {vision_condition}")
         if isinstance(features, list) and features:
             top_features = ", ".join([str(f) for f in features[:3] if f])
             if top_features:
@@ -1216,6 +1243,7 @@ def build_draft_preview_payload(draft: Dict[str, Any]) -> Dict[str, Any]:
         "description": description_preview,
         "full_description": description,
         "price": listing.get("price"),
+        "condition": str(listing.get("condition") or "").strip(),
         "category": str(listing.get("category") or "").strip(),
         "location": str(listing.get("location") or "").strip(),
         "images": images,
@@ -1241,12 +1269,14 @@ def format_preview_message(
     else:
         price_text = str(price) if price else "—"
     category = preview.get("category") or "—"
+    condition = preview.get("condition") or "—"
     location = preview.get("location") or "—"
     image_count = preview.get("image_count") or 0
 
     lines.append(f"• Başlık: {title}")
     lines.append(f"• Açıklama: {description}")
     lines.append(f"• Fiyat: {price_text}")
+    lines.append(f"• Durum: {condition}")
     lines.append(f"• Kategori: {category}")
     lines.append(f"• Lokasyon: {location}")
     lines.append(f"• Fotoğraflar: {image_count} adet")
@@ -1255,7 +1285,7 @@ def format_preview_message(
     if include_vision and isinstance(vision, dict):
         vision_lines: List[str] = []
         if vision.get("condition"):
-            vision_lines.append(f"Durum: {vision['condition']}")
+            vision_lines.append(f"Görsel izlenim: {vision['condition']}")
         features = vision.get("features")
         if isinstance(features, list) and features:
             feature_txt = ", ".join([str(f) for f in features[:3] if f])
@@ -1278,7 +1308,7 @@ def format_preview_message(
         balance_text = f"Mevcut bakiyeniz: {int(balance)} kredi. "
     lines.append("")
     lines.append(
-        f"{balance_text}Yayın ücreti {cost} kredi. Onay için 'onayla', düzenleme için 'başlık: ...', 'açıklama: ...', 'fiyat: ...', 'kategori: ...', 'lokasyon: ...', iptal için 'iptal' yazabilirsiniz."
+        f"{balance_text}Yayın ücreti {cost} kredi. Onay için 'onayla', düzenleme için 'başlık: ...', 'açıklama: ...', 'fiyat: ...', 'durum: ...', 'kategori: ...', 'lokasyon: ...', iptal için 'iptal' yazabilirsiniz."
     )
 
     return "\n".join(lines)
@@ -1290,6 +1320,12 @@ _PREVIEW_EDIT_KEYWORDS = {
     "price": ["fiyat", "price"],
     "category": ["kategori", "category"],
     "location": ["lokasyon", "konum", "location"],
+    "condition": ["durum", "kondisyon", "condition"],
+}
+
+_PREVIEW_EDIT_KEYWORDS_NORM = {
+    field: {normalize_for_match(k) for k in keywords}
+    for field, keywords in _PREVIEW_EDIT_KEYWORDS.items()
 }
 
 
@@ -1299,14 +1335,20 @@ def extract_preview_edit(message: str) -> Optional[Dict[str, str]]:
     text = message.strip()
     if not text:
         return None
-    for field, keywords in _PREVIEW_EDIT_KEYWORDS.items():
-        for keyword in keywords:
-            pattern = rf"{keyword}\s*(?:[:=])\s*(.+)"
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                value = match.group(1).strip()
-                if value:
-                    return {"field": field, "value": value}
+
+    # Parse deterministic edits like: "AÇIKLAMA: ..." / "Başlık = ...".
+    # We avoid relying on re.IGNORECASE for Turkish I/İ/ı edge-cases by normalizing.
+    for match in re.finditer(r"([^\n:=]{2,40})\s*[:=]\s*([^\n]+)", text):
+        raw_key = (match.group(1) or "").strip()
+        raw_value = (match.group(2) or "").strip()
+        if not raw_key or not raw_value:
+            continue
+
+        key_norm = normalize_for_match(raw_key)
+        for field, keywords_norm in _PREVIEW_EDIT_KEYWORDS_NORM.items():
+            if key_norm in keywords_norm:
+                return {"field": field, "value": raw_value}
+
     return None
 
 
@@ -1345,6 +1387,12 @@ async def apply_preview_edit(draft_id: str, field: str, value: str) -> Dict[str,
             return {"success": False, "message": "Lokasyon en az 2 karakter olmalı."}
         success = await supabase_client.update_draft_location(draft_id, clean_value)
         feedback = "Lokasyon güncellendi."
+    elif field == "condition":
+        parsed = parse_condition_input(clean_value)
+        if not parsed:
+            return {"success": False, "message": "Durum için 'Sıfır', '2. El' veya 'Az Kullanılmış' yazın."}
+        success = await supabase_client.update_draft_condition(draft_id, parsed)
+        feedback = f"Durum güncellendi: {parsed}"
     else:
         return {"success": False, "message": "Bu alanı düzenleyemiyorum."}
 
@@ -1392,6 +1440,38 @@ _COMMAND_ONLY_TOKENS = {
     "devam",
     "devam et",
 }
+
+
+def is_improve_command(message: str) -> bool:
+    """User requests deterministic title/description improvement in preview.
+
+    We keep this narrow to avoid accidentally treating normal sentences as a command.
+    """
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+
+    # Normalize Turkish chars (ş/ı/ğ/ç/ö/ü) and punctuation.
+    transl = str.maketrans({
+        "ş": "s",
+        "ı": "i",
+        "ğ": "g",
+        "ç": "c",
+        "ö": "o",
+        "ü": "u",
+    })
+    msg_n = msg.translate(transl)
+    msg_n = re.sub(r"[^a-z0-9\s]", " ", msg_n)
+    msg_n = re.sub(r"\s+", " ", msg_n).strip()
+
+    # Accept: "iyileştir", "iyilestir", "iyilestir lutfen".
+    if msg_n == "iyilestir":
+        return True
+    if msg_n.startswith("iyilestir "):
+        # Only allow small polite suffixes to stay deterministic.
+        rest = msg_n[len("iyilestir "):].strip()
+        return rest in {"lutfen", "lutfenn", "pls", "please"}
+    return False
 
 
 _FLOW_CONTROL_PATTERNS: list[re.Pattern[str]] = [
@@ -1481,6 +1561,8 @@ def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
         return "description"
     if listing.get("price") is None:
         return "price"
+    if not (str(listing.get("condition") or "").strip()):
+        return "condition"
     if not (str(listing.get("location") or "").strip()):
         return "location"
     if not (listing.get("category") or "").strip():
@@ -1505,6 +1587,8 @@ def build_next_step_message(draft: Dict[str, Any]) -> str:
         return "Kısa bir açıklama yazar mısınız? (durum, çizik/hasar, kutu/fatura, takas vb.)"
     if slot == "price":
         return "Fiyat nedir? İsterseniz 'kaç para eder' yazın, piyasa verisine göre tahmin söyleyeyim."
+    if slot == "condition":
+        return "Durum nedir? (Sıfır / 2. El / Az Kullanılmış)"
     if slot == "location":
         return "Lokasyon nedir? (Örn: 'İstanbul' veya 'Ankara Çankaya')"
     if slot == "category":
@@ -2778,18 +2862,47 @@ async def process_webchat_message(
 
                 # If we have the minimum set, optionally enrich and show a "wow" preview.
                 if draft_ready_for_preview(existing_draft):
-                    enriched = await maybe_enrich_title_description(draft_id, existing_draft, message_body)
-                    if enriched:
+                    force_enrich = is_improve_command(message_body)
+
+                    listing_ready = (existing_draft or {}).get("listing_data") or {}
+                    if not isinstance(listing_ready, dict):
+                        listing_ready = {}
+
+                    enrich_attempted = bool(listing_ready.get("_copy_enriched_attempted"))
+                    enrich_done = bool(listing_ready.get("_copy_enriched"))
+
+                    # Deterministic behavior:
+                    # - Auto enrich only once (when draft first becomes preview-ready)
+                    # - After that, only re-run when the user explicitly says "iyileştir"
+                    should_enrich = force_enrich or (not enrich_attempted and not enrich_done)
+
+                    if should_enrich and not force_enrich:
+                        # Mark attempted before running to avoid repeated auto attempts.
                         try:
-                            if enriched.get("title"):
-                                await supabase_client.update_draft_title(draft_id, enriched["title"])
-                            if enriched.get("description"):
-                                await supabase_client.update_draft_description(draft_id, enriched["description"])
-                            updated = await supabase_client.get_draft(draft_id)
-                            if updated:
-                                existing_draft = updated
+                            if hasattr(supabase_client, "set_draft_listing_data_flag"):
+                                await supabase_client.set_draft_listing_data_flag(draft_id, "_copy_enriched_attempted", True)
+                                refreshed = await supabase_client.get_draft(draft_id)
+                                if refreshed:
+                                    existing_draft = refreshed
+                                    listing_ready = (existing_draft or {}).get("listing_data") or listing_ready
                         except Exception:
                             pass
+
+                    if should_enrich:
+                        enriched = await maybe_enrich_title_description(draft_id, existing_draft, message_body)
+                        if enriched:
+                            try:
+                                if enriched.get("title"):
+                                    await supabase_client.update_draft_title(draft_id, enriched["title"])
+                                if enriched.get("description"):
+                                    await supabase_client.update_draft_description(draft_id, enriched["description"])
+                                if hasattr(supabase_client, "set_draft_listing_data_flag"):
+                                    await supabase_client.set_draft_listing_data_flag(draft_id, "_copy_enriched", True)
+                                updated = await supabase_client.get_draft(draft_id)
+                                if updated:
+                                    existing_draft = updated
+                            except Exception:
+                                pass
 
                     return await finalize_response({
                         "success": True,
@@ -2996,6 +3109,32 @@ async def process_webchat_message(
                                 "intent": intent,
                             })
 
+                # Condition
+                if slot == "condition":
+                    parsed = parse_condition_input(message_body)
+                    if parsed and hasattr(supabase_client, "update_draft_condition"):
+                        ok = await supabase_client.update_draft_condition(draft_id, parsed)
+                        updated = await supabase_client.get_draft(draft_id)
+                        if ok or updated:
+                            response_data.update({
+                                "draft_id": draft_id,
+                                "draft": updated,
+                                "type": "draft_update",
+                            })
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(updated or existing_draft),
+                                "data": response_data,
+                                "intent": intent,
+                            })
+
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Durumu anlayamadım. Lütfen 'Sıfır', '2. El' veya 'Az Kullanılmış' yazın.",
+                        "data": {"type": "slot_prompt", "slot": "condition", "draft_id": draft_id},
+                        "intent": intent,
+                    })
+
                 # Location
                 if slot == "location":
                     loc = parse_location_input(message_body)
@@ -3069,20 +3208,35 @@ async def process_webchat_message(
                 title = (listing.get("title") or "").strip()
                 description = (listing.get("description") or "").strip()
                 category = (listing.get("category") or "").strip()
-                condition = ""
-                if isinstance(vision, dict):
-                    condition = str(vision.get("condition") or "").strip()
+                user_condition = str(listing.get("condition") or "").strip()
+                condition_for_price = canonicalize_condition(user_condition) or "2. El"
 
                 # If we don't have a title yet, fall back to vision product/category
                 if not title and isinstance(vision, dict):
                     title = str(vision.get("product") or vision.get("category") or "").strip()
 
+                # If we don't have a useful category yet, best-effort map vision category to library.
+                # This improves cache hit rate (product_key includes category) and Perplexity query relevance.
+                category_for_price = category
+                if not category_for_price and isinstance(vision, dict):
+                    vision_cat = str(vision.get("category") or "").strip()
+                    if vision_cat:
+                        mapped = normalize_category_input(vision_cat)
+                        if mapped:
+                            category_for_price = mapped
+                if category_for_price:
+                    mapped = normalize_category_input(category_for_price)
+                    if mapped:
+                        category_for_price = mapped
+
                 # If we don't have a category yet, let edge function handle defaulting.
                 price_resp = await supabase_client.suggest_price_cached(
                     title=title or "Ürün",
-                    category=category or "Diğer",
+                    category=category_for_price or "Diğer",
                     description=description or "",
-                    condition=condition or "İyi Durumda",
+                    condition=condition_for_price,
+                    vision=vision if isinstance(vision, dict) else None,
+                    user_claim=(message_body or "").strip(),
                 )
 
                 price_value = price_resp.get("price")

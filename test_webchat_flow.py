@@ -41,7 +41,7 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
             draft_id = f"draft_{self._id}"
             self.drafts[draft_id] = {
                 "id": draft_id,
-                "listing_data": {"title": None, "description": None, "price": None, "category": None},
+                "listing_data": {"title": None, "description": None, "price": None, "condition": None, "category": None},
                 "images": [],
                 "vision_product": {},
             }
@@ -102,11 +102,16 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
             d.setdefault("listing_data", {})["description"] = description
             return True
 
+        async def update_draft_condition(self, draft_id: str, condition: str) -> bool:
+            d = self.drafts[draft_id]
+            d.setdefault("listing_data", {})["condition"] = condition
+            return True
+
         async def reset_draft(self, draft_id: str, phone_number: str | None = None) -> bool:
             # Mimic production behavior: reset wipes images + listing fields.
             self.reset_calls.append(draft_id)
             d = self.drafts[draft_id]
-            d["listing_data"] = {"title": None, "description": None, "price": None, "category": None}
+            d["listing_data"] = {"title": None, "description": None, "price": None, "condition": None, "category": None}
             d["images"] = []
             return True
 
@@ -115,7 +120,7 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
 
     # Avoid any real OpenAI call
     async def fake_analyze_media(media_urls: list[str]) -> list[dict[str, Any]]:
-        return [{"image_url": media_urls[0], "analysis": {"product": "iPhone 14", "category": "Elektronik", "condition": "İyi Durumda", "features": ["128GB"]}}]
+        return [{"image_url": media_urls[0], "analysis": {"product": "iPhone 14", "category": "Elektronik", "condition": "Az Kullanılmış", "features": ["128GB"]}}]
 
     monkeypatch.setattr(webchat, "analyze_media_with_vision", fake_analyze_media)
 
@@ -170,7 +175,7 @@ async def test_locked_create_listing_image_add_updates_counter_without_restart(m
             self.drafts: dict[str, dict[str, Any]] = {
                 "d1": {
                     "id": "d1",
-                    "listing_data": {"title": "X", "description": "Y", "price": 10, "location": "İstanbul", "category": "Elektronik"},
+                    "listing_data": {"title": "X", "description": "Y", "price": 10, "condition": "2. El", "location": "İstanbul", "category": "Elektronik"},
                     "images": [{"image_url": "https://example.com/1.jpg", "metadata": {}}],
                     "vision_product": {},
                 }
@@ -226,7 +231,7 @@ async def test_help_message_does_not_fill_title_slot(monkeypatch: MonkeyPatch) -
             self.drafts: dict[str, dict[str, Any]] = {
                 "d1": {
                     "id": "d1",
-                    "listing_data": {"title": None, "description": None, "price": None, "location": None, "category": None},
+                    "listing_data": {"title": None, "description": None, "price": None, "condition": None, "location": None, "category": None},
                     "images": [{"image_url": "https://example.com/1.jpg", "metadata": {}}],
                     "vision_product": {"product": "X", "category": "Elektronik"},
                 }
@@ -327,7 +332,7 @@ async def test_pre_intent_price_slot_is_applied_without_intent_routing(monkeypat
     assert r["success"] is True
     assert r["intent"] == "create_listing"
     assert r["data"]["type"] == "draft_update"
-    assert "lokasyon" in r["message"].lower(), "Next missing slot after price should be location"
+    assert "durum" in r["message"].lower(), "Next missing slot after price should be condition"
     assert r["data"].get("price") == 1200000.0
 
 
@@ -497,7 +502,7 @@ async def test_auto_category_selection_uses_vision_when_user_does_not_know(monke
     )
 
     assert r["success"] is True
-    assert "Lokasyon" in r["message"]
+    assert "Durum" in r["message"]
 
 
 def test_vision_blocks_can_be_suppressed(monkeypatch: MonkeyPatch) -> None:
@@ -507,7 +512,7 @@ def test_vision_blocks_can_be_suppressed(monkeypatch: MonkeyPatch) -> None:
         "id": "d1",
         "listing_data": {"title": "X", "description": "Y", "price": None, "category": None},
         "images": [{"image_url": "https://example.com/x.jpg", "metadata": {}}],
-        "vision_product": {"product": "iPhone", "condition": "İyi", "features": ["128GB"]},
+        "vision_product": {"product": "iPhone", "condition": "Az Kullanılmış", "features": ["128GB"]},
     }
 
     msg_no_vision = webchat.build_draft_status_message(draft, include_vision=False)
