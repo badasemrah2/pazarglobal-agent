@@ -22,6 +22,7 @@ from agents import (
     SmallTalkAgent,
     TitleAgent,
 )
+from agents.vision_safety_gate import vision_safety_gate
 from config import settings
 from services import openai_client, redis_client, supabase_client
 from services.text_normalization import canonicalize_condition, normalize_for_match
@@ -3726,6 +3727,25 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
     """Run vision analysis on uploaded media and prompt user for next action."""
     if not chat_message.media_urls:
         raise HTTPException(status_code=400, detail="media_urls is required")
+
+    # 🔴 STEP 0: PRE-ROUTING VISION SAFETY CHECK (Sprint 1)
+    # Block unsafe content BEFORE it reaches FSM/Router/Vision Analysis
+    safety_check = await vision_safety_gate.check_media(chat_message.media_urls)
+    if not safety_check.get("safe", True):
+        block_reason = safety_check.get("block_reason", "İçerik güvenlik politikalarımıza uygun değil.")
+        logger.warning(
+            f"Vision safety gate blocked media upload. Session: {chat_message.session_id}, "
+            f"Categories: {safety_check.get('flagged_categories', [])}"
+        )
+        return ChatResponse(
+            success=False,
+            message=block_reason,
+            data={
+                "type": "safety_blocked",
+                "flagged_categories": safety_check.get("flagged_categories", [])
+            },
+            intent="blocked"
+        )
 
     session = await load_session_state(chat_message.session_id)
     if session is None or not isinstance(session, dict):

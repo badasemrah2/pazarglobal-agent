@@ -48,7 +48,50 @@ Create Listing akışı pratikte **hibrit** çalışır:
 Bu sayede Railway’de sticky session olmadığı senaryolarda bile akış “kendi kendine toparlayabilir”.
 
 > **Manifesto:** ComposerAgent karar vermez, tutarlılığı denetler.
+### 🔐 Vision Safety Gate (Step 0)
 
+**Sprint 1 Implementation (January 2026)**
+
+Güvensiz içerik sisteme GİRMEDEN bloklanır:
+
+```text
+User uploads media → Vision Safety Gate (Pre-Routing)
+                            ↓
+                     ┌──────────────┐
+                     │ OpenAI       │
+                     │ Moderation   │
+                     │ API          │
+                     └──────┬───────┘
+                            │
+                    ┌───────┴────────┐
+                    │                │
+              🔴 UNSAFE          ✅ SAFE
+                    │                │
+                    ▼                ▼
+            ┌──────────────┐   ┌──────────────┐
+            │ Block +      │   │ Proceed to   │
+            │ Empathetic   │   │ FSM/Router   │
+            │ Message      │   │              │
+            └──────────────┘   └──────────────┘
+```
+
+**Blocked Categories:**
+- Sexual content (explicit)
+- Violence (graphic)
+- Hate symbols
+- Harassment/Threats
+- Self-harm content
+- Illicit content (drugs, weapons)
+
+**Key Design Decisions:**
+- **Fail-open behavior**: If moderation API fails, allow content (avoids blocking legitimate users)
+- **Storage-first**: Media URLs checked AFTER upload, verdict blocks downstream processing
+- **FSM/Router never sees unsafe content**: Safety check runs in `/media/analyze` endpoint BEFORE vision analysis
+
+**Implementation:**
+- `agents/vision_safety_gate.py`: VisionSafetyGate class
+- `api/webchat.py`: Pre-routing check in `/media/analyze` endpoint
+- Test coverage: `test_vision_safety_gate.py` (8 tests)
 ```text
 User: "iPhone 13 satmak istiyorum, fiyat 20000 TL"
                     ↓
