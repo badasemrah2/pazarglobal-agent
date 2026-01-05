@@ -256,8 +256,15 @@ Not: Supabase şeması repo içinde [pazarglobal-agent/supabase_table_schema.md]
 │    {                                                        │
 │      "user_id": "...",                                     │
 │      "intent": "create_listing",                           │
+│      "locked_intent": "create_listing",                    │
 │      "active_draft_id": "...",                             │
-│      "phone_number": "..."                                 │
+│      "phone_number": "...",                                │
+│      "fsm_state": "active",                                │
+│      "fsm_state_reason": null,                             │
+│      "fsm_state_updated_at": "2026-01-06T...",             │
+│      "parked_intent": null,                                │
+│      "last_user_at": "2026-01-06T...",                     │
+│      "last_bot_at": "2026-01-06T..."                       │
 │    }                                                        │
 Redis yoksa veya load-balancer nedeniyle istek farklı instance’a düşerse:
 
@@ -278,7 +285,10 @@ Redis yoksa veya load-balancer nedeniyle istek farklı instance’a düşerse:
 | Tool error (DB/RPC/HTTP) | İşlem durdurulur, kullanıcıya hata döner; audit log ile izlenebilirlik korunur |
 | Draft conflict (birden fazla `draft_id` / tutarsız ID) | Akış ABORT edilir; kullanıcıdan yeniden başlatması istenir; audit log’a conflict yazılır |
 | Redis yok / sticky session yok | Draft state Supabase `active_drafts` üzerinden recover edilir; geçici media buffer DB’ye yazılabilir |
-| Edge Function (WhatsApp gate) down | WhatsApp istekleri reject edilir veya güvenli fail-close yapılır; backend’e kontrolsüz forward edilmez || **FSM Loop Trap (user hesitation)** | Kullanıcı "dur bi", "belki", "satmayabilirim" gibi kararsızlık sinyali gösterirse: `locked_intent` temizlenir, flow nazikçe kapatılır, aynı soru tekrar tekrar sorulmaz (same question suppression) |
+| Edge Function (WhatsApp gate) down | WhatsApp istekleri reject edilir veya güvenli fail-close yapılır; backend'e kontrolsüz forward edilmez |
+| **FSM Loop Trap (user hesitation)** | Kullanıcı "dur bi", "belki", "satmayabilirim" gibi kararsızlık sinyali gösterirse: `locked_intent` temizlenir, flow nazikçe kapatılır, aynı soru tekrar tekrar sorulmaz (same question suppression) |
+| **ComposerAgent timeout** | 45s içinde LLM dönmezse → `fsm_state=timeout`, flow parked olur, kullanıcı "devam" veya "iptal" ile yönetir |
+| **User inactivity (parked)** | 10 dakika sessizlik → `fsm_state=parked`, flow askıya alınır, kullanıcı "devam" ile kaldığı yerden başlatabilir |
 
 ### 🔁 FSM Loop Trap Prevention (Yeni)
 
@@ -310,6 +320,42 @@ Sistem: "Fiyat nedir?" [❌ LOOP]
      - Flow nazikçe kapatılır, kullanıcı yeniden başlayabilir
 
 **Test coverage:** `test_hesitation_signals_exit_create_listing_flow` (28/28 passing)
+
+### 🕒 FSM Parked/Timeout States (Sprint 3, January 2026)
+
+**Problem:** Kullanıcı taslak başlatıyor, uzun süre yanıt vermiyor, sonra tekrar mesaj yazdığında flow otomatik devam ediyor; ama kullanıcı context kaybetmiş olabilir ve bot yanlış noktadan devam ediyorsa UX kötü oluyor.
+
+**Çözüm: Parked & Timeout States + Telemetry**
+
+Session state genişletildi:
+- `fsm_state` (active | parked | timeout | hesitation_exit)
+- `fsm_state_reason` (inactivity | composer_timeout | user_hesitation)
+- `fsm_state_updated_at`, `fsm_state_intent`
+- `parked_intent` (kullanıcı "devam" derse hangi intent'e döneceğiz)
+- `last_user_at`, `last_bot_at` (timestamp ISO8601)
+
+**Parked** (inactivity):
+- `last_user_at` 10 dakika geçtikten sonra session locked ise → `parked` state
+- `locked_intent` temizlenir, `parked_intent` doldurulur
+- Bot: "Bir süredir yanıt alamadım. Akışı park ettim. Devam etmek için 'devam' yaz."
+- Kullanıcı "devam" derse → intent restore + `fsm_state=active`
+- Kullanıcı "iptal" derse → flow tamamen temizlenir
+
+**Timeout** (ComposerAgent timeout):
+- `ComposerAgent.orchestrate_listing_creation()` 45 saniye içinde dönmezse → asyncio.TimeoutError
+- `fsm_state=timeout`, `parked_intent` set, bot: "Şu an yanıt veremedim, beklemeye aldım."
+- Kullanıcı "devam" ya da "iptal" ile akışı yönetir
+
+**Hesitation Exit** (user signal):
+- `is_hesitation_signal()` tetiklenirse → `fsm_state=hesitation_exit`
+- Flow nazikçe kapatılır
+
+**Telemetry:**
+- Her FSM state değişimi `audit_logs` tablosuna yazılır (action=`fsm_event`)
+- Metadata içinde: event (`parked`, `timeout`, `resumed`, `hesitation_exit`, `intent_lock`), session_id, intent, locked_intent, fsm_state, fsm_state_reason
+- Fail-soft: telemetry başarısız olsa bile flow kesilmez
+
+**Test coverage:** `test_fsm_sprint3.py` (5/5 passing)
 ``````
 
 ## 🌐 Communication Protocols

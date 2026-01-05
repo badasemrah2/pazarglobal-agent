@@ -4,9 +4,12 @@ WebChat API endpoints for frontend integration
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -51,6 +54,70 @@ MEDIA_ANALYSIS_USER_PROMPT = (
     "Durum alanını 'görsel izlenim' olarak yaz (örn: 'temiz', 'yıpranmış', 'çok iyi görünüyor'). "
     "'Sıfır/2. El' gibi kesin çıkarım yapma."
 )
+
+FSM_PARK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes of user silence → parked
+FSM_COMPOSER_TIMEOUT_SECONDS = 45   # ComposerAgent hard timeout
+RESUME_KEYWORDS = {"devam", "kaldığımız yerden", "kaldigimiz yerden", "resume", "continue"}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _seconds_since(ts: Optional[str], now_iso: Optional[str] = None) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        base = datetime.fromisoformat(ts)
+        now_dt = datetime.fromisoformat(now_iso) if now_iso else datetime.now(timezone.utc)
+        return max(0.0, (now_dt - base).total_seconds())
+    except Exception:
+        try:
+            return max(0.0, time.time() - float(ts))
+        except Exception:
+            return None
+
+
+def _set_fsm_state(session: Dict[str, Any], state: str, intent: Optional[str] = None, reason: Optional[str] = None) -> None:
+    session["fsm_state"] = state
+    session["fsm_state_reason"] = reason
+    session["fsm_state_updated_at"] = _utc_now_iso()
+    if intent:
+        session["fsm_state_intent"] = intent
+
+
+async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any], detail: Dict[str, Any] | None = None) -> None:
+    detail = detail or {}
+    try:
+        meta = {
+            "event": event,
+            "session_id": session_id,
+            "intent": session.get("intent"),
+            "locked_intent": session.get("locked_intent"),
+            "fsm_state": session.get("fsm_state"),
+            "fsm_state_reason": session.get("fsm_state_reason"),
+        }
+        meta.update(detail)
+
+        if not hasattr(supabase_client, "log_action"):
+            return
+        await supabase_client.log_action(
+            action="fsm_event",
+            metadata=meta,
+            resource_type="session",
+            resource_id=session_id,
+            user_id=session.get("user_id"),
+        )
+    except Exception:
+        # Telemetry must never break the flow
+        logger.debug(f"FSM telemetry emit failed for {event}")
+
+
+def is_resume_command(message: str) -> bool:
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    return any(token in msg for token in RESUME_KEYWORDS)
 
 
 def redis_is_disabled() -> bool:
@@ -2114,7 +2181,14 @@ async def process_webchat_message(
                 "locked_intent": None,
                 "active_draft_id": None,
                 "pending_media_urls": [],
-                "pending_media_analysis": []
+                "pending_media_analysis": [],
+                "fsm_state": "active",
+                "fsm_state_reason": None,
+                "fsm_state_updated_at": _utc_now_iso(),
+                "fsm_state_intent": None,
+                "parked_intent": None,
+                "last_user_at": _utc_now_iso(),
+                "last_bot_at": None,
             }
             session_dirty = True
         else:
@@ -2129,12 +2203,101 @@ async def process_webchat_message(
             if "locked_intent" not in session:
                 session["locked_intent"] = None
                 session_dirty = True
+            if "fsm_state" not in session:
+                session["fsm_state"] = "active"
+                session_dirty = True
+            if "fsm_state_reason" not in session:
+                session["fsm_state_reason"] = None
+                session_dirty = True
+            if "fsm_state_updated_at" not in session:
+                session["fsm_state_updated_at"] = _utc_now_iso()
+                session_dirty = True
+            if "fsm_state_intent" not in session:
+                session["fsm_state_intent"] = None
+                session_dirty = True
+            if "parked_intent" not in session:
+                session["parked_intent"] = None
+                session_dirty = True
+            if "last_user_at" not in session:
+                session["last_user_at"] = _utc_now_iso()
+                session_dirty = True
+            if "last_bot_at" not in session:
+                session["last_bot_at"] = None
+                session_dirty = True
 
         async def _finalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal session_dirty
+            session["last_bot_at"] = _utc_now_iso()
+            if not session_dirty:
+                session_dirty = True
             if session_dirty:
                 await persist_session_state(session_id, session)
             return payload
         finalize_response = _finalize_response
+
+        now_iso = _utc_now_iso()
+        inactivity_seconds = _seconds_since(session.get("last_user_at"), now_iso)
+        session["last_user_at"] = now_iso
+        session_dirty = True
+
+        # Auto-park flows after prolonged silence to avoid stale prompts.
+        locked_for_timeout = session.get("locked_intent")
+        if (
+            locked_for_timeout
+            and inactivity_seconds is not None
+            and inactivity_seconds > FSM_PARK_TIMEOUT_SECONDS
+            and session.get("fsm_state") != "parked"
+        ):
+            session["parked_intent"] = locked_for_timeout
+            session["locked_intent"] = None
+            session["intent"] = None
+            _set_fsm_state(session, "parked", intent=locked_for_timeout, reason="inactivity")
+            session_dirty = True
+            await _record_fsm_event(
+                "parked",
+                session_id,
+                session,
+                {"inactivity_seconds": inactivity_seconds, "parked_intent": locked_for_timeout},
+            )
+            return await finalize_response({
+                "success": True,
+                "message": "Bir süredir yanıt alamadım. Akışı park ettim. Devam etmek için 'devam' yazabilir ya da yeniden başlatmak için yeni isteğini yazabilirsin.",
+                "data": {"type": "parked"},
+                "intent": None,
+            })
+
+        # If already parked/timeout, require explicit resume keyword to continue.
+        if session.get("fsm_state") in {"parked", "timeout"}:
+            if is_resume_command(message_body):
+                restored_intent = session.get("parked_intent") or session.get("fsm_state_intent") or session.get("intent") or session.get("locked_intent") or "create_listing"
+                session["locked_intent"] = restored_intent
+                session["intent"] = restored_intent
+                session["parked_intent"] = None
+                _set_fsm_state(session, "active", intent=restored_intent, reason="resume_command")
+                session_dirty = True
+                if not redis_disabled:
+                    await redis_client.set_intent(session_id, restored_intent)
+                await _record_fsm_event("resumed", session_id, session, {"restored_intent": restored_intent})
+            elif is_cancel_command(message_body):
+                session["locked_intent"] = None
+                session["intent"] = None
+                session["parked_intent"] = None
+                _set_fsm_state(session, "active", intent=None, reason="cancel_from_parked")
+                session_dirty = True
+                await _record_fsm_event("parked_cancel", session_id, session, {})
+                return await finalize_response({
+                    "success": True,
+                    "message": "Tamam, bekleyen akışı iptal ettim. Yeni bir işlem başlatabilirsin.",
+                    "data": {"type": "parked_cancel"},
+                    "intent": "small_talk",
+                })
+            else:
+                return await finalize_response({
+                    "success": True,
+                    "message": "Akış beklemedeydi. Devam etmek için 'devam' yazabilir veya 'iptal' ile sıfırlayabilirsin.",
+                    "data": {"type": session.get("fsm_state")},
+                    "intent": None,
+                })
 
         # IMPORTANT: frontend may omit user_id for some calls.
         # If we normalize None -> uuid4(), we get a different user per request,
@@ -2202,18 +2365,24 @@ async def process_webchat_message(
         # This prevents getting stuck in a previous flow (e.g., search_listings) when the user explicitly
         # changes their mind and wants to sell or publish.
         if is_publish_command(message_body) or is_delete_command(message_body):
+            prev_locked_pub = session.get("locked_intent")
             session["intent"] = "publish_or_delete"
             session["locked_intent"] = "publish_or_delete"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "publish_or_delete")
+            if prev_locked_pub != "publish_or_delete":
+                await _record_fsm_event("intent_lock", session_id, session, {"new_intent": "publish_or_delete", "prev_locked": prev_locked_pub})
 
         if is_create_listing_command(message_body) and not (is_publish_command(message_body) or is_delete_command(message_body)):
+            prev_locked = session.get("locked_intent")
             session["intent"] = "create_listing"
             session["locked_intent"] = "create_listing"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "create_listing")
+            if prev_locked != "create_listing":
+                await _record_fsm_event("intent_lock", session_id, session, {"new_intent": "create_listing", "prev_locked": prev_locked})
         
         # Store message in history
         if not redis_disabled:
@@ -2713,9 +2882,13 @@ async def process_webchat_message(
             # Clear the locked state to allow user to restart fresh
             session["locked_intent"] = None
             session["intent"] = "small_talk"
+            session["parked_intent"] = None
+            _set_fsm_state(session, "hesitation_exit", intent="create_listing", reason="user_hesitation")
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "small_talk")
+
+            await _record_fsm_event("hesitation_exit", session_id, session, {"message": message_body})
             
             return await finalize_response({
                 "success": True,
@@ -2825,6 +2998,7 @@ async def process_webchat_message(
             elif is_search_command(message_body):
                 override_intent = "search_listings"
             if override_intent and override_intent != intent:
+                prev_locked = session.get("locked_intent")
                 intent = override_intent
                 session["intent"] = intent
                 session["locked_intent"] = intent
@@ -2832,6 +3006,7 @@ async def process_webchat_message(
                 session_dirty = True
                 if not redis_disabled:
                     await redis_client.set_intent(session_id, intent)
+                await _record_fsm_event("intent_lock", session_id, session, {"new_intent": override_intent, "prev_locked": prev_locked, "trigger": "command_override"})
 
         if not intent:
             router_agent = IntentRouterAgent()
@@ -2844,9 +3019,11 @@ async def process_webchat_message(
 
             # Only lock "task" intents; keep small_talk unlocked.
             if intent in {"create_listing", "search_listings"}:
+                prev_locked_router = session.get("locked_intent")
                 session["locked_intent"] = intent
                 locked_intent = intent
                 session_dirty = True
+                await _record_fsm_event("intent_lock", session_id, session, {"new_intent": intent, "prev_locked": prev_locked_router, "trigger": "router"})
         
         response_data = {"intent": intent}
         
@@ -3512,13 +3689,30 @@ async def process_webchat_message(
             if run_composer:
                 active_draft_id = session.get("active_draft_id")
                 composer_draft_id = active_draft_id if isinstance(active_draft_id, str) and active_draft_id else None
-                result = await composer.orchestrate_listing_creation(
-                    user_message=message_body,
-                    user_id=user_id,
-                    phone_number=session_id,  # Use session_id as identifier
-                    draft_id=composer_draft_id,
-                    media_urls=[]
-                )
+                try:
+                    result = await asyncio.wait_for(
+                        composer.orchestrate_listing_creation(
+                            user_message=message_body,
+                            user_id=user_id,
+                            phone_number=session_id,  # Use session_id as identifier
+                            draft_id=composer_draft_id,
+                            media_urls=[],
+                        ),
+                        timeout=FSM_COMPOSER_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    session["parked_intent"] = intent
+                    session["locked_intent"] = None
+                    session["intent"] = None
+                    _set_fsm_state(session, "timeout", intent=intent, reason="composer_timeout")
+                    session_dirty = True
+                    await _record_fsm_event("timeout", session_id, session, {"stage": "composer"})
+                    return await finalize_response({
+                        "success": False,
+                        "message": "Şu an yanıt veremedim, akışı beklemeye aldım. Devam etmek için 'devam' yazabilir ya da yeniden başlatabilirsin.",
+                        "data": {"type": "timeout"},
+                        "intent": None,
+                    })
 
             # If we skipped composer (or composer failed), just read current draft
             if not result:
