@@ -377,6 +377,43 @@ def is_cancel_command(message: str) -> bool:
     ])
 
 
+def is_hesitation_signal(message: str) -> bool:
+    """
+    Detect user hesitation or uncertainty signals.
+    These indicate the user is NOT ready to provide information.
+    This prevents FSM loop trap where system keeps asking same question.
+    """
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    
+    # Exclude false positives: user says "bilmiyorum" but with instruction
+    if "otomatik" in msg or "sen belirle" in msg or "sen seç" in msg or "sen sec" in msg:
+        return False
+    
+    # Short messages showing hesitation/pause
+    if msg in ["dur", "dur bi", "dur bir", "bekle", "durur", "dursun"]:
+        return True
+    # Uncertainty patterns
+    hesitation_patterns = [
+        "aslında bakayım",
+        "aslinda bakayim",
+        "bakayım",
+        "bakayim",
+        "bakalım",
+        "bakalim",
+        "belki",
+        "emin değilim",
+        "emin degilim",
+        "düşüneyim",
+        "dusuneyim",
+        "satmayabilirim",
+        "vermeyebilirim",
+        "karar vermedim",
+    ]
+    return any((t := normalize_for_match(token)) and t in msg for token in hesitation_patterns)
+
+
 def is_wallet_balance_command(message: str) -> bool:
     """Return True when the user asks about wallet balance/remaining credits."""
 
@@ -1293,7 +1330,8 @@ def format_preview_message(
         keywords = ["km", "kilometre", "tramer", "hasar", "kaza", "boya", "değişen", "degisen"]
         return not any(k in desc_l for k in keywords)
 
-    lines: List[str] = ["📝 **Yayın Öncesi Kontrol**"]
+    lines: List[str] = ["� YAYIN ÖNCESİ KONTROL"]
+    lines.append("")
 
     title = preview.get("title") or "—"
     description = preview.get("description") or "—"
@@ -1308,13 +1346,26 @@ def format_preview_message(
     image_count = preview.get("image_count") or 0
     full_desc = preview.get("full_description") or description
 
-    lines.append(f"**Başlık:** {title}")
-    lines.append(f"**Açıklama:** {description}")
-    lines.append(f"**Fiyat:** {price_text}")
-    lines.append(f"**Durum:** {condition}")
-    lines.append(f"**Kategori:** {category}")
-    lines.append(f"**Lokasyon:** {location}")
-    lines.append(f"**Fotoğraflar:** {image_count} adet")
+    lines.append("BAŞLIK:")
+    lines.append(title)
+    lines.append("")
+    lines.append("AÇIKLAMA:")
+    lines.append(description)
+    lines.append("")
+    lines.append("FİYAT:")
+    lines.append(price_text)
+    lines.append("")
+    lines.append("DURUM:")
+    lines.append(condition)
+    lines.append("")
+    lines.append("KATEGORİ:")
+    lines.append(category)
+    lines.append("")
+    lines.append("LOKASYON:")
+    lines.append(location)
+    lines.append("")
+    lines.append("FOTOĞRAFLAR:")
+    lines.append(f"{image_count} adet")
 
     vision = preview.get("vision")
     if include_vision and isinstance(vision, dict):
@@ -1331,7 +1382,7 @@ def format_preview_message(
             vision_lines.append(f"Not: {vision_desc}")
         if vision_lines:
             lines.append("")
-            lines.append("🔎 **Görsel analizi**")
+            lines.append("🔎 GÖRSEL ANALİZİ:")
             lines.extend(f"• {entry}" for entry in vision_lines)
 
     if highlight:
@@ -1341,19 +1392,20 @@ def format_preview_message(
     # Optional reminder for automotive listings when key details are missing.
     if _needs_vehicle_detail_prompt(full_desc, category):
         lines.append("")
-        lines.append("🚗 **Otomotiv için hatırlatma (isteğe bağlı):**")
+        lines.append("🚗 OTOMOTİV HATIRLATMA (isteğe bağlı):")
         lines.append("• Km, boya/değişen ve tramer/hasar durumunu eklersen alıcılar için net olur. İstersen açıklamaya ekleyebilirim.")
+        lines.append("")
 
-    balance_text = ""
+    lines.append("")
+    lines.append("─────────────────────────")
     if balance is not None:
-        balance_text = f"Mevcut bakiyeniz: {int(balance)} kredi. "
+        lines.append(f"Mevcut bakiyeniz: {int(balance)} kredi")
+    lines.append(f"Yayın ücreti: {cost} kredi")
     lines.append("")
-    lines.append(f"{balance_text}Yayın ücreti {cost} kredi.")
-    lines.append("")
-    lines.append("🛠️ **Komutlar**")
-    lines.append("👉 **Onayla:** onayla")
-    lines.append("👉 **Düzenle:** başlık: ..., açıklama: ..., fiyat: ..., durum: ..., kategori: ..., lokasyon: ...")
-    lines.append("👉 **İptal:** iptal")
+    lines.append("🛠️ KOMUTLAR")
+    lines.append("👉 Onayla: onayla")
+    lines.append("👉 Düzenle: başlık: ..., açıklama: ..., fiyat: ...")
+    lines.append("👉 İptal: iptal")
     lines.append("")
     lines.append("İlanınızda değişiklik yapmak veya yayınlamak için yukarıdaki komutları kullanın.")
 
@@ -2588,6 +2640,24 @@ async def process_webchat_message(
                 "message": "Aktif bir taslak bulunamadı. Önce 'ilan oluştur' ile taslak başlatın.",
                 "data": {"type": "draft_status"},
                 "intent": session.get("intent") or "small_talk",
+            })
+
+        # HESITATION DETECTION (FSM loop preventer):
+        # If user shows uncertainty/hesitation while in create_listing flow,
+        # acknowledge it and exit gracefully to prevent repeated prompts.
+        if is_hesitation_signal(message_body) and session.get("locked_intent") == "create_listing":
+            # Clear the locked state to allow user to restart fresh
+            session["locked_intent"] = None
+            session["intent"] = "small_talk"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, "small_talk")
+            
+            return await finalize_response({
+                "success": True,
+                "message": "Tamam, acele yok. Karar verdiğinde söylersin, birlikte ilan oluştururuz. 😊",
+                "data": {"type": "hesitation_exit"},
+                "intent": "small_talk",
             })
 
         # WALLET BALANCE OVERRIDE:

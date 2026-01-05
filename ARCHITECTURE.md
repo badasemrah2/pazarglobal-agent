@@ -225,8 +225,39 @@ Redis yoksa veya load-balancer nedeniyle istek farklı instance’a düşerse:
 | Tool error (DB/RPC/HTTP) | İşlem durdurulur, kullanıcıya hata döner; audit log ile izlenebilirlik korunur |
 | Draft conflict (birden fazla `draft_id` / tutarsız ID) | Akış ABORT edilir; kullanıcıdan yeniden başlatması istenir; audit log’a conflict yazılır |
 | Redis yok / sticky session yok | Draft state Supabase `active_drafts` üzerinden recover edilir; geçici media buffer DB’ye yazılabilir |
-| Edge Function (WhatsApp gate) down | WhatsApp istekleri reject edilir veya güvenli fail-close yapılır; backend’e kontrolsüz forward edilmez |
+| Edge Function (WhatsApp gate) down | WhatsApp istekleri reject edilir veya güvenli fail-close yapılır; backend’e kontrolsüz forward edilmez || **FSM Loop Trap (user hesitation)** | Kullanıcı "dur bi", "belki", "satmayabilirim" gibi kararsızlık sinyali gösterirse: `locked_intent` temizlenir, flow nazikçe kapatılır, aynı soru tekrar tekrar sorulmaz (same question suppression) |
+
+### 🔁 FSM Loop Trap Prevention (Yeni)
+
+**Problem:** Kullanıcı ilan akışına başlıyor ama kararsız kalıyor:
 ```
+Kullanıcı: "ilan vermek istiyorum ama dur bi"
+Sistem: "Ürün adı nedir?"
+Kullanıcı: "aslında bakayım"
+Sistem: "Fiyat nedir?" [❌ YANLIŞ - aynı soru tekrarı]
+Kullanıcı: "satmayabilirim"
+Sistem: "Fiyat nedir?" [❌ LOOP]
+```
+
+**Çözüm:**
+
+1. **IntentRouter pattern detection:**
+   - Kararsızlık: "dur bi", "bekle", "aslında bakayım", "belki", "emin değilim", "düşüneyim"
+   - İptal: "satmayabilirim", "vermeyebilirim", "vazgeç"
+   - Bu pattern'ler tespit edilirse → `small_talk` intent'ine yönlendir
+
+2. **ComposerAgent same question suppression:**
+   - Son 2 response aynı soruyu içeriyorsa, farklı yaklaşım kullan
+   - Örnek: "Görüyorum ki kararsızsın. Karar verdiğinde söylersin."
+
+3. **Webchat hesitation override:**
+   - `is_hesitation_signal()` fonksiyonu `create_listing` flow'dayken tetiklenirse:
+     - `locked_intent` ve `intent` temizlenir
+     - "Tamam, acele yok. Karar verdiğinde söylersin, birlikte ilan oluştururuz. 😊" şeklinde empatik yanıt verilir
+     - Flow nazikçe kapatılır, kullanıcı yeniden başlayabilir
+
+**Test coverage:** `test_hesitation_signals_exit_create_listing_flow` (28/28 passing)
+``````
 
 ## 🌐 Communication Protocols
 

@@ -911,3 +911,72 @@ async def test_locked_create_listing_search_command_prompts_cancel_hint(monkeypa
     assert r["success"] is True
     assert r["intent"] == "create_listing"
     assert "iptal" in r["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_hesitation_signals_exit_create_listing_flow(monkeypatch: MonkeyPatch) -> None:
+    """
+    Test FSM loop trap prevention:
+    User starts listing creation but shows hesitation/uncertainty.
+    System should exit gracefully instead of repeating same questions.
+    """
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        async def get_draft(self, draft_id: str):
+            return {
+                "id": draft_id,
+                "listing_data": {"title": None, "description": None, "price": None, "condition": None, "category": None},
+                "images": [],
+                "vision_product": {},
+            }
+
+        async def get_latest_draft_for_user(self, user_id: str):
+            return None
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    # Scenario: User starts listing creation flow
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s1"] = {
+        "user_id": "u1",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    # Test various hesitation patterns
+    hesitation_messages = [
+        "dur bi",
+        "aslında bakayım",
+        "belki",
+        "satmayabilirim",
+        "düşüneyim",
+        "emin değilim",
+    ]
+
+    for msg in hesitation_messages:
+        r = await webchat.process_webchat_message(
+            message_body=msg,
+            session_id="s1",
+            user_id="u1",
+            media_urls=None,
+        )
+
+        # Verify graceful exit
+        assert r["success"] is True, f"Failed for message: {msg}"
+        assert r["intent"] == "small_talk", f"Intent not reset for message: {msg}"
+        assert "acele yok" in r["message"].lower() or "karar ver" in r["message"].lower(), f"No empathetic response for: {msg}"
+
+        # Reset session for next test
+        webchat.IN_MEMORY_SESSION_CACHE["s1"] = {
+            "user_id": "u1",
+            "intent": "create_listing",
+            "locked_intent": "create_listing",
+            "active_draft_id": "d1",
+            "pending_media_urls": [],
+            "pending_media_analysis": [],
+        }
+
