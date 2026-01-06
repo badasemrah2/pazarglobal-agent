@@ -136,6 +136,114 @@ async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any]
         )
 
 
+async def _handle_ambiguous_intent(
+    session_id: str,
+    session: Dict[str, Any],
+    detected_intents: List[str],
+    message_body: str
+) -> None:
+    """Handle ambiguous intent by logging and preparing for clarification."""
+    await _record_fsm_event(
+        "intent_ambiguous",
+        session_id,
+        session,
+        {
+            "detected_intents": detected_intents,
+            "message_preview": message_body[:100]
+        }
+    )
+    # CRITICAL: This is NOT small_talk, it's "decision pending"
+    session["intent"] = "clarify_intent"
+    session["locked_intent"] = None  # Explicitly unlock
+    
+    # TTL: expire after 2 minutes to avoid ghost state
+    import time
+    expires_at = time.time() + 120  # 2 minutes
+    
+    session["pending_clarification"] = {
+        "detected_intents": detected_intents,
+        "original_message": message_body,
+        "expires_at": expires_at
+    }
+
+
+async def _generate_clarification_message(detected_intents: List[str], original_message: str) -> str:
+    """Generate a SHORT user-friendly clarification message for ambiguous intents.
+    
+    Strategy: Minimal first response, let user choose with 1 word/number.
+    """
+    
+    # HARD RULE: price_inquiry + create_listing → always clarify (user wants to learn price first)
+    if "price_inquiry" in detected_intents and "create_listing" in detected_intents:
+        return (
+            "İki konuda yardımcı olabilirim:\n\n"
+            "1️⃣ **Fiyatını öğrenmek** (hızlı değerlendirme)\n"
+            "2️⃣ **Satış ilanı oluşturmak**\n\n"
+            "Hangisiyle başlayalım? (1 veya 2 yazın)"
+        )
+    
+    # Build options based on detected intents (short format)
+    options = []
+    option_num = 1
+    
+    if "price_inquiry" in detected_intents:
+        options.append(f"{option_num}️⃣ **Fiyat araştırması**")
+        option_num += 1
+    
+    if "create_listing" in detected_intents:
+        options.append(f"{option_num}️⃣ **İlan oluştur**")
+        option_num += 1
+    
+    if "search_listings" in detected_intents:
+        options.append(f"{option_num}️⃣ **İlan ara**")
+        option_num += 1
+    
+    message = "Hangi konuda yardımcı olayım?\n\n"
+    message += "\n".join(options)
+    message += "\n\nNumara yazarak seçebilirsiniz."
+    
+    return message
+
+
+def _parse_clarification_choice(message: str, detected_intents: List[str]) -> Optional[str]:
+    """Parse user's response to clarification prompt.
+    
+    Returns:
+        Intent name if valid choice, None otherwise
+    """
+    msg = normalize_for_match(message)
+    if not msg:
+        return None
+    
+    # Number-based selection (1, 2, 3)
+    if msg in ["1", "bir", "birinci", "ilk"]:
+        return detected_intents[0] if len(detected_intents) > 0 else None
+    if msg in ["2", "iki", "ikinci"]:
+        return detected_intents[1] if len(detected_intents) > 1 else None
+    if msg in ["3", "uc", "üç", "ucuncu", "üçüncü"]:
+        return detected_intents[2] if len(detected_intents) > 2 else None
+    
+    # Keyword-based selection
+    if any(kw in msg for kw in ["fiyat", "fiyatini", "fiyatını", "deger", "değer", "kac para", "kaç para"]):
+        if "price_inquiry" in detected_intents:
+            return "price_inquiry"
+    
+    if any(kw in msg for kw in ["ilan", "sat", "satmak", "satış", "satis"]):
+        if "create_listing" in detected_intents:
+            return "create_listing"
+    
+    if any(kw in msg for kw in ["ara", "arama", "bul", "goster", "göster"]):
+        if "search_listings" in detected_intents:
+            return "search_listings"
+    
+    # If only 2 intents and user says something affirmative
+    if len(detected_intents) == 2 and any(kw in msg for kw in ["evet", "tamam", "olur", "ok"]):
+        # Default to first option
+        return detected_intents[0]
+    
+    return None
+
+
 def is_resume_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
@@ -827,13 +935,29 @@ def is_wallet_balance_command(message: str) -> bool:
     return bool(asks_amount or "kalan" in msg)
 
 
-def sanitize_classified_intent(message: str, classified_intent: str | None) -> str | None:
-    # Post-process router output to avoid accidental lock-in and wrong flows.
-    #
-    # The router can occasionally return intents that require state (e.g. publish/delete)
-    # even when the user did not ask for them. This function constrains those cases.
+def sanitize_classified_intent(message: str, router_result: str | dict | None) -> dict:
+    """
+    Post-process router output to avoid accidental lock-in and wrong flows.
+    
+    Args:
+        message: User's message
+        router_result: Either a string (legacy) or dict from classify_intent
+    
+    Returns:
+        Dict with 'intent' and optional 'detected_intents'
+    """
+    # Handle legacy string return
+    if isinstance(router_result, str):
+        router_result = {"intent": router_result, "detected_intents": []}
+    
+    if not router_result or not isinstance(router_result, dict):
+        return {"intent": "small_talk", "detected_intents": []}
+    
+    classified_intent = router_result.get("intent")
+    detected_intents = router_result.get("detected_intents", [])
+    
     if not classified_intent:
-        return classified_intent
+        return {"intent": "small_talk", "detected_intents": []}
 
     msg = (message or "").strip().lower()
 
@@ -841,10 +965,10 @@ def sanitize_classified_intent(message: str, classified_intent: str | None) -> s
     if classified_intent == "publish_or_delete" and not (is_publish_command(msg) or is_delete_command(msg)):
         # If it looks like a product query, prefer search.
         if is_search_command(msg):
-            return "search_listings"
-        return "small_talk"
+            return {"intent": "search_listings", "detected_intents": []}
+        return {"intent": "small_talk", "detected_intents": []}
 
-    return classified_intent
+    return {"intent": classified_intent, "detected_intents": detected_intents}
 
 
 def draft_is_publishable(draft: Dict[str, Any]) -> bool:
@@ -3593,7 +3717,12 @@ async def process_webchat_message(
 
         if not intent:
             router_agent = IntentRouterAgent()
-            intent = sanitize_classified_intent(message_body, await router_agent.classify_intent(message_body))
+            router_result = await router_agent.classify_intent(message_body)
+            sanitized = sanitize_classified_intent(message_body, router_result)
+            
+            intent = sanitized.get("intent")
+            detected_intents = sanitized.get("detected_intents", [])
+            
             session["intent"] = intent
             intent_reason = "router"
             session_dirty = True
@@ -3604,8 +3733,24 @@ async def process_webchat_message(
                 session_id,
                 session,
                 classified_intent=intent,
+                detected_intents=detected_intents,
             )
-            logger.info(f"WebChat intent for {session_id}: {intent}")
+            logger.info(f"WebChat intent for {session_id}: {intent}, detected_intents: {detected_intents}")
+            
+            # Handle ambiguous intent - ask user to clarify
+            if intent == "ambiguous" and detected_intents:
+                await _handle_ambiguous_intent(
+                    session_id=session_id,
+                    session=session,
+                    detected_intents=detected_intents,
+                    message_body=message_body
+                )
+                return JSONResponse(content={
+                    "message": await _generate_clarification_message(detected_intents, message_body),
+                    "intent": "ambiguous",
+                    "detected_intents": detected_intents,
+                    "session_id": session_id
+                })
 
             # Only lock "task" intents; keep small_talk unlocked.
             if intent in {"create_listing", "search_listings"}:
@@ -3626,6 +3771,70 @@ async def process_webchat_message(
         response_data = {"intent": intent}
         
         # Route to appropriate agent
+        
+        # CLARIFY_INTENT: Special state - user must choose between multiple intents
+        # This is NOT small_talk, it's a decision point with no tool calls or agent invocations
+        if intent == "clarify_intent":
+            # Check if clarification has expired (TTL)
+            pending = session.get("pending_clarification")
+            if isinstance(pending, dict) and pending.get("expires_at"):
+                import time
+                if time.time() > pending.get("expires_at", 0):
+                    # Expired - clear and re-route
+                    session.pop("pending_clarification", None)
+                    session["intent"] = None
+                    session["locked_intent"] = None
+                    session_dirty = True
+                    
+                    # Re-classify with fresh context
+                    router_agent = IntentRouterAgent()
+                    router_result = await router_agent.classify_intent(message_body)
+                    sanitized = sanitize_classified_intent(message_body, router_result)
+                    intent = sanitized.get("intent")
+                    session["intent"] = intent
+                    session_dirty = True
+                    # Continue to normal routing below
+                else:
+                    # Still valid - user is responding to clarification
+                    # Parse their choice (1, 2, or keywords)
+                    detected_intents = pending.get("detected_intents", [])
+                    user_choice = _parse_clarification_choice(message_body, detected_intents)
+                    
+                    if user_choice:
+                        # Clear clarification state
+                        session.pop("pending_clarification", None)
+                        session["intent"] = user_choice
+                        session["locked_intent"] = user_choice if user_choice in {"create_listing", "search_listings"} else None
+                        intent = user_choice
+                        session_dirty = True
+                        
+                        # Acknowledge and proceed
+                        acknowledgment = {
+                            "create_listing": "Tamam, ilan oluşturalım! 📝",
+                            "search_listings": "Hemen arayalım! 🔍",
+                            "price_inquiry": "Fiyat araştırması yapıyorum... 📊"
+                        }.get(user_choice, "Anladım.")
+                        
+                        # Store acknowledgment for use in the actual flow response
+                        session["_clarification_ack"] = acknowledgment
+                        session_dirty = True
+                        
+                        # Continue to normal routing
+                    else:
+                        # User didn't give valid choice - re-prompt
+                        clarification_msg = await _generate_clarification_message(detected_intents, pending.get("original_message", ""))
+                        return JSONResponse(content={
+                            "message": f"Lütfen seçim yapın:\n\n{clarification_msg}",
+                            "intent": "clarify_intent",
+                            "session_id": session_id
+                        })
+            
+            # If we get here without pending_clarification, treat as small_talk
+            if not pending or intent == "clarify_intent":
+                intent = "small_talk"
+                session["intent"] = "small_talk"
+                session_dirty = True
+        
         if intent == "create_listing":
             log_fsm_event(
                 "flow_enter_create_listing",
@@ -4470,6 +4679,81 @@ async def process_webchat_message(
                 "message": publish_payload.get("message", ""),
                 "data": response_data,
                 "intent": publish_payload.get("intent")
+            })
+        
+        elif intent == "price_inquiry":
+            # Price research flow: quick estimation without creating full listing
+            log_fsm_event(
+                "flow_enter_price_inquiry",
+                session_id,
+                session,
+            )
+            
+            # Check if user provided image(s)
+            media_urls = session.get("pending_media_urls") or []
+            
+            if not media_urls:
+                # Ask for image or product details
+                return await finalize_response({
+                    "success": True,
+                    "message": (
+                        "Fiyat araştırması için:\n\n"
+                        "📷 Ürünün fotoğrafını gönderebilirsiniz\n"
+                        "veya\n"
+                        "📝 Ürün bilgilerini yazın (marka, model, durum)\n\n"
+                        "Örnek: 'Samsung S21 128GB, 2. el, temiz'"
+                    ),
+                    "data": {"type": "price_inquiry", "awaiting_input": True},
+                    "intent": intent
+                })
+            
+            # User has media - use vision analysis for price inquiry
+            vision_analyses = session.get("pending_media_analysis") or []
+            
+            if not vision_analyses:
+                # Run vision analysis
+                vision_analyses = await analyze_media_with_vision(media_urls)
+                session["pending_media_analysis"] = vision_analyses
+                session_dirty = True
+            
+            # Extract product info from vision
+            product_info = ""
+            for analysis in vision_analyses:
+                parsed = analysis.get("analysis") or {}
+                if isinstance(parsed, dict):
+                    product = parsed.get("product") or parsed.get("category", "")
+                    if product:
+                        product_info = product
+                        break
+            
+            # Clear pending media
+            session["pending_media_urls"] = []
+            session["pending_media_analysis"] = []
+            session["intent"] = None  # Reset intent
+            session["locked_intent"] = None
+            session_dirty = True
+            
+            # Generate response
+            if product_info:
+                response_msg = (
+                    f"📊 **{product_info}** için fiyat bilgisi:\n\n"
+                    "Piyasa fiyatlarını araştırıyorum... Bu özellik yakında aktif olacak!\n\n"
+                    "Şimdi ne yapmak istersiniz?\n"
+                    "• 'ilan ver' yazarak satış ilanı oluşturabilirsiniz\n"
+                    "• 'benzer ara' yazarak benzer ilanları görebilirsiniz"
+                )
+            else:
+                response_msg = (
+                    "Görselden ürün bilgisi çıkaramadım. 😔\n\n"
+                    "Ürün bilgilerini yazarak tekrar deneyebilirsiniz:\n"
+                    "Örnek: 'Samsung S21 128GB kaç para eder'"
+                )
+            
+            return await finalize_response({
+                "success": True,
+                "message": response_msg,
+                "data": {"type": "price_inquiry", "product": product_info},
+                "intent": "small_talk"  # Reset to allow new flow
             })
         
         elif intent == "search_listings":

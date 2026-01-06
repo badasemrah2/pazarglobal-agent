@@ -21,12 +21,15 @@ class IntentRouterAgent(BaseAgent):
             tools=[]  # No tools needed
         )
     
-    async def classify_intent(self, user_message: str) -> str:
+    async def classify_intent(self, user_message: str) -> dict:
         """
         Classify user message into one of the intents
         
         Returns:
-            Intent string: create_listing, publish_or_delete, search_listings, small_talk
+            Dict with 'intent' and optional 'detected_intents' for ambiguous cases:
+            - intent: primary intent (create_listing, publish_or_delete, search_listings, small_talk, ambiguous)
+            - detected_intents: list of detected intents when ambiguous
+            - confidence: confidence level
         """
         try:
             messages = [
@@ -37,14 +40,22 @@ class IntentRouterAgent(BaseAgent):
             # Use function calling for structured output
             functions = [{
                 "name": "classify_intent",
-                "description": "Classify the user's intent",
+                "description": "Classify the user's intent, detecting multiple intents if present",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "intent": {
                             "type": "string",
-                            "enum": ["create_listing", "publish_or_delete", "search_listings", "small_talk"],
-                            "description": "The classified intent"
+                            "enum": ["create_listing", "publish_or_delete", "search_listings", "small_talk", "ambiguous"],
+                            "description": "The primary classified intent. Use 'ambiguous' if multiple clear intents detected."
+                        },
+                        "detected_intents": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["create_listing", "search_listings", "price_inquiry"]
+                            },
+                            "description": "List of all detected intents when ambiguous. Empty if not ambiguous."
                         },
                         "confidence": {
                             "type": "string",
@@ -66,11 +77,19 @@ class IntentRouterAgent(BaseAgent):
                 tool_call = response.choices[0].message.tool_calls[0]
                 result = json.loads(tool_call.function.arguments)
                 intent = result.get("intent", "small_talk")
-                logger.info(f"Classified intent: {intent}")
-                return intent
+                detected_intents = result.get("detected_intents", [])
+                confidence = result.get("confidence", "medium")
+                
+                logger.info(f"Classified intent: {intent}, detected_intents: {detected_intents}, confidence: {confidence}")
+                
+                return {
+                    "intent": intent,
+                    "detected_intents": detected_intents,
+                    "confidence": confidence
+                }
             
-            return "small_talk"  # Default fallback
+            return {"intent": "small_talk", "detected_intents": [], "confidence": "low"}
         
         except Exception as e:
             logger.error(f"Intent classification error: {e}")
-            return "small_talk"  # Safe fallback
+            return {"intent": "small_talk", "detected_intents": [], "confidence": "low"}

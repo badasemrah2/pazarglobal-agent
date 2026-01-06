@@ -11,6 +11,7 @@ Görevin:
   * publish_or_delete: İlanını yayınlamak veya silmek istiyor  
   * search_listings: İlan aramak veya göz atmak istiyor
   * small_talk: Genel sohbet, platform soruları veya belirsiz niyet
+  * ambiguous: Birden fazla net niyet tespit edildi (kullanıcıya sormak gerekiyor)
 
 Critical Rules:
 - Each clear task query is a new intent; after routing, stay in that workflow unless the user says "vazgectim", "iptal", or "bosver" (these reset intent)
@@ -20,6 +21,24 @@ Critical Rules:
 - Search/Listings intent is task-focused (no chit-chat), each new query is a new intent
 - Once intent is determined, system routes to the appropriate workflow; follow-up like "show details of listing X" stays in the same workflow
 - Return ONLY the intent name in the structured output
+
+Multi-Intent Detection (ÇIKARI AMBIGUOUS):
+- Eğer kullanıcı AYNI mesajda birden fazla farklı görev/niyet belirtiyorsa => ambiguous
+  Örnek ambiguous durumlar:
+  * "samsung s21 var satmak istiyorum kaç para eder" => hem create_listing hem price_inquiry
+  * "iPhone 13 aramak istiyorum ama benim iPhone 11'i de satayım" => hem search hem create
+  * "kaç liraya satabilirim ve nasıl ilan veririm" => hem price_inquiry hem create_listing
+  
+  detected_intents array'ine tespit edilen intentleri ekle:
+  - create_listing: ilan oluşturma/satma isteği var
+  - search_listings: ilan arama/göz atma isteği var  
+  - price_inquiry: fiyat öğrenme/değerleme isteği var ("kaç para eder", "fiyatı ne", "değeri nedir")
+
+- Tek bir ana görev varsa => o intent'i döndür (ambiguous DEĞIL)
+  Örnekler:
+  * "iPhone 13 satmak istiyorum" => create_listing (tek niyet)
+  * "samsung kaç para eder" => small_talk ile handle edilecek genel soru
+  * "göz atmak istiyorum" => search_listings (tek niyet)
 
 Routing Heuristics (Turkish-first):
 - If the user asks availability like "X var mı/varmi/varmı?", "mevcut mu?", "bulunur mu?" => search_listings.
@@ -40,7 +59,9 @@ Routing Heuristics (Turkish-first):
   Cancellation patterns: "iptal", "vazgeç/vazgeçtim", "boşver", "istemiyorum", "ilan oluşturmak istemiyorum", "satmak istemiyorum", "satmayabilirim", "vermeyebilirim"
   These patterns indicate the user is NOT ready to provide information => DO NOT route to create_listing.
 
-Output format: {"intent": "create_listing|publish_or_delete|search_listings|small_talk"}
+Output format: 
+- Tek intent: {"intent": "create_listing|publish_or_delete|search_listings|small_talk"}
+- Multi-intent: {"intent": "ambiguous", "detected_intents": ["create_listing", "price_inquiry"]}
 """
 
 TITLE_AGENT_PROMPT = """Sen PazarGlobal için ilan başlığı uzmanısın 📝
