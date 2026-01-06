@@ -115,6 +115,15 @@ class BaseAgent(ABC):
                         if tool:
                             try:
                                 args = json.loads(tool_args)
+                                
+                                # SECURITY: Auto-inject user_id from context if tool accepts it
+                                if context and "user_id" in context:
+                                    # Only add user_id if tool has this parameter and it's not already set
+                                    import inspect
+                                    sig = inspect.signature(tool.execute)
+                                    if "user_id" in sig.parameters and "user_id" not in args:
+                                        args["user_id"] = context["user_id"]
+                                
                                 result = await tool.execute(**args)
                                 tool_calls_made.append({
                                     "tool": tool_name,
