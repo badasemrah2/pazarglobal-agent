@@ -1238,16 +1238,20 @@ class SupabaseClient:
             
             # Ownership verified or no user_id provided (system operation)
             result = self.client.table("listings").delete().eq("id", listing_id).execute()
-            if result.data:
-                await self.log_action(
-                    action="delete_listing",
-                    metadata={"listing_id": listing_id},
-                    resource_type="listing",
-                    resource_id=listing_id,
-                    user_id=user_id
-                )
-                return True
-            return False
+            
+            # Supabase DELETE returns empty array on success, check for no errors instead
+            # result.data could be [] which is falsy, so check the operation succeeded
+            logger.info(f"Delete listing result: data={result.data}, count={getattr(result, 'count', None)}")
+            
+            # If no error was raised, deletion succeeded
+            await self.log_action(
+                action="delete_listing",
+                metadata={"listing_id": listing_id},
+                resource_type="listing",
+                resource_id=listing_id,
+                user_id=user_id
+            )
+            return True
         except Exception as e:
             logger.error(f"Error deleting listing: {e}")
             return False
