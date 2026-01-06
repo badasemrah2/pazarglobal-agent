@@ -171,42 +171,54 @@ async def _generate_clarification_message(detected_intents: List[str], original_
     """Generate a SHORT user-friendly clarification message for ambiguous intents.
     
     Strategy: Minimal first response, let user choose with 1 word/number.
+    Handles 2-way and 3-way intent conflicts.
     """
     
-    # HARD RULE: price_inquiry + create_listing → always clarify (user wants to learn price first)
-    if "price_inquiry" in detected_intents and "create_listing" in detected_intents:
-        return (
-            "İki konuda yardımcı olabilirim:\n\n"
-            "1️⃣ **Fiyatını öğrenmek** (hızlı değerlendirme)\n"
-            "2️⃣ **Satış ilanı oluşturmak**\n\n"
-            "Hangisiyle başlayalım? (1 veya 2 yazın)"
-        )
+    # Extract product context from message if possible
+    product_hint = ""
+    msg_lower = original_message.lower()
+    for product in ["iphone", "samsung", "ps5", "macbook", "laptop", "telefon"]:
+        if product in msg_lower:
+            product_hint = product.upper() if len(product) <= 4 else product.capitalize()
+            break
     
-    # Build options based on detected intents (short format)
+    intro = f"{product_hint} için ne yapmak istiyorsunuz?" if product_hint else "Ne yapmak istiyorsunuz?"
+    
+    # Build options based on detected intents (priority order)
     options = []
     option_num = 1
     
+    # Always show in this order for consistency
     if "price_inquiry" in detected_intents:
-        options.append(f"{option_num}️⃣ **Fiyat araştırması**")
-        option_num += 1
-    
-    if "create_listing" in detected_intents:
-        options.append(f"{option_num}️⃣ **İlan oluştur**")
+        options.append(f"{option_num}️⃣ **Fiyatını öğrenmek**")
         option_num += 1
     
     if "search_listings" in detected_intents:
-        options.append(f"{option_num}️⃣ **İlan ara**")
+        options.append(f"{option_num}️⃣ **Satılık ilanlarına bakmak**")
         option_num += 1
     
-    message = "Hangi konuda yardımcı olayım?\n\n"
+    if "create_listing" in detected_intents:
+        options.append(f"{option_num}️⃣ **Kendi ilanımı oluşturmak**")
+        option_num += 1
+    
+    # For 3-way conflicts, add helpful note
+    if len(options) >= 3:
+        footer = "\n💡 Birini seçin, diğerlerini sonra yapabiliriz."
+    else:
+        footer = ""
+    
+    message = f"{intro}\n\n"
     message += "\n".join(options)
-    message += "\n\nNumara yazarak seçebilirsiniz."
+    message += footer
     
     return message
 
 
 def _parse_clarification_choice(message: str, detected_intents: List[str]) -> Optional[str]:
     """Parse user's response to clarification prompt.
+    
+    Supports numbers (1/2/3), Turkish words (bir/iki/üç), keywords (fiyat/sat/ara).
+    Detection order matches clarification message: price → search → create
     
     Returns:
         Intent name if valid choice, None otherwise
@@ -215,31 +227,40 @@ def _parse_clarification_choice(message: str, detected_intents: List[str]) -> Op
     if not msg:
         return None
     
-    # Number-based selection (1, 2, 3)
-    if msg in ["1", "bir", "birinci", "ilk"]:
-        return detected_intents[0] if len(detected_intents) > 0 else None
-    if msg in ["2", "iki", "ikinci"]:
-        return detected_intents[1] if len(detected_intents) > 1 else None
-    if msg in ["3", "uc", "üç", "ucuncu", "üçüncü"]:
-        return detected_intents[2] if len(detected_intents) > 2 else None
+    # Build ordered intent list (same order as _generate_clarification_message)
+    ordered_intents = []
+    if "price_inquiry" in detected_intents:
+        ordered_intents.append("price_inquiry")
+    if "search_listings" in detected_intents:
+        ordered_intents.append("search_listings")
+    if "create_listing" in detected_intents:
+        ordered_intents.append("create_listing")
     
-    # Keyword-based selection
-    if any(kw in msg for kw in ["fiyat", "fiyatini", "fiyatını", "deger", "değer", "kac para", "kaç para"]):
+    # Number-based selection with explicit mapping
+    if msg in ["1", "bir", "birinci", "ilk", "1️⃣"]:
+        return ordered_intents[0] if len(ordered_intents) > 0 else None
+    if msg in ["2", "iki", "ikinci", "2️⃣"]:
+        return ordered_intents[1] if len(ordered_intents) > 1 else None
+    if msg in ["3", "uc", "üç", "ucuncu", "üçüncü", "3️⃣"]:
+        return ordered_intents[2] if len(ordered_intents) > 2 else None
+    
+    # Keyword-based selection (expanded for better coverage)
+    if any(kw in msg for kw in ["fiyat", "fiyatini", "fiyatını", "deger", "değer", "kac para", "kaç para", "ogren", "öğren"]):
         if "price_inquiry" in detected_intents:
             return "price_inquiry"
     
-    if any(kw in msg for kw in ["ilan", "sat", "satmak", "satış", "satis"]):
-        if "create_listing" in detected_intents:
-            return "create_listing"
-    
-    if any(kw in msg for kw in ["ara", "arama", "bul", "goster", "göster"]):
+    if any(kw in msg for kw in ["ara", "arama", "bul", "goster", "göster", "bak", "ilanlara", "piyasa", "satilan", "satılan"]):
         if "search_listings" in detected_intents:
             return "search_listings"
     
+    if any(kw in msg for kw in ["ilan olustur", "ilan oluştur", "sat", "satmak", "satış", "satis", "ilan ver", "kendi ilan"]):
+        if "create_listing" in detected_intents:
+            return "create_listing"
+    
     # If only 2 intents and user says something affirmative
     if len(detected_intents) == 2 and any(kw in msg for kw in ["evet", "tamam", "olur", "ok"]):
-        # Default to first option
-        return detected_intents[0]
+        # Default to first option in ordered list
+        return ordered_intents[0]
     
     return None
 

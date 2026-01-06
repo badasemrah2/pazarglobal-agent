@@ -23,22 +23,40 @@ Critical Rules:
 - Return ONLY the intent name in the structured output
 
 Multi-Intent Detection (ÇIKARI AMBIGUOUS):
-- Eğer kullanıcı AYNI mesajda birden fazla farklı görev/niyet belirtiyorsa => ambiguous
-  Örnek ambiguous durumlar:
-  * "samsung s21 var satmak istiyorum kaç para eder" => hem create_listing hem price_inquiry
-  * "iPhone 13 aramak istiyorum ama benim iPhone 11'i de satayım" => hem search hem create
-  * "kaç liraya satabilirim ve nasıl ilan veririm" => hem price_inquiry hem create_listing
+- Eğer kullanıcı AYNI mesajda birden fazla farklı görev/niyet belirtiyorsa => ZORUNLU ambiguous
   
-  detected_intents array'ine tespit edilen intentleri ekle:
-  - create_listing: ilan oluşturma/satma isteği var
-  - search_listings: ilan arama/göz atma isteği var  
-  - price_inquiry: fiyat öğrenme/değerleme isteği var ("kaç para eder", "fiyatı ne", "değeri nedir")
+  🔥 HARD RULES - HER ZAMAN AMBIGUOUS:
+  * price_inquiry + create_listing => "kaç para eder + satmak istiyorum"
+  * price_inquiry + search_listings => "kaç para eder + var mı/piyasada"
+  * create_listing + search_listings => "satmak istiyorum + piyasaya bakmak"
+  * 3'lü combo (hepsi birden) => "satacağım + kaç para + var mı bakabilir miyiz"
+  
+  Ambiguous örnekleri:
+  * "iPhone 13 satacağım ama kaç para eder önce bi bakabilir miyiz" 
+    => [create_listing, price_inquiry]
+  * "Samsung S21 kaç para ediyor piyasada var mı bakabilir miyiz"
+    => [price_inquiry, search_listings]
+  * "Bu fiyata satılanlar varsa ben de ilan gireyim"
+    => [search_listings, create_listing]
+  * "Evde PS5 var satmayı düşünüyorum, kaç para eder, varsa ilanlara da bak"
+    => [create_listing, price_inquiry, search_listings]
+  * "MacBook satmak istiyorum kaç liraya koymalıyım"
+    => [create_listing, price_inquiry]
+  * "iPhone var mı bakayım satacağım"
+    => [search_listings, create_listing]
+  
+  detected_intents array'ine tespit edilen TÜM intentleri ekle:
+  - create_listing: "satmak", "ilan vermek", "ilan oluştur", "satacağım", "satayım"
+  - search_listings: "var mı", "piyasada", "ilanlara bak", "satılanlar", "ara"
+  - price_inquiry: "kaç para", "fiyatı ne", "değeri", "ne kadara", "kaç lira"
+  
+  ⚠️ ÖNEMLİ: 2+ intent varsa => ASLA otomatik akış başlatma, HER ZAMAN clarify
 
 - Tek bir ana görev varsa => o intent'i döndür (ambiguous DEĞIL)
   Örnekler:
   * "iPhone 13 satmak istiyorum" => create_listing (tek niyet)
-  * "samsung kaç para eder" => small_talk ile handle edilecek genel soru
-  * "göz atmak istiyorum" => search_listings (tek niyet)
+  * "samsung var mı" => search_listings (tek niyet)
+  * "nasılsın" => small_talk
 
 Routing Heuristics (Turkish-first):
 - If the user asks availability like "X var mı/varmi/varmı?", "mevcut mu?", "bulunur mu?" => search_listings.
