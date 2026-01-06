@@ -5,7 +5,10 @@ from .base_agent import BaseAgent
 from config.prompts import INTENT_ROUTER_PROMPT
 from services import openai_client
 import json
-from loguru import logger
+from services.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class IntentRouterAgent(BaseAgent):

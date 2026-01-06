@@ -5,8 +5,11 @@ from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 from services import openai_client
 from tools.base_tool import BaseTool
-from loguru import logger
+from services.logger import get_logger
 import json
+
+
+logger = get_logger(__name__)
 
 
 class BaseAgent(ABC):

@@ -10,6 +10,7 @@ import re
 import json
 
 from .metadata_keywords import generate_listing_keywords
+from services.text_normalization import violates_listing_content_guard
 
 
 class InsufficientCreditsError(Exception):
@@ -521,6 +522,10 @@ class SupabaseClient:
     
     async def update_draft_title(self, draft_id: str, title: str) -> bool:
         """Update draft title inside listing_data"""
+        candidate = (title or "").strip()
+        if candidate and violates_listing_content_guard(candidate):
+            logger.info(f"Title guard skipped suspicious payload for draft {draft_id}")
+            return True
         if self._rpc_update_listing_field_available is not False:
             try:
                 result = self.client.rpc("update_listing_field", {
@@ -554,6 +559,10 @@ class SupabaseClient:
     
     async def update_draft_description(self, draft_id: str, description: str) -> bool:
         """Update draft description inside listing_data"""
+        candidate = (description or "").strip()
+        if candidate and violates_listing_content_guard(candidate):
+            logger.info(f"Description guard skipped suspicious payload for draft {draft_id}")
+            return True
         if self._rpc_update_listing_field_available is not False:
             try:
                 result = self.client.rpc("update_listing_field", {

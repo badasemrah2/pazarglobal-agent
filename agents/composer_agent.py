@@ -12,7 +12,7 @@ from typing import Dict, Any, List, Optional
 from loguru import logger
 import asyncio
 import re
-from services.text_normalization import normalize_for_match
+from services.text_normalization import looks_like_image_action_command, normalize_for_match
 
 
 class ComposerAgent(BaseAgent):
@@ -159,6 +159,9 @@ class ComposerAgent(BaseAgent):
                 "user_id": user_id,
                 "media_urls": all_media_urls
             }
+            is_image_command = looks_like_image_action_command(user_message)
+            if is_image_command:
+                context["sub_intent"] = "add_image"
             
             # ALWAYS run all agents in parallel for create_listing intent
             # Each agent's system prompt determines what updates it should make
@@ -186,7 +189,8 @@ class ComposerAgent(BaseAgent):
             want_title = (not title_filled) or _wants_explicit_edit(user_message, "title")
             want_description = (not description_filled) or _wants_explicit_edit(user_message, "description")
 
-            if not (is_command_only and all_media_urls):
+            skip_content_agents = (is_command_only and all_media_urls) or is_image_command
+            if not skip_content_agents:
                 if want_title:
                     tasks.append(self.title_agent.run(user_message, context))
                 if want_description:
@@ -206,8 +210,7 @@ class ComposerAgent(BaseAgent):
                     tasks.append(self.image_agent.run(media_url_item, context))
             else:
                 # Also check if message mentions images without explicit URLs
-                message_lower = normalize_for_match(user_message)
-                if any(word in message_lower for word in ["image", "photo", "resim", "fotoğraf", "görsel", "resim yükle"]):
+                if any(word in (normalized_msg or "") for word in ["image", "photo", "resim", "fotoğraf", "görsel", "resim yükle", "foto"]):
                     tasks.append(self.image_agent.run(user_message, context))
             
             # Execute agents in parallel

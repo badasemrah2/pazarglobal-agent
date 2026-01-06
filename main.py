@@ -5,18 +5,12 @@ FastAPI application with WhatsApp and WebChat integration
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from loguru import logger
 from config import settings
 from api import whatsapp, webchat
-import sys
+from services.logger import get_logger
 
-# Configure logger
-logger.remove()
-logger.add(
-    sys.stderr,
-    level=settings.log_level,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
-)
+# Shared logger instance for this module
+logger = get_logger(__name__)
 
 # Create FastAPI app
 app = FastAPI(

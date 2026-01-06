@@ -51,6 +51,9 @@ async def test_pre_intent_media_buffer_then_create_listing_prompts_next_slot(mon
             return self.drafts.get(draft_id)
 
         async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
+            return self.drafts.get("d1")
+
+        async def get_latest_draft_for_user(self, user_id: str) -> dict[str, Any] | None:
             if not self.drafts:
                 return None
             latest_id = sorted(self.drafts.keys())[-1]
@@ -277,6 +280,56 @@ async def test_help_message_does_not_fill_title_slot(monkeypatch: MonkeyPatch) -
     assert r["success"] is True
     assert r["intent"] == "create_listing"
     assert fake_supabase.update_title_calls == []
+    assert "Ürünün adı" in r["message"]
+
+
+@pytest.mark.asyncio
+async def test_image_action_command_does_not_fill_title_slot(monkeypatch: MonkeyPatch) -> None:
+    webchat = import_webchat(monkeypatch)
+
+    class FakeSupabase:
+        def __init__(self):
+            self.drafts: dict[str, dict[str, Any]] = {
+                "d1": {
+                    "id": "d1",
+                    "listing_data": {"title": None, "description": None, "price": None, "condition": None, "location": None, "category": None},
+                    "images": [{"image_url": "https://example.com/1.jpg", "metadata": {}}],
+                    "vision_product": {},
+                }
+            }
+
+        async def get_draft(self, draft_id: str) -> dict[str, Any] | None:
+            return self.drafts.get(draft_id)
+
+        async def update_draft_title(self, draft_id: str, title: str) -> bool:
+            raise AssertionError("Title should not be updated from an image action command")
+
+    monkeypatch.setattr(webchat, "supabase_client", FakeSupabase())
+
+    webchat.IN_MEMORY_SESSION_CACHE.clear()
+    webchat.IN_MEMORY_SESSION_CACHE["s_action_title"] = {
+        "user_id": "u_action",
+        "intent": "create_listing",
+        "locked_intent": "create_listing",
+        "active_draft_id": "d1",
+        "pending_media_urls": [],
+        "pending_media_analysis": [],
+    }
+
+    class BoomComposer:
+        async def orchestrate_listing_creation(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("ComposerAgent should not run for pure action commands while title slot is missing")
+
+    monkeypatch.setattr(webchat, "ComposerAgent", lambda: BoomComposer())
+
+    r = await webchat.process_webchat_message(
+        message_body="fotoğrafı ilana ekle",
+        session_id="s_action_title",
+        user_id="u_action",
+        media_urls=None,
+    )
+
+    assert r["success"] is True
     assert "Ürünün adı" in r["message"]
 
 

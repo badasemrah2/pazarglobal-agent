@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from loguru import logger
 from pydantic import BaseModel
 
 from agents import (
@@ -28,8 +27,19 @@ from agents import (
 from agents.vision_safety_gate import vision_safety_gate
 from config import settings
 from services import openai_client, redis_client, supabase_client
-from services.text_normalization import canonicalize_condition, normalize_for_match
-from tools import get_wallet_balance_tool, publish_listing_tool
+from services.logger import (
+    bind_session_logger,
+    ensure_session_trace,
+    get_logger,
+    log_fsm_event,
+)
+from services.text_normalization import (
+    canonicalize_condition,
+    looks_like_image_action_command,
+    normalize_for_match,
+    violates_listing_content_guard,
+)
+from tools import delete_listing_tool, get_wallet_balance_tool, publish_listing_tool
 
 
 # In-memory cache for last search results (when Redis is disabled)
@@ -58,6 +68,9 @@ MEDIA_ANALYSIS_USER_PROMPT = (
 FSM_PARK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes of user silence → parked
 FSM_COMPOSER_TIMEOUT_SECONDS = 45   # ComposerAgent hard timeout
 RESUME_KEYWORDS = {"devam", "kaldığımız yerden", "kaldigimiz yerden", "resume", "continue"}
+
+
+logger = get_logger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -90,7 +103,14 @@ def _set_fsm_state(session: Dict[str, Any], state: str, intent: Optional[str] = 
 
 async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any], detail: Dict[str, Any] | None = None) -> None:
     detail = detail or {}
+    log_fsm_event(event, session_id, session, **detail)
+
     try:
+        if not hasattr(supabase_client, "log_action"):
+            bind_session_logger(session_id, session, event=event).debug(
+                "Supabase client lacks log_action, skipping telemetry persist",
+            )
+            return
         meta = {
             "event": event,
             "session_id": session_id,
@@ -101,11 +121,6 @@ async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any]
         }
         meta.update(detail)
 
-        logger.info(f"FSM telemetry: event={event}, session={session_id[:8]}..., detail={detail}")
-
-        if not hasattr(supabase_client, "log_action"):
-            logger.debug(f"Supabase client lacks log_action, skipping telemetry persist for {event}")
-            return
         await supabase_client.log_action(
             action="fsm_event",
             metadata=meta,
@@ -113,10 +128,12 @@ async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any]
             resource_id=session_id,
             user_id=session.get("user_id"),
         )
-        logger.debug(f"FSM telemetry persisted to audit_logs: {event}")
+        bind_session_logger(session_id, session, event=event).debug("FSM telemetry persisted to audit_logs")
     except Exception as e:
         # Telemetry must never break the flow
-        logger.warning(f"FSM telemetry emit failed for {event}: {e}")
+        bind_session_logger(session_id, session, event=event).warning(
+            f"FSM telemetry emit failed: {e}"
+        )
 
 
 def is_resume_command(message: str) -> bool:
@@ -153,6 +170,232 @@ def remove_session_state(session_id: str) -> None:
     """Remove session from fallback cache when Redis is disabled."""
     if redis_is_disabled():
         IN_MEMORY_SESSION_CACHE.pop(session_id, None)
+
+
+SEARCH_CONTEXT_RESULT_LIMIT = 6
+_SEARCH_CONTEXT_KEEP_FIELDS = {
+    "id",
+    "listing_id",
+    "title",
+    "description",
+    "price",
+    "category",
+    "location",
+    "user_location",
+    "user_id",
+    "user_name",
+    "user_phone",
+    "contact_phone",
+    "metadata",
+    "image_url",
+    "images",
+}
+_DETAIL_KEYWORDS = {"goster", "göster", "detay", "incele", "bak", "gösterebilir", "gosterir", "detayini"}
+_THIS_LISTING_KEYWORDS = {
+    "bu ilan",
+    "bu ilani",
+    "bu ilanin",
+    "bu urun",
+    "bu ürün",
+    "az onceki ilan",
+    "az önceki ilan",
+}
+_FOLLOWUP_OWNER_KEYWORDS = {"kime ait", "sahibi", "kimin", "kim satiyor", "kim satıyor"}
+_FOLLOWUP_CONTACT_KEYWORDS = {"telefon", "numara", "iletisim", "iletişim", "ulaş", "ulas"}
+
+
+def _trim_listing_for_context(listing: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(listing, dict):
+        return {}
+    trimmed: Dict[str, Any] = {}
+    for key in _SEARCH_CONTEXT_KEEP_FIELDS:
+        if key in listing:
+            trimmed[key] = listing[key]
+    return trimmed
+
+
+def _get_search_context_results(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ctx = session.get("search_context")
+    results = (ctx or {}).get("results") if isinstance(ctx, dict) else None
+    if isinstance(results, list):
+        return results
+    return []
+
+
+def _store_search_context(session: Dict[str, Any], query: str, listings: Optional[List[Dict[str, Any]]]) -> None:
+    listings = listings or []
+    trimmed = [_trim_listing_for_context(item) for item in listings[:SEARCH_CONTEXT_RESULT_LIMIT]]
+    session["search_context"] = {
+        "search_id": str(uuid.uuid4()),
+        "query": (query or "").strip(),
+        "results": trimmed,
+        "stored_at": _utc_now_iso(),
+    }
+    session["context_mode"] = "search"
+
+
+def _store_active_listing(session: Dict[str, Any], listing: Dict[str, Any], source: str = "search") -> None:
+    trimmed = _trim_listing_for_context(listing)
+    if not trimmed:
+        return
+    session["active_listing_context"] = {
+        "listing": trimmed,
+        "listing_id": str(trimmed.get("id") or trimmed.get("listing_id") or ""),
+        "source": source,
+        "stored_at": _utc_now_iso(),
+    }
+    session["context_mode"] = "view_listing"
+
+
+def _get_active_listing(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ctx = session.get("active_listing_context")
+    if isinstance(ctx, dict) and isinstance(ctx.get("listing"), dict):
+        return ctx.get("listing")
+    return None
+
+
+def _clear_active_listing_if_matches(session: Dict[str, Any], listing_id: Optional[str]) -> None:
+    if not listing_id:
+        return
+    ctx = session.get("active_listing_context")
+    if not isinstance(ctx, dict):
+        return
+    ctx_id = str(ctx.get("listing_id") or "").strip()
+    if ctx_id and ctx_id == str(listing_id).strip():
+        session.pop("active_listing_context", None)
+
+
+def _extract_listing_index(message: str) -> Optional[int]:
+    msg = normalize_for_match(message)
+    if not msg:
+        return None
+    match = re.search(r"(\d{1,3})\s*(?:nolu|no\'lu|no|numarali|numaral[ıi]|\.?)\s*(?:ilan|liste|sirasi|sira)?", msg)
+    if match:
+        idx = int(match.group(1)) - 1
+        if idx >= 0:
+            return idx
+    return None
+
+
+def _references_current_listing(message: str) -> bool:
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    return any(token in msg for token in _THIS_LISTING_KEYWORDS)
+
+
+def _looks_like_listing_detail_request(message: str) -> bool:
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    if any(token in msg for token in _DETAIL_KEYWORDS):
+        return True
+    return _extract_listing_index(message) is not None
+
+
+def _classify_listing_followup_question(message: str) -> Optional[str]:
+    msg = normalize_for_match(message)
+    if not msg:
+        return None
+    if any(token in msg for token in _FOLLOWUP_OWNER_KEYWORDS):
+        return "owner"
+    if any(token in msg for token in _FOLLOWUP_CONTACT_KEYWORDS):
+        return "contact"
+    return None
+
+
+def _listing_contact_text(listing: Dict[str, Any]) -> tuple[str, str]:
+    owner = str(listing.get("user_name") or "Satıcı bilgisi yok").strip()
+    phone = str(listing.get("user_phone") or listing.get("contact_phone") or "Telefon paylaşılmamış").strip()
+    return owner, phone
+
+
+def _listing_belongs_to_user(listing: Dict[str, Any], user_id: Optional[str]) -> bool:
+    if not user_id:
+        return False
+    owner = str(listing.get("user_id") or "").strip()
+    return bool(owner) and owner == str(user_id).strip()
+
+
+def _resolve_listing_reference(
+    session: Dict[str, Any],
+    message: str,
+    session_id: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    listings_ctx = _get_search_context_results(session)
+    idx = _extract_listing_index(message)
+    if idx is not None:
+        if 0 <= idx < len(listings_ctx):
+            return listings_ctx[idx], "search_context"
+        cached = LAST_SEARCH_CACHE.get(session_id) or []
+        if 0 <= idx < len(cached):
+            return _trim_listing_for_context(cached[idx]), "legacy_cache"
+
+    if _references_current_listing(message):
+        active = _get_active_listing(session)
+        if active:
+            return active, "active_listing"
+
+    msg_norm = normalize_for_match(message)
+    if msg_norm and listings_ctx:
+        for entry in listings_ctx:
+            title_norm = normalize_for_match(entry.get("title") or "")
+            if title_norm and title_norm in msg_norm:
+                return entry, "title_match"
+
+    cached = LAST_SEARCH_CACHE.get(session_id) or []
+    if msg_norm and cached:
+        for entry in cached:
+            title_norm = normalize_for_match(entry.get("title") or "")
+            if title_norm and title_norm in msg_norm:
+                return _trim_listing_for_context(entry), "legacy_title_match"
+
+    return None, None
+
+
+def _format_listing_detail_message(listing: Dict[str, Any]) -> str:
+    title = listing.get("title") or "Başlıksız"
+    price = listing.get("price")
+    price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
+    category = listing.get("category") or "Kategori yok"
+    location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
+    owner = listing.get("user_name") or "Satıcı bilgisi yok"
+    phone = listing.get("user_phone") or listing.get("contact_phone") or "Telefon yok"
+    description = listing.get("description") or "Açıklama yok"
+    if len(description) > 600:
+        description = description[:600] + "..."
+
+    image_url = listing.get("image_url")
+    images = listing.get("images") if isinstance(listing.get("images"), list) else []
+    if not image_url and images:
+        first = images[0]
+        if isinstance(first, dict):
+            image_url = first.get("image_url") or first.get("public_url")
+        elif isinstance(first, str):
+            image_url = first
+
+    extra_images: List[str] = []
+    if images:
+        for img in images[1:]:
+            if isinstance(img, dict):
+                url = img.get("image_url") or img.get("public_url")
+            elif isinstance(img, str):
+                url = img
+            else:
+                url = None
+            if url:
+                extra_images.append(url)
+
+    detail_msg = f"![{title}]({image_url})\n" if image_url else ""
+    detail_msg += (
+        f"**{title}**\n{price_txt} | {location} | {category}\n"
+        f"Satıcı: {owner} | Telefon: {phone}\n\nAçıklama:\n{description}"
+    )
+    if extra_images:
+        links = "\n".join([f"[Foto {i + 2}]({url})" for i, url in enumerate(extra_images)])
+        if links:
+            detail_msg += f"\n\nEk görseller:\n{links}"
+    return detail_msg
 
 
 def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
@@ -2188,6 +2431,10 @@ async def process_webchat_message(
                 "active_draft_id": None,
                 "pending_media_urls": [],
                 "pending_media_analysis": [],
+                "search_context": {},
+                "active_listing_context": None,
+                "pending_listing_delete": None,
+                "context_mode": None,
                 "fsm_state": "active",
                 "fsm_state_reason": None,
                 "fsm_state_updated_at": _utc_now_iso(),
@@ -2205,6 +2452,18 @@ async def process_webchat_message(
                 session_dirty = True
             if "pending_media_analysis" not in session:
                 session["pending_media_analysis"] = []
+                session_dirty = True
+            if "search_context" not in session:
+                session["search_context"] = {}
+                session_dirty = True
+            if "active_listing_context" not in session:
+                session["active_listing_context"] = None
+                session_dirty = True
+            if "pending_listing_delete" not in session:
+                session["pending_listing_delete"] = None
+                session_dirty = True
+            if "context_mode" not in session:
+                session["context_mode"] = None
                 session_dirty = True
             if "locked_intent" not in session:
                 session["locked_intent"] = None
@@ -2231,6 +2490,21 @@ async def process_webchat_message(
                 session["last_bot_at"] = None
                 session_dirty = True
 
+        trace_id, trace_added = ensure_session_trace(session)
+        if trace_added:
+            session_dirty = True
+
+        message_preview = (message_body or "").strip()
+        log_fsm_event(
+            "message_received",
+            session_id,
+            session,
+            message_preview=message_preview[:160],
+            has_media=bool(incoming_media_urls),
+            media_count=len(incoming_media_urls),
+            redis_disabled=redis_disabled,
+        )
+
         async def _finalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
             nonlocal session_dirty
             session["last_bot_at"] = _utc_now_iso()
@@ -2238,6 +2512,17 @@ async def process_webchat_message(
                 session_dirty = True
             if session_dirty:
                 await persist_session_state(session_id, session)
+            response_type = None
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                response_type = data.get("type")
+            log_fsm_event(
+                "response_ready",
+                session_id,
+                session,
+                response_type=response_type,
+                intent=payload.get("intent"),
+            )
             return payload
         finalize_response = _finalize_response
 
@@ -2246,7 +2531,13 @@ async def process_webchat_message(
         session["last_user_at"] = now_iso
         session_dirty = True
 
-        logger.debug(f"Session {session_id[:8]}... inactivity: {inactivity_seconds:.1f}s, locked={session.get('locked_intent')}, fsm_state={session.get('fsm_state')}")
+        bind_session_logger(
+            session_id,
+            session,
+            inactivity_seconds=inactivity_seconds,
+        ).debug(
+            "Session heartbeat"
+        )
 
         # Auto-park flows after prolonged silence to avoid stale prompts.
         locked_for_timeout = session.get("locked_intent")
@@ -2370,13 +2661,26 @@ async def process_webchat_message(
                 # Fall through to normal handling
                 pass
 
+        delete_listing_request: Optional[Dict[str, Any]] = None
+        delete_listing_source: Optional[str] = None
+        if is_delete_command(message_body):
+            listing_candidate, listing_source = _resolve_listing_reference(session, message_body, session_id)
+            if listing_candidate:
+                delete_listing_request = {"listing": listing_candidate}
+                delete_listing_source = listing_source or "context"
+
         # If user issues a publish/delete/create command, override any sticky intent.
         # This prevents getting stuck in a previous flow (e.g., search_listings) when the user explicitly
         # changes their mind and wants to sell or publish.
-        if is_publish_command(message_body) or is_delete_command(message_body):
+        wants_publish_delete_intent = is_publish_command(message_body) or (
+            is_delete_command(message_body) and delete_listing_request is None
+        )
+        if wants_publish_delete_intent:
             prev_locked_pub = session.get("locked_intent")
             session["intent"] = "publish_or_delete"
             session["locked_intent"] = "publish_or_delete"
+            intent = "publish_or_delete"
+            intent_reason = "publish_delete_command"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "publish_or_delete")
@@ -2387,6 +2691,8 @@ async def process_webchat_message(
             prev_locked = session.get("locked_intent")
             session["intent"] = "create_listing"
             session["locked_intent"] = "create_listing"
+            intent = "create_listing"
+            intent_reason = "create_command"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "create_listing")
@@ -2399,6 +2705,68 @@ async def process_webchat_message(
                 "role": "user",
                 "content": message_body,
                 "timestamp": str(uuid.uuid1().time)
+            })
+
+        if delete_listing_request:
+            listing = delete_listing_request.get("listing") if isinstance(delete_listing_request, dict) else None
+            listing_id = str((listing or {}).get("id") or (listing or {}).get("listing_id") or "").strip()
+            if not listing or not listing_id:
+                log_fsm_event(
+                    "delete_listing_missing_reference",
+                    session_id,
+                    session,
+                    listing_source=delete_listing_source,
+                )
+                return await finalize_response({
+                    "success": False,
+                    "message": "Hangi ilanı kastettiğini anlayamadım. Önce arama yapıp '1 nolu ilanın detayını göster' diyebilirsin.",
+                    "data": {"type": "listing_action_needed"},
+                    "intent": session.get("intent") or "search_listings",
+                })
+
+            if not _listing_belongs_to_user(listing, user_id):
+                log_fsm_event(
+                    "delete_listing_denied",
+                    session_id,
+                    session,
+                    listing_id=listing_id,
+                    listing_source=delete_listing_source,
+                )
+                return await finalize_response({
+                    "success": False,
+                    "message": "Bu ilan sana ait görünmüyor, bu yüzden silemem. Kendi ilanlarını silmek için önce ilgili ilanı açmalısın.",
+                    "data": {"type": "listing_action_denied", "listing_id": listing_id},
+                    "intent": "search_listings",
+                })
+
+            _store_active_listing(session, listing, source=delete_listing_source or "context")
+            price = listing.get("price")
+            price_txt = f"{price} ₺" if price is not None else "fiyat belirtilmemiş"
+            title = listing.get("title") or "Bu ilan"
+            session["pending_listing_delete"] = {
+                "listing_id": listing_id,
+                "title": title,
+                "price": price,
+                "prompted_at": _utc_now_iso(),
+            }
+            session_dirty = True
+            prompt = f"{title} ({price_txt}) ilanını silmek istediğine emin misin? (evet/hayır)"
+            log_fsm_event(
+                "delete_listing_confirm",
+                session_id,
+                session,
+                listing_id=listing_id,
+                listing_source=delete_listing_source,
+            )
+            return await finalize_response({
+                "success": True,
+                "message": prompt,
+                "data": {
+                    "type": "listing_delete_confirm",
+                    "listing_id": listing_id,
+                    "title": title,
+                },
+                "intent": "search_listings",
             })
 
         # Merge any newly provided media into session-level context
@@ -2964,6 +3332,7 @@ async def process_webchat_message(
         # Get or determine intent
         intent = session.get("intent")
         locked_intent = session.get("locked_intent")
+        intent_reason = "session_cache" if intent else None
 
         # If we somehow ended up in publish/delete without an explicit user request and without
         # a locked publish/delete flow, drop it so we can route normally.
@@ -2995,6 +3364,8 @@ async def process_webchat_message(
         # Publish/delete can still temporarily override.
         if locked_intent and intent != "publish_or_delete":
             intent = locked_intent
+            if intent_reason not in {"publish_delete_command", "create_command"}:
+                intent_reason = "locked_intent"
             if session.get("intent") != intent:
                 session["intent"] = intent
                 session_dirty = True
@@ -3012,6 +3383,7 @@ async def process_webchat_message(
                 session["intent"] = intent
                 session["locked_intent"] = intent
                 locked_intent = intent
+                intent_reason = "command_override"
                 session_dirty = True
                 if not redis_disabled:
                     await redis_client.set_intent(session_id, intent)
@@ -3021,9 +3393,16 @@ async def process_webchat_message(
             router_agent = IntentRouterAgent()
             intent = sanitize_classified_intent(message_body, await router_agent.classify_intent(message_body))
             session["intent"] = intent
+            intent_reason = "router"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, intent)
+            log_fsm_event(
+                "intent_classified",
+                session_id,
+                session,
+                classified_intent=intent,
+            )
             logger.info(f"WebChat intent for {session_id}: {intent}")
 
             # Only lock "task" intents; keep small_talk unlocked.
@@ -3034,10 +3413,24 @@ async def process_webchat_message(
                 session_dirty = True
                 await _record_fsm_event("intent_lock", session_id, session, {"new_intent": intent, "prev_locked": prev_locked_router, "trigger": "router"})
         
+        log_fsm_event(
+            "intent_selected",
+            session_id,
+            session,
+            selected_intent=intent,
+            intent_source=intent_reason,
+        )
+
         response_data = {"intent": intent}
         
         # Route to appropriate agent
         if intent == "create_listing":
+            log_fsm_event(
+                "flow_enter_create_listing",
+                session_id,
+                session,
+                draft_id=session.get("active_draft_id"),
+            )
             # If user asks for market price while we are missing price, answer deterministically.
             # Uses cached Perplexity pipeline on Supabase Edge (market_price_snapshots).
             draft_id = session.get("active_draft_id")
@@ -3374,7 +3767,7 @@ async def process_webchat_message(
 
                 # Title
                 if slot == "title":
-                    if is_command_only_message(message_body):
+                    if is_command_only_message(message_body) or looks_like_image_action_command(message_body):
                         # Photo-first flow: if we have images + vision, auto-seed title/description
                         # and continue instead of saving the command as a title.
                         try:
@@ -3432,8 +3825,17 @@ async def process_webchat_message(
                             "data": {"type": "slot_prompt", "slot": "title", "draft_id": draft_id},
                             "intent": intent,
                         })
-                    if len((message_body or "").strip()) >= 3:
-                        ok = await supabase_client.update_draft_title(draft_id, (message_body or "").strip())
+                    trimmed_title = (message_body or "").strip()
+                    if len(trimmed_title) >= 3:
+                        if violates_listing_content_guard(trimmed_title):
+                            logger.info("Title guard suppressed action command payload for draft %s", draft_id)
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(existing_draft),
+                                "data": {"type": "slot_prompt", "slot": "title", "draft_id": draft_id},
+                                "intent": intent,
+                            })
+                        ok = await supabase_client.update_draft_title(draft_id, trimmed_title)
                         updated = await supabase_client.get_draft(draft_id)
                         if ok or updated:
                             response_data.update({
@@ -3450,7 +3852,7 @@ async def process_webchat_message(
 
                 # Description
                 if slot == "description":
-                    if is_command_only_message(message_body):
+                    if is_command_only_message(message_body) or looks_like_image_action_command(message_body):
                         return await finalize_response({
                             "success": True,
                             "message": build_next_step_message(existing_draft),
@@ -3464,8 +3866,17 @@ async def process_webchat_message(
                             "data": {"type": "slot_prompt", "slot": "description", "draft_id": draft_id},
                             "intent": intent,
                         })
-                    if len((message_body or "").strip()) >= 6:
-                        ok = await supabase_client.update_draft_description(draft_id, (message_body or "").strip())
+                    trimmed_description = (message_body or "").strip()
+                    if len(trimmed_description) >= 6:
+                        if violates_listing_content_guard(trimmed_description):
+                            logger.info("Description guard suppressed action command payload for draft %s", draft_id)
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(existing_draft),
+                                "data": {"type": "slot_prompt", "slot": "description", "draft_id": draft_id},
+                                "intent": intent,
+                            })
+                        ok = await supabase_client.update_draft_description(draft_id, trimmed_description)
                         updated = await supabase_client.get_draft(draft_id)
                         if ok or updated:
                             response_data.update({
@@ -3678,8 +4089,10 @@ async def process_webchat_message(
 
             # Reduce unnecessary LLM load: don't run composer on pure greetings.
             run_composer = True
+            composer_skip_reason = None
             if looks_like_greeting(message_body):
                 run_composer = False
+                composer_skip_reason = "greeting"
 
             # Also don't run composer on pure flow commands like "ilan oluştur" when we already
             # have media in the draft; otherwise title/description agents may hallucinate from
@@ -3690,6 +4103,7 @@ async def process_webchat_message(
                     existing_draft = await supabase_client.get_draft(active_draft_id)
                 if existing_draft and (existing_draft.get("images") or []):
                     run_composer = False
+                    composer_skip_reason = "command_only_with_media"
 
             # Pass no media URLs here because we already consumed pre-intent buffer into the draft.
             # If you later want to support post-lock image uploads in this endpoint, they will still
@@ -3699,6 +4113,13 @@ async def process_webchat_message(
                 active_draft_id = session.get("active_draft_id")
                 composer_draft_id = active_draft_id if isinstance(active_draft_id, str) and active_draft_id else None
                 try:
+                    log_fsm_event(
+                        "agent_invocation",
+                        session_id,
+                        session,
+                        agent="ComposerAgent",
+                        draft_id=composer_draft_id,
+                    )
                     result = await asyncio.wait_for(
                         composer.orchestrate_listing_creation(
                             user_message=message_body,
@@ -3723,6 +4144,23 @@ async def process_webchat_message(
                         "data": {"type": "timeout"},
                         "intent": None,
                     })
+            else:
+                log_fsm_event(
+                    "agent_skipped",
+                    session_id,
+                    session,
+                    agent="ComposerAgent",
+                    reason=composer_skip_reason or "noop",
+                )
+
+            if run_composer:
+                log_fsm_event(
+                    "agent_result",
+                    session_id,
+                    session,
+                    agent="ComposerAgent",
+                    success=bool(isinstance(result, dict) and result.get("success")),
+                )
 
             # If we skipped composer (or composer failed), just read current draft
             if not result:
@@ -3795,6 +4233,12 @@ async def process_webchat_message(
         
         elif intent == "publish_or_delete":
             # Deterministic publish/delete flow to avoid looping confirmations and hallucinated fees.
+            log_fsm_event(
+                "agent_invocation",
+                session_id,
+                session,
+                agent="PublishDeleteFlow",
+            )
             publish_payload = await handle_publish_or_delete_flow(
                 message_body=message_body,
                 session_id=session_id,
@@ -3802,6 +4246,14 @@ async def process_webchat_message(
                 user_id=user_id,
                 redis_disabled=redis_disabled,
                 session_dirty=session_dirty
+            )
+
+            log_fsm_event(
+                "agent_result",
+                session_id,
+                session,
+                agent="PublishDeleteFlow",
+                success=bool(publish_payload.get("success")),
             )
 
             # propagate session_dirty back to outer finalize
@@ -3819,6 +4271,12 @@ async def process_webchat_message(
             })
         
         elif intent == "search_listings":
+            log_fsm_event(
+                "flow_enter_search",
+                session_id,
+                session,
+                search_context_size=len(_get_search_context_results(session)),
+            )
             # If we have pre-intent buffered media analysis, enrich the search query with it.
             if session.get("pending_media_urls") and session.get("pending_media_analysis"):
                 vision_query = extract_vision_search_query(session.get("pending_media_analysis") or [])
@@ -3915,7 +4373,21 @@ async def process_webchat_message(
                     })
 
             composer = SearchComposerAgent()
+            log_fsm_event(
+                "agent_invocation",
+                session_id,
+                session,
+                agent="SearchComposerAgent",
+            )
             result = await composer.orchestrate_search(message_body)
+
+            log_fsm_event(
+                "agent_result",
+                session_id,
+                session,
+                agent="SearchComposerAgent",
+                success=bool(result and result.get("success")),
+            )
 
             if not result or not isinstance(result, dict):
                 return await finalize_response({
@@ -3943,8 +4415,21 @@ async def process_webchat_message(
             })
         
         else:  # small_talk
+            log_fsm_event(
+                "agent_invocation",
+                session_id,
+                session,
+                agent="SmallTalkAgent",
+            )
             agent = SmallTalkAgent()
             response = await agent.run_simple(message_body)
+            log_fsm_event(
+                "agent_result",
+                session_id,
+                session,
+                agent="SmallTalkAgent",
+                success=bool(response),
+            )
 
             response_data["type"] = "conversation"
             return await finalize_response({
@@ -4026,6 +4511,14 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
         session = dict(session)
         if "pending_media_urls" not in session:
             session["pending_media_urls"] = []
+
+    ensure_session_trace(session)
+    log_fsm_event(
+        "media_analyze_request",
+        chat_message.session_id,
+        session,
+        media_count=len(chat_message.media_urls),
+    )
 
     # Keep user identity stable even if the frontend omits user_id.
     # Falling back to session_id prevents creating a new anonymous UUID per request.
