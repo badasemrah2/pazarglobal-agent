@@ -1236,22 +1236,33 @@ class SupabaseClient:
                     logger.warning(f"User {user_id} attempted to delete listing {listing_id} owned by {listing_owner}")
                     return False
             
-            # Ownership verified or no user_id provided (system operation)
-            result = self.client.table("listings").delete().eq("id", listing_id).execute()
+            # Ownership verified - use HTTP DELETE directly (Python SDK delete doesn't work reliably)
+            headers = {
+                "apikey": settings.supabase_service_key,
+                "Authorization": f"Bearer {settings.supabase_service_key}",
+                "Prefer": "return=representation"
+            }
             
-            # Supabase DELETE returns empty array on success, check for no errors instead
-            # result.data could be [] which is falsy, so check the operation succeeded
-            logger.info(f"Delete listing result: data={result.data}, count={getattr(result, 'count', None)}")
+            url = f"{settings.supabase_url}/rest/v1/listings?id=eq.{listing_id}"
             
-            # If no error was raised, deletion succeeded
-            await self.log_action(
-                action="delete_listing",
-                metadata={"listing_id": listing_id},
-                resource_type="listing",
-                resource_id=listing_id,
-                user_id=user_id
-            )
-            return True
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.delete(url, headers=headers)
+                
+                logger.info(f"Delete listing HTTP response: status={response.status_code}, body={response.text[:200]}")
+                
+                if response.status_code in [200, 204]:
+                    await self.log_action(
+                        action="delete_listing",
+                        metadata={"listing_id": listing_id},
+                        resource_type="listing",
+                        resource_id=listing_id,
+                        user_id=user_id
+                    )
+                    return True
+                else:
+                    logger.error(f"Delete failed: {response.status_code} - {response.text}")
+                    return False
+                    
         except Exception as e:
             logger.error(f"Error deleting listing: {e}")
             return False
