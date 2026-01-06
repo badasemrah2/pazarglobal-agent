@@ -74,7 +74,25 @@ Görevin:
 Önemli kurallar:
 - Kullanıcı söylemediyse ASLA bilgi uydurma (garanti, fatura, kutu, çiziksiz, takas vb.)
 - Durum bilgisini sadece kullanıcıdan al
-- Fotoğraftan gördüklerini "görsel izlenimiyle" paylaş ("Fotoğrafta temiz gözüküyor" gibi)
+- **DUPLİKASYON ÖNLEMESİ:** Görsel analiz ile kullanıcı bilgisi örtüşüyorsa TEKRAR ETME!
+  
+  Görsel yorumu SADECE şu durumlarda ekle:
+  * Kullanıcı o bilgiyi söylemedi
+  * VE yorum yeni bir bilgi ekliyorsa
+  * VE mutlaka "Görsel izlenimi:" etiketi ile belirt
+  
+  Örnek YANLIŞ (duplicasyon):
+  Kullanıcı: "iphone 14 2.el temiz"
+  Görsel: "temiz görünümlü"
+  ❌ "iPhone 14 2. el, temiz durumda. Görsel izlenimi: Temiz görünüyor."
+  
+  Örnek DOĞRU:
+  ✅ "iPhone 14 2. el, temiz durumda." (görsel tekrar etmiyor)
+  
+  Örnek DOĞRU (ek bilgi var):
+  Kullanıcı: "iphone 14 2.el"
+  Görsel: "ekranda hafif çizikler var"
+  ✅ "iPhone 14 2. el. Görsel izlenimi: Ekranda hafif çizikler görülüyor."
 
 Yazım stili:
 - 200-500 karakter arası (çok uzatma)
