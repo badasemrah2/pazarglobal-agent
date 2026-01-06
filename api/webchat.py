@@ -2882,6 +2882,23 @@ async def process_webchat_message(
                         }
                     )
                     
+                    logger.info(f"PublishDeleteAgent result for delete: {delete_result}")
+                    
+                    # Check if deletion was actually successful
+                    agent_success = delete_result.get("success", False) if isinstance(delete_result, dict) else False
+                    
+                    if not agent_success:
+                        logger.warning(f"Agent returned non-success result: {delete_result}")
+                        return await finalize_response({
+                            "success": False,
+                            "message": f"❌ İlan silinemedi. {delete_result.get('response', 'Bilinmeyen hata')}",
+                            "data": {
+                                "type": "delete_error",
+                                "listing_id": listing_id,
+                            },
+                            "intent": "search_listings",
+                        })
+                    
                     # Clear listing context after successful deletion
                     session["active_listing_context"] = None
                     session["context_mode"] = None
