@@ -790,6 +790,7 @@ class SupabaseClient:
         """Update draft condition inside listing_data.
         
         Security: Verify draft ownership before update
+        Best-effort: some deployments may not support this field in the RPC.
         """
         if user_id:
             draft = await self.get_draft(draft_id)
@@ -802,8 +803,6 @@ class SupabaseClient:
                 )
                 return False
 
-        Best-effort: some deployments may not support this field in the RPC.
-        """
         if self._rpc_update_listing_field_available is not False and "condition" not in self._rpc_update_listing_field_invalid_fields:
             try:
                 result = self.client.rpc("update_listing_field", {
@@ -894,7 +893,7 @@ class SupabaseClient:
             return False
 
     async def update_draft_allow_no_images(self, draft_id: str, allow_no_images: bool) -> bool:
-        """Persist user's preference to publish without images (listing_data.allow_no_images)."""
+        # Persist user's preference to publish without images (listing_data.allow_no_images).
         if self._rpc_update_listing_field_available is not False:
             try:
                 result = self.client.rpc("update_listing_field", {
