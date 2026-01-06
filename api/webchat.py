@@ -2830,6 +2830,91 @@ async def process_webchat_message(
             session_dirty = True
         user_id = normalized_user_id
 
+        # Deterministic delete listing confirmation (session-based).
+        # Check if there's a pending delete confirmation before processing other logic.
+        pending_delete = session.get("pending_listing_delete")
+        if pending_delete and isinstance(pending_delete, dict):
+            listing_id = pending_delete.get("listing_id")
+            title = pending_delete.get("title") or "İlan"
+            
+            if is_confirm_command(message_body):
+                # User confirmed deletion
+                session["pending_listing_delete"] = None
+                session_dirty = True
+                
+                try:
+                    # Use PublishDeleteAgent to perform actual deletion
+                    from agents.publish_delete_agent import PublishDeleteAgent
+                    pub_del_agent = PublishDeleteAgent()
+                    
+                    delete_result = await pub_del_agent.run(
+                        message=f"delete listing {listing_id}",
+                        user_id=user_id,
+                        session_id=session_id,
+                        context={
+                            "listing_id": listing_id,
+                            "operation": "delete",
+                        }
+                    )
+                    
+                    # Clear listing context after successful deletion
+                    session["active_listing_context"] = None
+                    session["context_mode"] = None
+                    session["locked_intent"] = None
+                    session["intent"] = None
+                    session_dirty = True
+                    
+                    log_fsm_event(
+                        "delete_listing_success",
+                        session_id,
+                        session,
+                        listing_id=listing_id,
+                    )
+                    
+                    return await finalize_response({
+                        "success": True,
+                        "message": f"✅ {title} ilanı silindi.",
+                        "data": {
+                            "type": "listing_deleted",
+                            "listing_id": listing_id,
+                        },
+                        "intent": None,
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Delete listing failed for {listing_id}: {e}")
+                    return await finalize_response({
+                        "success": False,
+                        "message": f"❌ İlan silinirken hata oluştu. Lütfen tekrar dene.",
+                        "data": {
+                            "type": "delete_error",
+                            "listing_id": listing_id,
+                        },
+                        "intent": "search_listings",
+                    })
+            
+            elif is_cancel_command(message_body):
+                # User cancelled deletion
+                session["pending_listing_delete"] = None
+                session_dirty = True
+                
+                log_fsm_event(
+                    "delete_listing_cancel",
+                    session_id,
+                    session,
+                    listing_id=listing_id,
+                )
+                
+                return await finalize_response({
+                    "success": True,
+                    "message": f"Tamam, {title} ilanı silinmedi. Başka bir şey yapabilir miyim?",
+                    "data": {
+                        "type": "delete_cancelled",
+                        "listing_id": listing_id,
+                    },
+                    "intent": "search_listings",
+                })
+
         # Deterministic acceptance of a previously suggested price.
         # This must NOT rely on in-memory session state because Railway may route
         # consecutive requests to different instances when Redis is disabled.
@@ -3568,92 +3653,89 @@ async def process_webchat_message(
         is_interrupt = _is_interrupt_signal(message_body)
         is_meta = _is_meta_question(message_body)
         
-        if locked_intent and (is_interrupt or is_meta):
-            # META QUESTION: Answer directly with listing owner info if available
-            if is_meta:
-                # Try to get listing from context (detail view or search results)
-                active_listing = _get_active_listing(session)
+        # META QUESTION: Answer directly with listing owner info if available (even without locked_intent)
+        if is_meta:
+            # Try to get listing from context (detail view or search results)
+            active_listing = _get_active_listing(session)
+            
+            # If no active listing, check if user references a listing number from search
+            if not active_listing:
+                listing_idx = _extract_listing_index(message_body)
+                if listing_idx is not None:
+                    search_results = _get_search_context_results(session)
+                    if 0 <= listing_idx < len(search_results):
+                        active_listing = search_results[listing_idx]
+            
+            # If we have a listing context, answer the meta question
+            if active_listing:
+                listing_id = active_listing.get("id")  # listings.id (uuid)
+                owner_id = active_listing.get("user_id")  # listings.user_id (uuid)
+                owner_name = active_listing.get("user_name") or "Satıcı"  # listings.user_name (text)
+                owner_phone = active_listing.get("user_phone")  # listings.user_phone (text)
+                listing_title = active_listing.get("title", "Bu ilan")  # listings.title (text)
                 
-                # If no active listing, check if user references a listing number from search
-                if not active_listing:
-                    listing_idx = _extract_listing_index(message_body)
-                    if listing_idx is not None:
-                        search_results = _get_search_context_results(session)
-                        if 0 <= listing_idx < len(search_results):
-                            active_listing = search_results[listing_idx]
+                # OWNERSHIP CHECK: Compare current user_id with listing owner_id
+                is_own_listing = (owner_id and user_id and str(owner_id) == str(user_id))
                 
-                # If we have a listing context, answer the meta question
-                if active_listing:
-                    listing_id = active_listing.get("id")  # listings.id (uuid)
-                    owner_id = active_listing.get("user_id")  # listings.user_id (uuid)
-                    owner_name = active_listing.get("user_name") or "Satıcı"  # listings.user_name (text)
-                    owner_phone = active_listing.get("user_phone")  # listings.user_phone (text)
-                    listing_title = active_listing.get("title", "Bu ilan")  # listings.title (text)
-                    
-                    # OWNERSHIP CHECK: Compare current user_id with listing owner_id
-                    is_own_listing = (owner_id and user_id and str(owner_id) == str(user_id))
-                    
-                    if is_own_listing:
-                        response_msg = f"Bu senin ilanın 😊\n\n📋 {listing_title}"
-                    else:
-                        response_msg = f"👤 **Satıcı:** {owner_name}\n📋 **İlan:** {listing_title}"
-                        if owner_phone:
-                            response_msg += f"\n📞 **İletişim:** {owner_phone}\n\nWhatsApp'tan ulaşabilirsin!"
-                    
-                    # Unlock intent after answering
-                    prev_locked = locked_intent
-                    session.pop("locked_intent", None)
-                    session_dirty = True
-                    if not redis_disabled:
-                        await redis_client.set_intent(session_id, "small_talk")
-                    await _record_fsm_event("meta_question_answered", session_id, session, {
-                        "prev_locked": prev_locked,
+                if is_own_listing:
+                    response_msg = f"Bu senin ilanın 😊\n\n📋 {listing_title}"
+                else:
+                    response_msg = f"👤 **Satıcı:** {owner_name}\n📋 **İlan:** {listing_title}"
+                    if owner_phone:
+                        response_msg += f"\n📞 **İletişim:** {owner_phone}\n\nWhatsApp'tan ulaşabilirsin!"
+                
+                # Unlock intent after answering
+                prev_locked = locked_intent
+                session.pop("locked_intent", None)
+                session_dirty = True
+                if not redis_disabled:
+                    await redis_client.set_intent(session_id, "small_talk")
+                await _record_fsm_event("meta_question_answered", session_id, session, {
+                    "prev_locked": prev_locked,
+                    "listing_id": listing_id,
+                    "is_own_listing": is_own_listing,
+                    "message_preview": message_body[:50]
+                })
+                
+                return await finalize_response({
+                    "success": True,
+                    "message": response_msg,
+                    "data": {
+                        "type": "listing_owner_info",
                         "listing_id": listing_id,
                         "is_own_listing": is_own_listing,
-                        "message_preview": message_body[:50]
-                    })
-                    
-                    return await finalize_response({
-                        "success": True,
-                        "message": response_msg,
-                        "data": {
-                            "type": "listing_owner_info",
-                            "listing_id": listing_id,
-                            "is_own_listing": is_own_listing,
-                            "owner": {
-                                "name": owner_name,
-                                "phone": owner_phone,
-                                "user_id": owner_id,
-                            }
-                        },
-                        "intent": "small_talk",
-                    })
-                else:
-                    # No listing context - ask user to clarify
-                    prev_locked = locked_intent
-                    session.pop("locked_intent", None)
-                    session_dirty = True
-                    
-                    return await finalize_response({
-                        "success": True,
-                        "message": "Hangi ilandan bahsettiğini anlayamadım 🤔 Önce arama yap ve '1 numaralı ilan' gibi belirtebilirsin.",
-                        "data": {"type": "clarification_needed"},
-                        "intent": "small_talk",
-                    })
-            
+                        "owner": {
+                            "name": owner_name,
+                            "phone": owner_phone,
+                            "user_id": owner_id,
+                        }
+                    },
+                    "intent": "small_talk",
+                })
+            else:
+                # No listing context - ask user to clarify
+                return await finalize_response({
+                    "success": True,
+                    "message": "Hangi ilandan bahsettiğini anlayamadım 🤔 Önce arama yap ve '1 numaralı ilan' gibi belirtebilirsin.",
+                    "data": {"type": "clarification_needed"},
+                    "intent": "small_talk",
+                })
+        
+        # INTERRUPT: If locked and user interrupts, unlock and route to small_talk
+        if locked_intent and is_interrupt:
             # INTERRUPT or META without context: unlock intent and route to small_talk
             prev_locked = locked_intent
             session.pop("locked_intent", None)
             session["intent"] = "small_talk"
             intent = "small_talk"
             locked_intent = None
-            intent_reason = "soft_override_interrupt" if is_interrupt else "soft_override_meta"
+            intent_reason = "soft_override_interrupt"
             session_dirty = True
             if not redis_disabled:
                 await redis_client.set_intent(session_id, intent)
             await _record_fsm_event("intent_unlock", session_id, session, {
                 "prev_locked": prev_locked,
-                "trigger": "interrupt" if is_interrupt else "meta_question",
+                "trigger": "interrupt",
                 "message_preview": message_body[:50]
             })
         
@@ -4911,8 +4993,13 @@ async def process_webchat_message(
             })
 
             # Cache full results for follow-up detail requests
+            # Store both in-memory cache AND session for Redis-less environments
             if result.get("listings_full") is not None:
                 LAST_SEARCH_CACHE[session_id] = result["listings_full"]
+                
+                # Also persist in session using proper context manager
+                _store_search_context(session, message_body, result["listings_full"])
+                session_dirty = True
 
             return await finalize_response({
                 "success": result.get("success", False),
