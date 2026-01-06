@@ -2873,12 +2873,12 @@ async def process_webchat_message(
                     pub_del_agent = PublishDeleteAgent()
                     
                     delete_result = await pub_del_agent.run(
-                        message=f"delete listing {listing_id}",
-                        user_id=user_id,
-                        session_id=session_id,
+                        user_message=f"delete listing {listing_id}",
                         context={
                             "listing_id": listing_id,
                             "operation": "delete",
+                            "user_id": user_id,
+                            "session_id": session_id,
                         }
                     )
                     
