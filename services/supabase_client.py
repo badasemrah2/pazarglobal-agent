@@ -89,6 +89,23 @@ class SupabaseClient:
                 settings.supabase_service_key
             )
         return self._client
+    
+    async def set_user_context(self, user_id: str) -> bool:
+        """
+        Set user context for Row Level Security (RLS) policies.
+        Call this before database operations to enforce ownership at database level.
+        
+        This provides defense-in-depth: even if application code forgets to check
+        user_id, the database will enforce ownership via RLS policies.
+        """
+        try:
+            # Set PostgreSQL session variable for RLS policies
+            self.client.rpc('set_user_context', {'p_user_id': user_id}).execute()
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to set user context for RLS: {e}")
+            # Don't fail the operation - application-level checks still work
+            return False
 
     def _normalize_image_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
         """Return a consistent image payload with image_url + metadata."""
@@ -520,12 +537,25 @@ class SupabaseClient:
             logger.warning(f"Failed to clear pending publish state: {e}")
             return False
     
-    async def update_draft_title(self, draft_id: str, title: str) -> bool:
+    async def update_draft_title(self, draft_id: str, title: str, user_id: Optional[str] = None) -> bool:
         """Update draft title inside listing_data"""
         candidate = (title or "").strip()
         if candidate and violates_listing_content_guard(candidate):
             logger.info(f"Title guard skipped suspicious payload for draft {draft_id}")
             return True
+        
+        # Security: Verify draft ownership before update
+        if user_id:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to update title of draft {draft_id} owned by {draft_owner_id}"
+                )
+                return False
+        
         if self._rpc_update_listing_field_available is not False:
             try:
                 result = self.client.rpc("update_listing_field", {
@@ -557,12 +587,25 @@ class SupabaseClient:
             logger.error(f"Error updating title: {e}")
             return False
     
-    async def update_draft_description(self, draft_id: str, description: str) -> bool:
+    async def update_draft_description(self, draft_id: str, description: str, user_id: Optional[str] = None) -> bool:
         """Update draft description inside listing_data"""
         candidate = (description or "").strip()
         if candidate and violates_listing_content_guard(candidate):
             logger.info(f"Description guard skipped suspicious payload for draft {draft_id}")
             return True
+        
+        # Security: Verify draft ownership before update
+        if user_id:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to update description of draft {draft_id} owned by {draft_owner_id}"
+                )
+                return False
+        
         if self._rpc_update_listing_field_available is not False:
             try:
                 result = self.client.rpc("update_listing_field", {
@@ -594,8 +637,20 @@ class SupabaseClient:
             logger.error(f"Error updating description: {e}")
             return False
     
-    async def update_draft_price(self, draft_id: str, price: float) -> bool:
+    async def update_draft_price(self, draft_id: str, price: float, user_id: Optional[str] = None) -> bool:
         """Update draft price inside listing_data"""
+        # Security: Verify draft ownership before update
+        if user_id:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to update price of draft {draft_id} owned by {draft_owner_id}"
+                )
+                return False
+        
         if self._rpc_update_listing_field_available is not False:
             try:
                 result = self.client.rpc("update_listing_field", {
@@ -632,8 +687,20 @@ class SupabaseClient:
             logger.error(f"Error updating price: {e}")
             return False
     
-    async def update_draft_category(self, draft_id: str, category: str, vision_product: Dict[str, Any] = None) -> bool:
+    async def update_draft_category(self, draft_id: str, category: str, vision_product: Dict[str, Any] = None, user_id: Optional[str] = None) -> bool:
         """Update draft category inside listing_data and optionally vision_product"""
+        # Security: Verify draft ownership before update
+        if user_id:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to update category of draft {draft_id} owned by {draft_owner_id}"
+                )
+                return False
+        
         if self._rpc_update_listing_field_available is not False:
             try:
                 rpc_result = self.client.rpc("update_listing_field", {
@@ -672,8 +739,20 @@ class SupabaseClient:
             logger.error(f"Error updating category: {e}")
             return False
 
-    async def update_draft_location(self, draft_id: str, location: str) -> bool:
+    async def update_draft_location(self, draft_id: str, location: str, user_id: Optional[str] = None) -> bool:
         """Update draft location inside listing_data."""
+        # Security: Verify draft ownership before update
+        if user_id:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to update location of draft {draft_id} owned by {draft_owner_id}"
+                )
+                return False
+        
         if self._rpc_update_listing_field_available is not False and "location" not in self._rpc_update_listing_field_invalid_fields:
             try:
                 result = self.client.rpc("update_listing_field", {
@@ -707,8 +786,21 @@ class SupabaseClient:
             logger.error(f"Error updating location: {e}")
             return False
 
-    async def update_draft_condition(self, draft_id: str, condition: str) -> bool:
+    async def update_draft_condition(self, draft_id: str, condition: str, user_id: Optional[str] = None) -> bool:
         """Update draft condition inside listing_data.
+        
+        Security: Verify draft ownership before update
+        """
+        if user_id:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to update condition of draft {draft_id} owned by {draft_owner_id}"
+                )
+                return False
 
         Best-effort: some deployments may not support this field in the RPC.
         """
@@ -959,6 +1051,14 @@ class SupabaseClient:
             if not draft:
                 return None
             
+            # Security: Verify draft ownership before publishing
+            draft_owner_id = draft.get("user_id")
+            if str(draft_owner_id) != str(user_id):
+                logger.warning(
+                    f"User {user_id} attempted to publish draft {draft_id} owned by {draft_owner_id}"
+                )
+                return None
+            
             listing_data = draft.get("listing_data") or {}
             images = self._normalize_images(draft.get("images") or [])
 
@@ -1122,8 +1222,22 @@ class SupabaseClient:
             return None
     
     async def delete_listing(self, listing_id: str, user_id: Optional[str] = None) -> bool:
-        """Delete a listing"""
+        """Delete a listing (with ownership verification)"""
         try:
+            # SECURITY: Verify ownership before deletion
+            if user_id:
+                # First, fetch the listing to verify ownership
+                listing = self.client.table("listings").select("user_id").eq("id", listing_id).execute()
+                if not listing.data:
+                    logger.warning(f"Listing {listing_id} not found for deletion")
+                    return False
+                
+                listing_owner = listing.data[0].get("user_id")
+                if str(listing_owner) != str(user_id):
+                    logger.warning(f"User {user_id} attempted to delete listing {listing_id} owned by {listing_owner}")
+                    return False
+            
+            # Ownership verified or no user_id provided (system operation)
             result = self.client.table("listings").delete().eq("id", listing_id).execute()
             if result.data:
                 await self.log_action(

@@ -1158,7 +1158,7 @@ async def handle_publish_or_delete_flow(
     if pending:
         edit_request = extract_preview_edit(message_body)
         if edit_request:
-            edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"])
+            edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"], user_id)
             if not edit_result.get("success"):
                 return {
                     "success": False,
@@ -1988,7 +1988,7 @@ def extract_preview_edit(message: str) -> Optional[Dict[str, str]]:
     return None
 
 
-async def apply_preview_edit(draft_id: str, field: str, value: str) -> Dict[str, Any]:
+async def apply_preview_edit(draft_id: str, field: str, value: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     if not draft_id:
         return {"success": False, "message": "Henüz başlattığın bir ilan yok 🤷‍♂️"}
     clean_value = (value or "").strip()
@@ -2001,12 +2001,12 @@ async def apply_preview_edit(draft_id: str, field: str, value: str) -> Dict[str,
     if field == "title":
         if len(clean_value) < 3:
             return {"success": False, "message": "Başlık en az 3 karakter olmalı."}
-        success = await supabase_client.update_draft_title(draft_id, clean_value)
+        success = await supabase_client.update_draft_title(draft_id, clean_value, user_id)
         feedback = "Başlık güncellendi."
     elif field == "description":
         if len(clean_value) < 10:
             return {"success": False, "message": "Açıklama biraz daha detaylı olmalı (en az 10 karakter)."}
-        success = await supabase_client.update_draft_description(draft_id, clean_value)
+        success = await supabase_client.update_draft_description(draft_id, clean_value, user_id)
         feedback = "Açıklama güncellendi."
     elif field == "price":
         parsed = parse_price_input(clean_value)
@@ -2836,9 +2836,34 @@ async def process_webchat_message(
         if pending_delete and isinstance(pending_delete, dict):
             listing_id = pending_delete.get("listing_id")
             title = pending_delete.get("title") or "İlan"
+            owner_user_id = pending_delete.get("user_id")  # Listing owner
             
             if is_confirm_command(message_body):
-                # User confirmed deletion
+                # SECURITY: Re-verify ownership before deletion
+                if owner_user_id != user_id:
+                    session["pending_listing_delete"] = None
+                    session_dirty = True
+                    
+                    log_fsm_event(
+                        "delete_listing_denied_ownership",
+                        session_id,
+                        session,
+                        listing_id=listing_id,
+                        attempted_by=user_id,
+                        owner=owner_user_id,
+                    )
+                    
+                    return await finalize_response({
+                        "success": False,
+                        "message": "🚫 Bu ilan sana ait değil. Sadece kendi ilanlarını silebilirsin.",
+                        "data": {
+                            "type": "delete_denied",
+                            "listing_id": listing_id,
+                        },
+                        "intent": "search_listings",
+                    })
+                
+                # User confirmed deletion and ownership verified
                 session["pending_listing_delete"] = None
                 session_dirty = True
                 
@@ -3053,6 +3078,7 @@ async def process_webchat_message(
                 "listing_id": listing_id,
                 "title": title,
                 "price": price,
+                "user_id": listing.get("user_id"),  # Store owner for verification
                 "prompted_at": _utc_now_iso(),
             }
             session_dirty = True
@@ -4100,7 +4126,7 @@ async def process_webchat_message(
                 if draft_ready_for_preview(existing_draft):
                     edit_request = extract_preview_edit(message_body)
                     if edit_request:
-                        edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"])
+                        edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"], user_id)
                         if edit_result.get("success"):
                             updated_draft = edit_result.get("draft") or await supabase_client.get_draft(draft_id) or existing_draft
                             return await finalize_response({
