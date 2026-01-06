@@ -318,6 +318,63 @@ def _classify_listing_followup_question(message: str) -> Optional[str]:
     return None
 
 
+def _is_interrupt_signal(message: str) -> bool:
+    """Detect interrupt signals: 'bişey sorabilir miyim', 'dur bi', 'merak ettim'."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    interrupt_patterns = [
+        r"\bbis[eş]ey\s+sorabilir\s*mi",
+        r"\bsor(abilir|abilmek)\s*mi",
+        r"\bdur\s*(bi|bir)\b",
+        r"\bbekle\b",
+        r"\bmerak\s+ettim\b",
+        r"\bbir\s+dakika\b",
+        r"\b[şs]unu\s+merak\b",
+    ]
+    return any(re.search(pat, msg) for pat in interrupt_patterns)
+
+
+def _is_meta_question(message: str) -> bool:
+    """Detect meta questions about listing: 'kime ait', 'ne zaman', 'nerede'."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    meta_patterns = [
+        r"\bkime\s+ait\b",
+        r"\bkimin\b",
+        r"\bsahibi\b",
+        r"\bkim\s+sat[ıi]yor\b",
+        r"\bne\s+zaman\b",
+        r"\bnerede\b",
+        r"\bhangi\s+(s[eş]hir|b[oö]lge)\b",
+    ]
+    return any(re.search(pat, msg) for pat in meta_patterns)
+
+
+def _search_context_is_stale(session: Dict[str, Any]) -> bool:
+    """Check if search context is stale (no recent search results)."""
+    ctx = session.get("search_context")
+    if not isinstance(ctx, dict):
+        return True
+    results = ctx.get("results")
+    if not isinstance(results, list) or len(results) == 0:
+        return True
+    # Check if stored_at is older than 5 minutes
+    stored_at = ctx.get("stored_at")
+    if not stored_at:
+        return True
+    try:
+        from datetime import datetime, timezone, timedelta
+        stored_time = datetime.fromisoformat(stored_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if now - stored_time > timedelta(minutes=5):
+            return True
+    except Exception:
+        return True
+    return False
+
+
 def _listing_contact_text(listing: Dict[str, Any]) -> tuple[str, str]:
     owner = str(listing.get("user_name") or "Satıcı bilgisi yok").strip()
     phone = str(listing.get("user_phone") or listing.get("contact_phone") or "Telefon paylaşılmamış").strip()
@@ -3360,6 +3417,42 @@ async def process_webchat_message(
                 session["intent"] = None
                 intent = None
                 session_dirty = True
+
+        # SOFT OVERRIDE: Interrupt signals and meta questions can break through locked intents
+        # This MUST come before intent switch ergonomics to allow breaking out
+        is_interrupt = _is_interrupt_signal(message_body)
+        is_meta = _is_meta_question(message_body)
+        
+        if locked_intent and (is_interrupt or is_meta):
+            # Interrupt detected - unlock intent and route to small_talk
+            prev_locked = locked_intent
+            session.pop("locked_intent", None)
+            session["intent"] = "small_talk"
+            intent = "small_talk"
+            locked_intent = None
+            intent_reason = "soft_override_interrupt" if is_interrupt else "soft_override_meta"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, intent)
+            await _record_fsm_event("intent_unlock", session_id, session, {
+                "prev_locked": prev_locked,
+                "trigger": "interrupt" if is_interrupt else "meta_question",
+                "message_preview": message_body[:50]
+            })
+        
+        # SEARCH EXIT: If locked in search but context is stale and no new search query, unlock
+        if locked_intent == "search_listings" and not _looks_like_search_query(message_body):
+            if _search_context_is_stale(session) and not _looks_like_listing_detail_request(message_body):
+                # Search context expired, unlock
+                session.pop("locked_intent", None)
+                locked_intent = None
+                session["intent"] = None
+                intent = None
+                session_dirty = True
+                await _record_fsm_event("search_exit", session_id, session, {
+                    "reason": "context_stale",
+                    "message_preview": message_body[:50]
+                })
 
         # INTENT SWITCH ERGONOMICS:
         # If the user is locked in create_listing but says a clear search command (e.g. "benzer ara"),
