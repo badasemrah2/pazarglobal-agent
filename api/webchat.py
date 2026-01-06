@@ -3424,7 +3424,79 @@ async def process_webchat_message(
         is_meta = _is_meta_question(message_body)
         
         if locked_intent and (is_interrupt or is_meta):
-            # Interrupt detected - unlock intent and route to small_talk
+            # META QUESTION: Answer directly with listing owner info if available
+            if is_meta:
+                # Try to get listing from context (detail view or search results)
+                active_listing = _get_active_listing(session)
+                
+                # If no active listing, check if user references a listing number from search
+                if not active_listing:
+                    listing_idx = _extract_listing_index(message_body)
+                    if listing_idx is not None:
+                        search_results = _get_search_context_results(session)
+                        if 0 <= listing_idx < len(search_results):
+                            active_listing = search_results[listing_idx]
+                
+                # If we have a listing context, answer the meta question
+                if active_listing:
+                    listing_id = active_listing.get("id")  # listings.id (uuid)
+                    owner_id = active_listing.get("user_id")  # listings.user_id (uuid)
+                    owner_name = active_listing.get("user_name") or "Satıcı"  # listings.user_name (text)
+                    owner_phone = active_listing.get("user_phone")  # listings.user_phone (text)
+                    listing_title = active_listing.get("title", "Bu ilan")  # listings.title (text)
+                    
+                    # OWNERSHIP CHECK: Compare current user_id with listing owner_id
+                    is_own_listing = (owner_id and user_id and str(owner_id) == str(user_id))
+                    
+                    if is_own_listing:
+                        response_msg = f"Bu senin ilanın 😊\n\n📋 {listing_title}"
+                    else:
+                        response_msg = f"👤 **Satıcı:** {owner_name}\n📋 **İlan:** {listing_title}"
+                        if owner_phone:
+                            response_msg += f"\n📞 **İletişim:** {owner_phone}\n\nWhatsApp'tan ulaşabilirsin!"
+                    
+                    # Unlock intent after answering
+                    prev_locked = locked_intent
+                    session.pop("locked_intent", None)
+                    session_dirty = True
+                    if not redis_disabled:
+                        await redis_client.set_intent(session_id, "small_talk")
+                    await _record_fsm_event("meta_question_answered", session_id, session, {
+                        "prev_locked": prev_locked,
+                        "listing_id": listing_id,
+                        "is_own_listing": is_own_listing,
+                        "message_preview": message_body[:50]
+                    })
+                    
+                    return await finalize_response({
+                        "success": True,
+                        "message": response_msg,
+                        "data": {
+                            "type": "listing_owner_info",
+                            "listing_id": listing_id,
+                            "is_own_listing": is_own_listing,
+                            "owner": {
+                                "name": owner_name,
+                                "phone": owner_phone,
+                                "user_id": owner_id,
+                            }
+                        },
+                        "intent": "small_talk",
+                    })
+                else:
+                    # No listing context - ask user to clarify
+                    prev_locked = locked_intent
+                    session.pop("locked_intent", None)
+                    session_dirty = True
+                    
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Hangi ilandan bahsettiğini anlayamadım 🤔 Önce arama yap ve '1 numaralı ilan' gibi belirtebilirsin.",
+                        "data": {"type": "clarification_needed"},
+                        "intent": "small_talk",
+                    })
+            
+            # INTERRUPT or META without context: unlock intent and route to small_talk
             prev_locked = locked_intent
             session.pop("locked_intent", None)
             session["intent"] = "small_talk"
