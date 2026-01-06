@@ -1603,7 +1603,7 @@ def build_draft_status_message(draft: Dict[str, Any], include_vision: bool = Tru
 
     if missing:
         message_parts.append(
-            "Eksik bilgiler: " + ", ".join(missing) + ". Lütfen bu detayları yazarak veya fotoğraf yükleyerek paylaşın."
+            "Birkaç şey eksik kalmış: " + ", ".join(missing) + ". Bunları yazabilir ya da fotoğraf gönderebilirsin 📸"
         )
     else:
         message_parts.append("Tüm temel bilgiler tamam. Hazırsanız 'yayınla' yazarak ilanı yayınlayabilirsiniz.")
@@ -1788,7 +1788,7 @@ def extract_preview_edit(message: str) -> Optional[Dict[str, str]]:
 
 async def apply_preview_edit(draft_id: str, field: str, value: str) -> Dict[str, Any]:
     if not draft_id:
-        return {"success": False, "message": "Aktif taslak bulunamadı."}
+        return {"success": False, "message": "Henüz başlattığın bir ilan yok 🤷‍♂️"}
     clean_value = (value or "").strip()
     if not clean_value:
         return {"success": False, "message": "Yeni değeri anlayamadım."}
@@ -1831,7 +1831,7 @@ async def apply_preview_edit(draft_id: str, field: str, value: str) -> Dict[str,
         return {"success": False, "message": "Bu alanı düzenleyemiyorum."}
 
     if not success:
-        return {"success": False, "message": "Değişiklik kaydedilemedi. Lütfen tekrar deneyin."}
+        return {"success": False, "message": "Değişikliği kaydedemedim. Bir daha dener misin? 😅"}
 
     updated = await supabase_client.get_draft(draft_id)
     return {"success": True, "message": feedback, "draft": updated}
@@ -2579,7 +2579,7 @@ async def process_webchat_message(
             )
             return await finalize_response({
                 "success": True,
-                "message": "Bir süredir yanıt alamadım. Akışı park ettim. Devam etmek için 'devam' yazabilir ya da yeniden başlatmak için yeni isteğini yazabilirsin.",
+                "message": "Bir süredir ses çıkmadı, beklemede kaldım 😴 Devam etmek için 'devam' yaz, ya da yeni bir şey söyle."
                 "data": {"type": "parked"},
                 "intent": None,
             })
@@ -2606,14 +2606,14 @@ async def process_webchat_message(
                 await _record_fsm_event("parked_cancel", session_id, session, {})
                 return await finalize_response({
                     "success": True,
-                    "message": "Tamam, bekleyen akışı iptal ettim. Yeni bir işlem başlatabilirsin.",
+                    "message": "Tamam, iptal ettim. Ne yapmak istersin? 😊"
                     "data": {"type": "parked_cancel"},
                     "intent": "small_talk",
                 })
             else:
                 return await finalize_response({
                     "success": True,
-                    "message": "Akış beklemedeydi. Devam etmek için 'devam' yazabilir veya 'iptal' ile sıfırlayabilirsin.",
+                    "message": "Beklemedeydin. 'Devam' yazabilir ya da 'iptal' diyerek baştan başlayabilirsin 🔄"
                     "data": {"type": session.get("fsm_state")},
                     "intent": None,
                 })
@@ -2663,7 +2663,7 @@ async def process_webchat_message(
                             })
                         return await finalize_response({
                             "success": True,
-                            "message": "Fiyatı otomatik yazamadım. Lütfen fiyatı siz yazar mısınız?",
+                            "message": "Fiyatı anlayamadım. Kaç liradan satacaksın? 💰"
                             "data": {"type": "slot_prompt", "slot": "price", "draft_id": draft_id},
                             "intent": "create_listing",
                         })
@@ -2738,7 +2738,7 @@ async def process_webchat_message(
                 )
                 return await finalize_response({
                     "success": False,
-                    "message": "Hangi ilanı kastettiğini anlayamadım. Önce arama yapıp '1 nolu ilanın detayını göster' diyebilirsin.",
+                    "message": "Hangi ilanı demek istediğini anlayamadım. Önce arama yap, sonra '1 numaralı ilanı göster' diyebilirsin 🔎"
                     "data": {"type": "listing_action_needed"},
                     "intent": session.get("intent") or "search_listings",
                 })
@@ -2753,7 +2753,7 @@ async def process_webchat_message(
                 )
                 return await finalize_response({
                     "success": False,
-                    "message": "Bu ilan sana ait görünmüyor, bu yüzden silemem. Kendi ilanlarını silmek için önce ilgili ilanı açmalısın.",
+                    "message": "Bu ilan sana ait değil, silemem 🚫 Sadece kendi ilanlarını silebilirsin."
                     "data": {"type": "listing_action_denied", "listing_id": listing_id},
                     "intent": "search_listings",
                 })
@@ -2839,7 +2839,7 @@ async def process_webchat_message(
                 if not draft_id:
                     return await finalize_response({
                         "success": True,
-                        "message": "Taslağı bulamadım. Lütfen önce 'ilan oluştur' yazarak taslak başlatın.",
+                        "message": "Henüz başlattığın bir ilan yok. 'İlan oluştur' yazarak başlayabilirsin 🆕",
                         "data": {"type": "slot_prompt"},
                         "intent": "create_listing",
                     })
