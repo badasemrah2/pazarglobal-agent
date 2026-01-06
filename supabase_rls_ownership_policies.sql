@@ -1,7 +1,25 @@
 -- Row Level Security Policies for Ownership Verification
--- This provides database-level protection against unauthorized access
--- Works in conjunction with application-level checks for defense-in-depth
+-- ⚠️ DISABLED FOR SERVICE ROLE KEY COMPATIBILITY ⚠️
+--
+-- RLS policies would block service role key (backend server) operations.
+-- Service role key is used for admin operations and needs unrestricted access.
+--
+-- SECURITY APPROACH:
+-- - Application-level checks in supabase_client.py (ACTIVE)
+-- - FSM-level checks in webchat.py (ACTIVE)  
+-- - Database RLS policies (DISABLED - incompatible with service role)
+--
+-- To enable RLS, you would need to:
+-- 1. Use anon key instead of service role key
+-- 2. Implement proper auth.uid() from Supabase Auth
+-- 3. Migrate from phone-based sessions to Supabase Auth users
+--
+-- For now, we rely on application-level ownership verification.
+-- ============================================================================
 
+-- DISABLED: RLS policies commented out to prevent service role key blocking
+
+/*
 -- ============================================================================
 -- ACTIVE_DRAFTS: Users can only access their own drafts
 -- ============================================================================
@@ -103,3 +121,22 @@ $$;
 --    WHERE user_id = 'user123';
 --    -- Expected: 1 row updated
 -- ============================================================================
+*/
+
+-- ============================================================================
+-- ROLLBACK SCRIPT (if RLS was enabled):
+-- ============================================================================
+-- Run this in Supabase SQL Editor to disable RLS and restore service:
+--
+-- ALTER TABLE active_drafts DISABLE ROW LEVEL SECURITY;
+-- ALTER TABLE listings DISABLE ROW LEVEL SECURITY;
+-- DROP POLICY IF EXISTS "Users can read own drafts" ON active_drafts;
+-- DROP POLICY IF EXISTS "Users can create own drafts" ON active_drafts;
+-- DROP POLICY IF EXISTS "Users can update own drafts" ON active_drafts;
+-- DROP POLICY IF EXISTS "Users can delete own drafts" ON active_drafts;
+-- DROP POLICY IF EXISTS "Anyone can read active listings" ON listings;
+-- DROP POLICY IF EXISTS "Users can create own listings" ON listings;
+-- DROP POLICY IF EXISTS "Users can update own listings" ON listings;
+-- DROP POLICY IF EXISTS "Users can delete own listings" ON listings;
+-- ============================================================================
+
