@@ -293,6 +293,20 @@ def _looks_like_listing_detail_request(message: str) -> bool:
     return _extract_listing_index(message) is not None
 
 
+def _looks_like_search_query(message: str) -> bool:
+    """Check if message is a search query (var mı, ara, bul)."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    search_keywords = {
+        "var mi", "var mı", "varmi", "varmı",
+        "mevcut mu", "bulunur mu", "var misin",
+        "ara", "arama", "bul", "ariyorum", "arıyorum",
+        "ihtiyacim var", "ihtiyacım var", "lazim", "lazım"
+    }
+    return any(kw in msg for kw in search_keywords)
+
+
 def _classify_listing_followup_question(message: str) -> Optional[str]:
     msg = normalize_for_match(message)
     if not msg:
@@ -889,11 +903,16 @@ async def handle_publish_or_delete_flow(
     # Only support publish for now (delete can be added similarly)
     draft_id = session.get("active_draft_id")
     if not draft_id:
+        # Gracefully exit: unlock intent and inform user
+        session.pop("locked_intent", None)
+        session["intent"] = None
+        session_dirty = True
         return {
             "success": False,
-            "message": "Aktif bir taslak bulunamadı. Önce 'ilan oluştur' ile taslak başlatın.",
-            "data": {"type": "publish_delete"},
-            "intent": "publish_or_delete"
+            "message": "Henüz bir ilan taslağınız yok. Yayınlamak için önce 'ilan oluştur' yazıp yeni bir ilan başlatabilirsiniz. Ya da ürün aramak isterseniz 'iphone varmı' gibi arama yapabilirsiniz.",
+            "data": {"type": "conversation"},
+            "intent": "small_talk",
+            "_session_dirty": session_dirty
         }
 
     # Read draft
@@ -3345,6 +3364,7 @@ async def process_webchat_message(
         # INTENT SWITCH ERGONOMICS:
         # If the user is locked in create_listing but says a clear search command (e.g. "benzer ara"),
         # don't silently ignore it. Guide them to the explicit cancel keyword.
+        # HOWEVER: if locked in publish_or_delete and user tries to search, allow override.
         if locked_intent == "create_listing" and is_search_command(message_body):
             return await finalize_response({
                 "success": True,
@@ -3359,6 +3379,23 @@ async def process_webchat_message(
                 },
                 "intent": "create_listing",
             })
+        
+        # SEARCH OVERRIDE: Allow search queries to override publish_or_delete lock
+        # when no publish confirmation is pending.
+        if locked_intent == "publish_or_delete" and _looks_like_search_query(message_body):
+            pending_publish = session.get("pending_publish")
+            if not pending_publish or not isinstance(pending_publish, dict):
+                # No pending confirmation; allow search
+                session.pop("locked_intent", None)
+                session["intent"] = "search_listings"
+                session["locked_intent"] = "search_listings"
+                locked_intent = "search_listings"
+                intent = "search_listings"
+                intent_reason = "search_override"
+                session_dirty = True
+                if not redis_disabled:
+                    await redis_client.set_intent(session_id, intent)
+                await _record_fsm_event("intent_lock", session_id, session, {"new_intent": intent, "prev_locked": "publish_or_delete", "trigger": "search_query_override"})
 
         # Sticky intent: once locked_intent is set, do not re-run global routing.
         # Publish/delete can still temporarily override.

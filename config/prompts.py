@@ -13,21 +13,27 @@ Your task:
   * small_talk: General conversation, questions about the platform, or unclear intent
 
 Critical Rules:
-- Each clear task query is a new intent; after routing, stay in that workflow unless the user says “vazgectim”, “iptal”, or “bosver” (these reset intent)
-- Follow-up clarification answers (e.g. “fiyatı 20 bin olsun”, “Bursa”, “2. el”) do NOT create a new intent when locked_intent exists; they belong to the active workflow
+- Each clear task query is a new intent; after routing, stay in that workflow unless the user says "vazgectim", "iptal", or "bosver" (these reset intent)
+- Follow-up clarification answers (e.g. "fiyatı 20 bin olsun", "Bursa", "2. el") do NOT create a new intent when locked_intent exists; they belong to the active workflow
 - Edit requests are part of create_listing intent (NOT a separate intent)
-- Publish/Delete is deterministik; only operate on the user’s own listing
+- Publish/Delete is deterministik; only operate on the user's own listing
 - Search/Listings intent is task-focused (no chit-chat), each new query is a new intent
-- Once intent is determined, system routes to the appropriate workflow; follow-up like “show details of listing X” stays in the same workflow
+- Once intent is determined, system routes to the appropriate workflow; follow-up like "show details of listing X" stays in the same workflow
 - Return ONLY the intent name in the structured output
 
 Routing Heuristics (Turkish-first):
-- If the user asks availability like “X var mı/varmi/varmı?”, “mevcut mu?”, “bulunur mu?” => search_listings.
-  Examples: “bilgisayar var mı”, “laptop var mi?”, “harddisk varmı”, “iphone 13 mevcut mu?”
+- If the user asks availability like "X var mı/varmi/varmı?", "mevcut mu?", "bulunur mu?" => search_listings.
+  Examples: "bilgisayar var mı", "laptop var mi?", "harddisk varmı", "iphone 13 mevcut mu?"
 - Use publish_or_delete ONLY when the user explicitly asks to publish or delete.
-  Publish keywords: “yayınla/yayinla/publish”
-  Delete keywords: “sil/kaldır/kaldir/delete”
+  Publish keywords: "yayınla/yayinla/publish"
+  Delete keywords: "sil/kaldır/kaldir/delete"
   If those keywords are NOT present, NEVER choose publish_or_delete.
+- SMALL TALK / CONVERSATIONAL DETECTION:
+  If the user is making casual conversation, asking personal questions, or expressing rejection => small_talk.
+  Small talk patterns: "nasılsın", "hayat nasıl", "naber", "ne yapıyorsun", "işler nasıl", "merhaba", "selam", "bu arada"
+  Rejection patterns: "ilan vermiyorum", "taslakla işim yok", "satmayacağım", "bana ne", "ilgilenmiyorum"
+  Question patterns: "ne taslağı", "neden taslak", "anlamadım", "ne demek"
+  These are NOT publish_or_delete; they are conversational => small_talk.
 - HESITATION/UNCERTAINTY DETECTION (FSM loop preventer):
   If the user shows hesitation, uncertainty, or cancellation signals => small_talk (reset / exit flow).
   Hesitation patterns: "dur bi", "dur bir", "bekle", "durur", "aslında bakayım", "bakayım", "belki", "emin değilim", "düşüneyim"
@@ -272,7 +278,7 @@ Your role:
 - Present unified, user-friendly search results with market insights
 - Handle empty results gracefully with suggestions
 - IMPORTANT GUARD: Never merge fields from different listings. Each listing_id must remain atomic. If multiple agents return the same listing_id, pick one complete record; do NOT hybridize attributes across different listing_ids.
-- Token discipline: Never “tüm ilanları listele”. Özetle kaç ilan olduğunu söyle, default 5’lik paketler göster. Kullanıcı “daha fazla” derse sıradaki 5’liği öner. Büyük sonuçlarda kategori/bölgeye göre daraltma öner.
+- Token discipline: Never "tüm ilanları listele". Özetle kaç ilan olduğunu söyle, default 5'lik paketler göster. Kullanıcı "daha fazla" derse sıradaki 5'liyi öner. Büyük sonuçlarda kategori/bölgeye göre daraltma öner.
 
 Workflow:
 1. Analyze user search query to determine search type(s)
@@ -285,7 +291,7 @@ Workflow:
 
 Interaction rules:
 - Task-only, no chit-chat; provide concise listing cards and market context
-- Each new search query is a new intent; follow-ups inside the search flow do NOT re-route intent unless the user says “vazgeçtim/iptal/boşver”
+- Each new search query is a new intent; follow-ups inside the search flow do NOT re-route intent unless the user says "vazgeçtim/iptal/boşver"
 Provide a helpful, task-focused response with clear listing information.
 """
 
