@@ -2636,7 +2636,7 @@ async def process_webchat_message(
             )
             return await finalize_response({
                 "success": True,
-                "message": "Bir süredir ses çıkmadı, beklemede kaldım 😴 Devam etmek için 'devam' yaz, ya da yeni bir şey söyle."
+                "message": "Bir süredir ses çıkmadı, beklemede kaldım 😴 Devam etmek için 'devam' yaz, ya da yeni bir şey söyle.",
                 "data": {"type": "parked"},
                 "intent": None,
             })
@@ -2663,14 +2663,14 @@ async def process_webchat_message(
                 await _record_fsm_event("parked_cancel", session_id, session, {})
                 return await finalize_response({
                     "success": True,
-                    "message": "Tamam, iptal ettim. Ne yapmak istersin? 😊"
+                    "message": "Tamam, iptal ettim. Ne yapmak istersin? 😊",
                     "data": {"type": "parked_cancel"},
                     "intent": "small_talk",
                 })
             else:
                 return await finalize_response({
                     "success": True,
-                    "message": "Beklemedeydin. 'Devam' yazabilir ya da 'iptal' diyerek baştan başlayabilirsin 🔄"
+                    "message": "Beklemedeydin. 'Devam' yazabilir ya da 'iptal' diyerek baştan başlayabilirsin 🔄",
                     "data": {"type": session.get("fsm_state")},
                     "intent": None,
                 })
@@ -2720,7 +2720,7 @@ async def process_webchat_message(
                             })
                         return await finalize_response({
                             "success": True,
-                            "message": "Fiyatı anlayamadım. Kaç liradan satacaksın? 💰"
+                            "message": "Fiyatı anlayamadım. Kaç liradan satacaksın? 💰",
                             "data": {"type": "slot_prompt", "slot": "price", "draft_id": draft_id},
                             "intent": "create_listing",
                         })
@@ -2795,7 +2795,7 @@ async def process_webchat_message(
                 )
                 return await finalize_response({
                     "success": False,
-                    "message": "Hangi ilanı demek istediğini anlayamadım. Önce arama yap, sonra '1 numaralı ilanı göster' diyebilirsin 🔎"
+                    "message": "Hangi ilanı demek istediğini anlayamadım. Önce arama yap, sonra '1 numaralı ilanı göster' diyebilirsin 🔎",
                     "data": {"type": "listing_action_needed"},
                     "intent": session.get("intent") or "search_listings",
                 })
@@ -2810,7 +2810,7 @@ async def process_webchat_message(
                 )
                 return await finalize_response({
                     "success": False,
-                    "message": "Bu ilan sana ait değil, silemem 🚫 Sadece kendi ilanlarını silebilirsin."
+                    "message": "Bu ilan sana ait değil, silemem 🚫 Sadece kendi ilanlarını silebilirsin.",
                     "data": {"type": "listing_action_denied", "listing_id": listing_id},
                     "intent": "search_listings",
                 })
