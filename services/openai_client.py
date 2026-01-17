@@ -27,7 +27,8 @@ class OpenAIClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Any] = None
+        tool_choice: Optional[Any] = None,
+        response_format: Optional[Dict[str, Any]] = None
     ) -> Any:
         """
         Create a chat completion following OpenAI SDK patterns
@@ -54,6 +55,9 @@ class OpenAIClient:
             if tools:
                 params["tools"] = tools
                 params["tool_choice"] = tool_choice or "auto"
+
+            if response_format:
+                params["response_format"] = response_format
             
             response = await self.client.chat.completions.create(**params)
             return response

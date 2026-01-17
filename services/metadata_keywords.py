@@ -19,8 +19,12 @@ def _normalize_keyword(token: str) -> Optional[str]:
         return None
 
     # Basic cleanup
+    token = token.replace(".", " ")
     token = re.sub(r"\s+", " ", token)
-    token = token.strip("-•,.;:()[]{}\"'“”‘’")
+    token = token.strip("-•,.;:()[]{}\"'“”‘’`")
+    # Keep only letters/numbers/space/+ (for 1+1 etc.), remove emojis/punctuation
+    token = re.sub(r"[^0-9a-zçğıöşü\+ ]+", "", token, flags=re.IGNORECASE)
+    token = " ".join(token.split())
 
     # Avoid useless tokens
     if token in {"ürün", "esya", "eşya", "satılık", "satilik", "ikinci el", "2. el"}:
@@ -40,6 +44,59 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
         out.append(it)
         seen.add(k)
     return out
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    raw = text.strip()
+
+    # Strip code fences if present
+    if "```" in raw:
+        parts = raw.split("```")
+        # Prefer the first fenced block content
+        for part in parts:
+            candidate = part.strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if "{" in candidate and "}" in candidate:
+                raw = candidate
+                break
+
+    # Extract the first JSON object substring
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = raw[start:end + 1]
+    try:
+        parsed = json.loads(snippet)
+    except Exception:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _fallback_tokens(title: str, category: str, description: str) -> List[str]:
+    def tokenize(text: str) -> List[str]:
+        t = (text or "").lower()
+        raw = re.findall(r"[0-9a-zçğıöşü\+]{2,}", t, flags=re.IGNORECASE)
+        return [r.strip("+") if r.endswith("+") else r for r in raw if r]
+
+    stop = {
+        "satılık", "satilik", "kiralık", "kiralik", "urun", "ürün", "esya", "eşya",
+        "temiz", "az", "kullanılmış", "kullanilmis", "iyi", "durumda", "fiyat", "tl",
+        "acil", "hemen", "pazarlik", "pazarlık",
+    }
+
+    words: List[str] = []
+    for src in [title, category, description]:
+        for w in tokenize(src):
+            if not w or w in stop or len(w) < 2:
+                continue
+            words.append(w)
+    return _dedupe_preserve_order(words)
 
 
 async def generate_listing_keywords(
@@ -82,7 +139,8 @@ async def generate_listing_keywords(
         "Sadece çok genel olmayan ama aramayı kolaylaştıran terimler üret: "
         "ürün türü, kategori, marka, model, varyant, eş anlamlı/üst sınıf terimler (ör: araba/otomobil/araç), "
         "ve ilgili kullanım alanı. "
-        "Yasak: kişi bilgisi/telefon/konum, fiyat, seri numarası." 
+        "Yasak: kişi bilgisi/telefon/konum, fiyat, seri numarası. "
+        "API JSON Schema zorluyor; şema dışına çıkan çıktı reddedilir." 
     )
 
     payload = {
@@ -106,34 +164,74 @@ async def generate_listing_keywords(
     )
 
     try:
-        resp = await openai_client.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-            max_tokens=250,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        data = json.loads(text) if text else {}
-        raw = data.get("keywords") if isinstance(data, dict) else None
-        if not isinstance(raw, list):
-            raw = []
+        last_error: Optional[str] = None
+        for attempt in range(2):
+            retry_note = "\n\nSADECE JSON döndür. Kod bloğu, açıklama veya ekstra metin YAZMA." if attempt == 1 else ""
+            resp = await openai_client.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system + retry_note},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.1,
+                max_tokens=250,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "keywords_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "keywords": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 6,
+                                    "maxItems": 12,
+                                }
+                            },
+                            "required": ["keywords"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            data = _extract_json_object(text)
+            if not data:
+                last_error = "invalid_json"
+                continue
 
-        normed: List[str] = []
-        for t in raw:
-            kw = _normalize_keyword(str(t))
-            if kw:
-                normed.append(kw)
-        normed = _dedupe_preserve_order(normed)
+            raw = data.get("keywords") if isinstance(data, dict) else None
+            if not isinstance(raw, list):
+                last_error = "missing_keywords"
+                continue
 
-        # Cap size
-        normed = normed[: max(1, int(max_keywords))]
+            normed: List[str] = []
+            for t in raw:
+                kw = _normalize_keyword(str(t))
+                if kw:
+                    normed.append(kw)
+            normed = _dedupe_preserve_order(normed)
 
-        return {
-            "keywords": normed,
-            "keywords_text": " ".join(normed),
-        }
+            # Fill to minimum length if needed
+            if len(normed) < 6:
+                extras = _fallback_tokens(title, category, description)
+                for ex in extras:
+                    if len(normed) >= 6:
+                        break
+                    kw = _normalize_keyword(ex)
+                    if kw and kw not in normed:
+                        normed.append(kw)
+
+            # Cap size
+            normed = normed[: max(1, int(max_keywords))]
+
+            return {
+                "keywords": normed,
+                "keywords_text": " ".join(normed),
+            }
+
+        logger.warning(f"Keyword generation failed: {last_error or 'unknown'}")
+        return {"keywords": [], "keywords_text": ""}
     except Exception as e:
         logger.warning(f"Keyword generation failed: {e}")
         return {"keywords": [], "keywords_text": ""}
