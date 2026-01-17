@@ -15,7 +15,7 @@ class PublishListingTool(BaseTool):
         return "publish_listing"
     
     def get_description(self) -> str:
-        return "Publish a draft listing to make it publicly visible. Requires user confirmation."
+        return "Publish a draft listing to make it publicly visible. Requires user confirmation. Credit cost is configured server-side."
     
     def get_parameters(self) -> Dict[str, Any]:
         return {
@@ -28,17 +28,14 @@ class PublishListingTool(BaseTool):
                 "user_id": {
                     "type": "string",
                     "description": "User ID"
-                },
-                "credit_cost": {
-                    "type": "integer",
-                    "description": "Credit cost to deduct on publish (optional)"
                 }
             },
             "required": ["draft_id", "user_id"]
         }
     
-    async def execute(self, draft_id: str, user_id: str, credit_cost: int = 0) -> Dict[str, Any]:
+    async def execute(self, draft_id: str, user_id: str, credit_cost: Optional[int] = None) -> Dict[str, Any]:
         try:
+            # NOTE: credit_cost is ignored by SupabaseClient (cost is deterministic from settings).
             listing = await supabase_client.publish_listing(draft_id, user_id, cost=credit_cost)
         except InsufficientCreditsError as exc:
             return self.format_error(str(exc))
@@ -144,6 +141,26 @@ class SearchListingsTool(BaseTool):
                 # best-effort; keep original
                 pass
 
+        # Try cache first (only for deterministic searches with search_text)
+        from services.redis_client import redis_client
+
+        if search_text:
+            cache_filters = {
+                "category": category,
+                "min_price": min_price,
+                "max_price": max_price,
+                "limit": limit
+            }
+            cached_listings = await redis_client.get_search_cache(search_text, cache_filters)
+            if cached_listings:
+                logger.info(f"✅ Cache HIT for search: {search_text[:50]}")
+                return self.format_success({
+                    "listings": cached_listings,
+                    "count": len(cached_listings),
+                    "cached": True
+                })
+            logger.info(f"⚠️ Cache MISS for search: {search_text[:50]}")
+
         listings = await supabase_client.search_listings(
             category=category,
             min_price=min_price,
@@ -151,6 +168,16 @@ class SearchListingsTool(BaseTool):
             search_text=search_text,
             limit=limit
         )
+
+        # Cache the results for future queries (only if search_text exists)
+        if search_text and listings:
+            cache_filters = {
+                "category": category,
+                "min_price": min_price,
+                "max_price": max_price,
+                "limit": limit
+            }
+            await redis_client.set_search_cache(search_text, listings, cache_filters)
         return self.format_success({
             "listings": listings,
             "count": len(listings)

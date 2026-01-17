@@ -24,7 +24,8 @@ class CategorySearchAgent(BaseAgent):
         super().__init__(
             name="CategorySearchAgent",
             system_prompt=CATEGORY_SEARCH_AGENT_PROMPT,
-            tools=[search_listings_tool]
+            tools=[search_listings_tool],
+            tool_choice={"type": "function", "function": {"name": "search_listings"}},
         )
 
 
@@ -35,7 +36,8 @@ class PriceSearchAgent(BaseAgent):
         super().__init__(
             name="PriceSearchAgent",
             system_prompt=PRICE_SEARCH_AGENT_PROMPT,
-            tools=[search_listings_tool]
+            tools=[search_listings_tool],
+            tool_choice={"type": "function", "function": {"name": "search_listings"}},
         )
 
 
@@ -46,7 +48,8 @@ class ContentSearchAgent(BaseAgent):
         super().__init__(
             name="ContentSearchAgent",
             system_prompt=CONTENT_SEARCH_AGENT_PROMPT,
-            tools=[search_listings_tool]
+            tools=[search_listings_tool],
+            tool_choice={"type": "function", "function": {"name": "search_listings"}},
         )
 
 
@@ -59,11 +62,6 @@ class SearchComposerAgent(BaseAgent):
             system_prompt=SEARCH_COMPOSER_AGENT_PROMPT,
             tools=[search_listings_tool, market_price_tool]
         )
-        
-        # Initialize sub-agents
-        self.category_agent = CategorySearchAgent()
-        self.price_agent = PriceSearchAgent()
-        self.content_agent = ContentSearchAgent()
     
     async def orchestrate_search(
         self,
@@ -85,7 +83,6 @@ class SearchComposerAgent(BaseAgent):
 
             # Deterministic category inference (prevents false 0 results)
             inferred_category = None
-            inferred_category_results = []
             try:
                 from services.category_library import classify_category
 
@@ -93,34 +90,116 @@ class SearchComposerAgent(BaseAgent):
             except Exception:
                 inferred_category = None
 
-            # If the query is mostly a category word (e.g. "araba arıyorum"), do a pure category search.
-            # Passing search_text in that case can AND-filter everything out.
+            # If the query is mostly a category word (e.g. "araba arıyorum"),
+            # avoid over-filtering with a narrow search_text.
             def _category_only_search_text(msg: str) -> str | None:
+                """Return None if query is mostly category-only to avoid over-filtering.
+
+                Keep search_text for specific single-token queries (brands/products)
+                so results don't collapse to a broad category list.
+                """
                 s = (msg or "").strip().lower()
                 if not s:
                     return None
                 tokens = [t for t in re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ]+", s) if t]
                 stop = {
-                    "ariyorum", "arıyorum", "arıyorum", "bakiyorum", "bakıyorum", "bakiyorum", "var", "mi", "mu",
-                    "varmi", "varmı", "istiyorum", "lazim", "lazım", "satilik", "satılık",
+                    "ariyorum",
+                    "arıyorum",
+                    "bakiyorum",
+                    "bakıyorum",
+                    "var",
+                    "mi",
+                    "mu",
+                    "varmi",
+                    "varmı",
+                    "istiyorum",
+                    "lazim",
+                    "lazım",
+                    "satilik",
+                    "satılık",
                 }
-                # If no meaningful tokens beyond stopwords, treat as category-only.
                 meaningful = [t for t in tokens if t not in stop and len(t) >= 3]
-                return user_message if len(meaningful) >= 2 else None
+                if len(meaningful) >= 2:
+                    return msg
 
-            if inferred_category:
-                if getattr(settings, "debug", False):
-                    logger.info(f"[search] inferred_category={inferred_category} query={user_message!r}")
-                try:
-                    tool_res = await search_listings_tool.execute(
-                        category=inferred_category,
-                        search_text=_category_only_search_text(user_message),
-                        limit=20,
-                    )
-                    if tool_res.get("success") and tool_res.get("data", {}).get("listings"):
-                        inferred_category_results = tool_res["data"]["listings"]
-                except Exception:
-                    inferred_category_results = []
+                generic_category_terms = {
+                    "telefon",
+                    "laptop",
+                    "bilgisayar",
+                    "araba",
+                    "ev",
+                    "emlak",
+                    "giyim",
+                    "kıyafet",
+                    "ayakkabı",
+                    "ayakkabi",
+                    "oyuncak",
+                    "bisiklet",
+                    "mobilya",
+                    "koltuk",
+                    "masa",
+                    "sandalye",
+                    "yatak",
+                }
+                if meaningful and meaningful[0] in generic_category_terms:
+                    return None
+
+                return msg
+
+            def _extract_price_filters(msg: str) -> tuple[float | None, float | None]:
+                """Parse common Turkish price range queries."""
+                s = (msg or "").lower()
+                if not s:
+                    return (None, None)
+
+                def _to_number(raw: str) -> float | None:
+                    raw = (raw or "").strip().lower()
+                    if not raw:
+                        return None
+                    raw_clean = re.sub(r"[^0-9.,]", "", raw)
+                    if not raw_clean:
+                        return None
+                    raw_clean = raw_clean.replace(".", "").replace(",", "")
+                    if not raw_clean.isdigit():
+                        return None
+                    try:
+                        return float(int(raw_clean))
+                    except Exception:
+                        return None
+
+                def _apply_multiplier(value: float | None, tail: str) -> float | None:
+                    if value is None:
+                        return None
+                    tail = (tail or "").lower()
+                    if any(k in tail for k in ["milyon", "million"]):
+                        return value * 1_000_000
+                    if any(k in tail for k in ["bin", "k"]):
+                        return value * 1_000
+                    return value
+
+                m_range = re.search(
+                    r"(\d[\d\s\.,]*)\s*(bin|k|milyon|million)?\s*(?:-|–|—|ile|arası|arasi|to)\s*(\d[\d\s\.,]*)\s*(bin|k|milyon|million)?",
+                    s,
+                )
+                if m_range:
+                    a = _apply_multiplier(_to_number(m_range.group(1)), m_range.group(2) or "")
+                    b = _apply_multiplier(_to_number(m_range.group(3)), m_range.group(4) or "")
+                    if a is not None and b is not None:
+                        return (min(a, b), max(a, b))
+
+                m_max = re.search(r"(\d[\d\s\.,]*)\s*(bin|k|milyon|million)?\s*(?:alt[ıi]|altinda|altında|en\s+fazla|maks)\b", s)
+                if m_max:
+                    b = _apply_multiplier(_to_number(m_max.group(1)), m_max.group(2) or "")
+                    return (None, b) if b is not None else (None, None)
+
+                m_min = re.search(r"(?:en\s+az)\s*(\d[\d\s\.,]*)\s*(bin|k|milyon|million)?", s)
+                if not m_min:
+                    m_min = re.search(r"(\d[\d\s\.,]*)\s*(bin|k|milyon|million)?\s*(?:ust[üu]|ustunde|üstü|üstünde|en\s+az|min)\b", s)
+                if m_min:
+                    a = _apply_multiplier(_to_number(m_min.group(1)), m_min.group(2) or "")
+                    return (a, None) if a is not None else (None, None)
+
+                return (None, None)
 
             # If the user is asking a category classification question (not searching listings),
             # answer directly to avoid confusing "0 ilan bulundu" responses.
@@ -175,46 +254,47 @@ class SearchComposerAgent(BaseAgent):
                     "message": msg
                 }
 
-            tasks = []
-            
-            # Determine which search agents to run
-            if any(word in message_lower for word in ["category", "kategori", "type", "tür"]):
-                tasks.append(self.category_agent.run(user_message, context))
-            
-            if any(word in message_lower for word in ["price", "fiyat", "cheap", "ucuz", "expensive", "pahalı", "cost"]):
-                tasks.append(self.price_agent.run(user_message, context))
-            
-            # Always run content search as fallback
-            tasks.append(self.content_agent.run(user_message, context))
-            
-            # Execute searches in parallel
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Combine and deduplicate results
-            all_listings = []
-            seen_ids = set()
+            min_price, max_price = _extract_price_filters(user_message)
 
-            # First merge deterministic category results (high recall)
-            for listing in inferred_category_results:
-                listing_id = (listing or {}).get("id") if isinstance(listing, dict) else None
-                if listing_id and listing_id not in seen_ids:
-                    all_listings.append(listing)
-                    seen_ids.add(listing_id)
-            
-            for result in results:
-                if isinstance(result, dict) and result.get("success"):
-                    for tool_call in result.get("tool_calls", []):
-                        if tool_call.get("result", {}).get("success"):
-                            listings = tool_call["result"]["data"].get("listings", [])
-                            for listing in listings:
-                                # Guard: do not hybridize across listing_ids; pick first occurrence only
-                                listing_id = listing.get("id")
-                                if listing_id and listing_id not in seen_ids:
-                                    all_listings.append(listing)
-                                    seen_ids.add(listing_id)
-            
-            # Fetch market price context
-            market_data = await market_price_tool.execute(product_key=user_message)
+            search_text = user_message
+            if inferred_category:
+                search_text = _category_only_search_text(user_message)
+
+            if getattr(settings, "debug", False):
+                logger.info(
+                    f"[search] fast_path category={inferred_category} min={min_price} max={max_price} search_text={search_text!r}"
+                )
+
+            search_task = search_listings_tool.execute(
+                category=inferred_category,
+                min_price=min_price,
+                max_price=max_price,
+                search_text=search_text,
+                limit=20,
+            )
+            market_task = market_price_tool.execute(product_key=user_message)
+            search_res, market_data = await asyncio.gather(search_task, market_task, return_exceptions=True)
+
+            all_listings = []
+            if isinstance(search_res, dict) and search_res.get("success"):
+                all_listings = (search_res.get("data") or {}).get("listings") or []
+
+            if not all_listings and inferred_category and search_text:
+                try:
+                    fallback = await search_listings_tool.execute(
+                        category=None,
+                        min_price=min_price,
+                        max_price=max_price,
+                        search_text=search_text,
+                        limit=20,
+                    )
+                    if isinstance(fallback, dict) and fallback.get("success"):
+                        all_listings = (fallback.get("data") or {}).get("listings") or []
+                except Exception:
+                    pass
+
+            if not isinstance(market_data, dict):
+                market_data = {}
             insights = []
             if market_data.get("success") and market_data["data"].get("snapshots"):
                 snaps = market_data["data"]["snapshots"]

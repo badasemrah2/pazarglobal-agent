@@ -1,6 +1,4 @@
-"""
-Base agent class following OpenAI SDK patterns
-"""
+"""Base agent class following OpenAI SDK patterns."""
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 from services import openai_client
@@ -15,10 +13,17 @@ logger = get_logger(__name__)
 class BaseAgent(ABC):
     """Base class for all agents following OpenAI best practices"""
     
-    def __init__(self, name: str, system_prompt: str, tools: Optional[List[BaseTool]] = None):
+    def __init__(
+        self,
+        name: str,
+        system_prompt: str,
+        tools: Optional[List[BaseTool]] = None,
+        tool_choice: Optional[Any] = None,
+    ):
         self.name = name
         self.system_prompt = system_prompt
         self.tools = tools or []
+        self.tool_choice = tool_choice
         self.conversation_history: List[Dict[str, str]] = []
     
     def _get_tools_spec(self) -> Optional[List[Dict[str, Any]]]:
@@ -59,6 +64,53 @@ class BaseAgent(ABC):
                 - success: Whether execution succeeded
         """
         try:
+            def _forced_tool_name() -> Optional[str]:
+                tc = self.tool_choice
+                if isinstance(tc, dict):
+                    fn = (tc.get("function") or {}) if isinstance(tc.get("function"), dict) else {}
+                    name = fn.get("name")
+                    return str(name) if name else None
+                return None
+
+            def _shrink_tool_result(tool_name: str, result: Any) -> Any:
+                """Reduce token/payload bloat for tools whose results can be huge."""
+
+                if tool_name != "search_listings":
+                    return result
+
+                if not isinstance(result, dict):
+                    return result
+
+                data = result.get("data")
+                if not isinstance(data, dict):
+                    return result
+
+                listings = data.get("listings")
+                if not isinstance(listings, list):
+                    return result
+
+                preview: list[dict[str, Any]] = []
+                for item in listings[:10]:
+                    if not isinstance(item, dict):
+                        continue
+                    preview.append(
+                        {
+                            "id": item.get("id"),
+                            "title": item.get("title"),
+                            "price": item.get("price"),
+                            "category": item.get("category"),
+                            "location": item.get("location"),
+                            "image_url": item.get("image_url"),
+                            "status": item.get("status"),
+                        }
+                    )
+
+                new_data = dict(data)
+                new_data["listings"] = preview
+                out = dict(result)
+                out["data"] = new_data
+                return out
+
             # Start fresh conversation
             messages = [
                 {"role": "system", "content": self.system_prompt},
@@ -72,6 +124,8 @@ class BaseAgent(ABC):
             
             tool_calls_made = []
             iteration = 0
+            forced = _forced_tool_name()
+            executed_forced_once = False
             
             while iteration < max_iterations:
                 iteration += 1
@@ -79,7 +133,8 @@ class BaseAgent(ABC):
                 # Get completion from OpenAI
                 response = await openai_client.create_chat_completion(
                     messages=messages,
-                    tools=self._get_tools_spec()
+                    tools=self._get_tools_spec(),
+                    tool_choice=self.tool_choice,
                 )
                 
                 assistant_message = response.choices[0].message
@@ -123,6 +178,11 @@ class BaseAgent(ABC):
                                     sig = inspect.signature(tool.execute)
                                     if "user_id" in sig.parameters and "user_id" not in args:
                                         args["user_id"] = context["user_id"]
+
+                                # Enforce single-call tools when tool_choice forces them.
+                                if forced == "search_listings" and tool_name == "search_listings":
+                                    if executed_forced_once:
+                                        continue
                                 
                                 result = await tool.execute(**args)
                                 tool_calls_made.append({
@@ -130,12 +190,15 @@ class BaseAgent(ABC):
                                     "args": args,
                                     "result": result
                                 })
+
+                                if forced == "search_listings" and tool_name == "search_listings":
+                                    executed_forced_once = True
                                 
                                 # Add tool response to messages
                                 messages.append({
                                     "role": "tool",
                                     "tool_call_id": tool_call.id,
-                                    "content": json.dumps(result)
+                                    "content": json.dumps(_shrink_tool_result(tool_name, result))
                                 })
                             except Exception as e:
                                 logger.error(f"Tool execution error: {e}")
@@ -151,6 +214,14 @@ class BaseAgent(ABC):
                                 "content": json.dumps({"error": f"Tool {tool_name} not found"})
                             })
                     
+                    # Special-case: for forced search_listings agents, stop after first tool call.
+                    if forced == "search_listings" and executed_forced_once:
+                        return {
+                            "response": None,
+                            "tool_calls": tool_calls_made,
+                            "success": True,
+                        }
+
                     # Continue loop to get next response
                     continue
                 

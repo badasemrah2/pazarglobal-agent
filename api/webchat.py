@@ -41,12 +41,35 @@ from services.text_normalization import (
 )
 from tools import delete_listing_tool, get_wallet_balance_tool, publish_listing_tool
 
+from api.webchat_store import (
+    IN_MEMORY_SESSION_CACHE,
+    LAST_SEARCH_CACHE,
+    load_session_state,
+    persist_session_state,
+    redis_is_disabled,
+    remove_session_state,
+)
+from api.webchat_search_context import (
+    _classify_listing_followup_question,
+    _clear_active_listing_if_matches,
+    _extract_listing_index,
+    _format_listing_detail_message,
+    _get_active_listing,
+    _get_search_context_results,
+    _is_interrupt_signal,
+    _is_meta_question,
+    _listing_belongs_to_user,
+    _listing_contact_text,
+    _looks_like_listing_detail_request,
+    _looks_like_search_query,
+    _resolve_listing_reference,
+    _search_context_is_stale,
+    _store_active_listing,
+    _store_search_context,
+)
 
-# In-memory cache for last search results (when Redis is disabled)
-LAST_SEARCH_CACHE: Dict[str, List[Any]] = {}
 
-# Local session cache fallback when Redis is disabled
-IN_MEMORY_SESSION_CACHE: Dict[str, Dict[str, Any]] = {}
+# In-memory caches are managed in api.webchat_store
 
 MEDIA_ANALYSIS_SYSTEM_PROMPT = (
     "You are a marketplace vision assistant that returns concise Turkish JSON. "
@@ -270,332 +293,6 @@ def is_resume_command(message: str) -> bool:
     if not msg:
         return False
     return any(token in msg for token in RESUME_KEYWORDS)
-
-
-def redis_is_disabled() -> bool:
-    """Centralize redis enabled/disabled checks."""
-
-    return bool(getattr(redis_client, "disabled", False))
-
-
-async def load_session_state(session_id: str) -> Optional[Dict[str, Any]]:
-    """Load session either from Redis or in-memory fallback."""
-
-    if redis_is_disabled():
-        return IN_MEMORY_SESSION_CACHE.get(session_id)
-    return await redis_client.get_session(session_id)
-
-
-async def persist_session_state(session_id: str, session: Dict[str, Any]) -> None:
-    """Persist session state regardless of backend availability."""
-
-    if redis_is_disabled():
-        IN_MEMORY_SESSION_CACHE[session_id] = session
-        return
-    await redis_client.set_session(session_id, session)
-
-
-def remove_session_state(session_id: str) -> None:
-    """Remove session from fallback cache when Redis is disabled."""
-    if redis_is_disabled():
-        IN_MEMORY_SESSION_CACHE.pop(session_id, None)
-
-
-SEARCH_CONTEXT_RESULT_LIMIT = 6
-_SEARCH_CONTEXT_KEEP_FIELDS = {
-    "id",
-    "listing_id",
-    "title",
-    "description",
-    "price",
-    "category",
-    "location",
-    "user_location",
-    "user_id",
-    "user_name",
-    "user_phone",
-    "contact_phone",
-    "metadata",
-    "image_url",
-    "images",
-}
-_DETAIL_KEYWORDS = {"goster", "göster", "detay", "incele", "bak", "gösterebilir", "gosterir", "detayini"}
-_THIS_LISTING_KEYWORDS = {
-    "bu ilan",
-    "bu ilani",
-    "bu ilanin",
-    "bu urun",
-    "bu ürün",
-    "az onceki ilan",
-    "az önceki ilan",
-}
-_FOLLOWUP_OWNER_KEYWORDS = {"kime ait", "sahibi", "kimin", "kim satiyor", "kim satıyor"}
-_FOLLOWUP_CONTACT_KEYWORDS = {"telefon", "numara", "iletisim", "iletişim", "ulaş", "ulas"}
-
-
-def _trim_listing_for_context(listing: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(listing, dict):
-        return {}
-    trimmed: Dict[str, Any] = {}
-    for key in _SEARCH_CONTEXT_KEEP_FIELDS:
-        if key in listing:
-            trimmed[key] = listing[key]
-    return trimmed
-
-
-def _get_search_context_results(session: Dict[str, Any]) -> List[Dict[str, Any]]:
-    ctx = session.get("search_context")
-    results = (ctx or {}).get("results") if isinstance(ctx, dict) else None
-    if isinstance(results, list):
-        return results
-    return []
-
-
-def _store_search_context(session: Dict[str, Any], query: str, listings: Optional[List[Dict[str, Any]]]) -> None:
-    listings = listings or []
-    trimmed = [_trim_listing_for_context(item) for item in listings[:SEARCH_CONTEXT_RESULT_LIMIT]]
-    session["search_context"] = {
-        "search_id": str(uuid.uuid4()),
-        "query": (query or "").strip(),
-        "results": trimmed,
-        "stored_at": _utc_now_iso(),
-    }
-    session["context_mode"] = "search"
-
-
-def _store_active_listing(session: Dict[str, Any], listing: Dict[str, Any], source: str = "search") -> None:
-    trimmed = _trim_listing_for_context(listing)
-    if not trimmed:
-        return
-    session["active_listing_context"] = {
-        "listing": trimmed,
-        "listing_id": str(trimmed.get("id") or trimmed.get("listing_id") or ""),
-        "source": source,
-        "stored_at": _utc_now_iso(),
-    }
-    session["context_mode"] = "view_listing"
-
-
-def _get_active_listing(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    ctx = session.get("active_listing_context")
-    if isinstance(ctx, dict) and isinstance(ctx.get("listing"), dict):
-        return ctx.get("listing")
-    return None
-
-
-def _clear_active_listing_if_matches(session: Dict[str, Any], listing_id: Optional[str]) -> None:
-    if not listing_id:
-        return
-    ctx = session.get("active_listing_context")
-    if not isinstance(ctx, dict):
-        return
-    ctx_id = str(ctx.get("listing_id") or "").strip()
-    if ctx_id and ctx_id == str(listing_id).strip():
-        session.pop("active_listing_context", None)
-
-
-def _extract_listing_index(message: str) -> Optional[int]:
-    msg = normalize_for_match(message)
-    if not msg:
-        return None
-    match = re.search(r"(\d{1,3})\s*(?:nolu|no\'lu|no|numarali|numaral[ıi]|\.?)\s*(?:ilan|liste|sirasi|sira)?", msg)
-    if match:
-        idx = int(match.group(1)) - 1
-        if idx >= 0:
-            return idx
-    return None
-
-
-def _references_current_listing(message: str) -> bool:
-    msg = normalize_for_match(message)
-    if not msg:
-        return False
-    return any(token in msg for token in _THIS_LISTING_KEYWORDS)
-
-
-def _looks_like_listing_detail_request(message: str) -> bool:
-    msg = normalize_for_match(message)
-    if not msg:
-        return False
-    if any(token in msg for token in _DETAIL_KEYWORDS):
-        return True
-    return _extract_listing_index(message) is not None
-
-
-def _looks_like_search_query(message: str) -> bool:
-    """Check if message is a search query (var mı, ara, bul)."""
-    msg = normalize_for_match(message)
-    if not msg:
-        return False
-    search_keywords = {
-        "var mi", "var mı", "varmi", "varmı",
-        "mevcut mu", "bulunur mu", "var misin",
-        "ara", "arama", "bul", "ariyorum", "arıyorum",
-        "ihtiyacim var", "ihtiyacım var", "lazim", "lazım"
-    }
-    return any(kw in msg for kw in search_keywords)
-
-
-def _classify_listing_followup_question(message: str) -> Optional[str]:
-    msg = normalize_for_match(message)
-    if not msg:
-        return None
-    if any(token in msg for token in _FOLLOWUP_OWNER_KEYWORDS):
-        return "owner"
-    if any(token in msg for token in _FOLLOWUP_CONTACT_KEYWORDS):
-        return "contact"
-    return None
-
-
-def _is_interrupt_signal(message: str) -> bool:
-    """Detect interrupt signals: 'bişey sorabilir miyim', 'dur bi', 'merak ettim'."""
-    msg = normalize_for_match(message)
-    if not msg:
-        return False
-    interrupt_patterns = [
-        r"\bbis[eş]ey\s+sorabilir\s*mi",
-        r"\bsor(abilir|abilmek)\s*mi",
-        r"\bdur\s*(bi|bir)\b",
-        r"\bbekle\b",
-        r"\bmerak\s+ettim\b",
-        r"\bbir\s+dakika\b",
-        r"\b[şs]unu\s+merak\b",
-    ]
-    return any(re.search(pat, msg) for pat in interrupt_patterns)
-
-
-def _is_meta_question(message: str) -> bool:
-    """Detect meta questions about listing: 'kime ait', 'ne zaman', 'nerede'."""
-    msg = normalize_for_match(message)
-    if not msg:
-        return False
-    meta_patterns = [
-        r"\bkime\s+ait\b",
-        r"\bkimin\b",
-        r"\bsahibi\b",
-        r"\bkim\s+sat[ıi]yor\b",
-        r"\bne\s+zaman\b",
-        r"\bnerede\b",
-        r"\bhangi\s+(s[eş]hir|b[oö]lge)\b",
-    ]
-    return any(re.search(pat, msg) for pat in meta_patterns)
-
-
-def _search_context_is_stale(session: Dict[str, Any]) -> bool:
-    """Check if search context is stale (no recent search results)."""
-    ctx = session.get("search_context")
-    if not isinstance(ctx, dict):
-        return True
-    results = ctx.get("results")
-    if not isinstance(results, list) or len(results) == 0:
-        return True
-    # Check if stored_at is older than 5 minutes
-    stored_at = ctx.get("stored_at")
-    if not stored_at:
-        return True
-    try:
-        from datetime import datetime, timezone, timedelta
-        stored_time = datetime.fromisoformat(stored_at.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        if now - stored_time > timedelta(minutes=5):
-            return True
-    except Exception:
-        return True
-    return False
-
-
-def _listing_contact_text(listing: Dict[str, Any]) -> tuple[str, str]:
-    owner = str(listing.get("user_name") or "Satıcı bilgisi yok").strip()
-    phone = str(listing.get("user_phone") or listing.get("contact_phone") or "Telefon paylaşılmamış").strip()
-    return owner, phone
-
-
-def _listing_belongs_to_user(listing: Dict[str, Any], user_id: Optional[str]) -> bool:
-    if not user_id:
-        return False
-    owner = str(listing.get("user_id") or "").strip()
-    return bool(owner) and owner == str(user_id).strip()
-
-
-def _resolve_listing_reference(
-    session: Dict[str, Any],
-    message: str,
-    session_id: str,
-) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    listings_ctx = _get_search_context_results(session)
-    idx = _extract_listing_index(message)
-    if idx is not None:
-        if 0 <= idx < len(listings_ctx):
-            return listings_ctx[idx], "search_context"
-        cached = LAST_SEARCH_CACHE.get(session_id) or []
-        if 0 <= idx < len(cached):
-            return _trim_listing_for_context(cached[idx]), "legacy_cache"
-
-    if _references_current_listing(message):
-        active = _get_active_listing(session)
-        if active:
-            return active, "active_listing"
-
-    msg_norm = normalize_for_match(message)
-    if msg_norm and listings_ctx:
-        for entry in listings_ctx:
-            title_norm = normalize_for_match(entry.get("title") or "")
-            if title_norm and title_norm in msg_norm:
-                return entry, "title_match"
-
-    cached = LAST_SEARCH_CACHE.get(session_id) or []
-    if msg_norm and cached:
-        for entry in cached:
-            title_norm = normalize_for_match(entry.get("title") or "")
-            if title_norm and title_norm in msg_norm:
-                return _trim_listing_for_context(entry), "legacy_title_match"
-
-    return None, None
-
-
-def _format_listing_detail_message(listing: Dict[str, Any]) -> str:
-    title = listing.get("title") or "Başlıksız"
-    price = listing.get("price")
-    price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
-    category = listing.get("category") or "Kategori yok"
-    location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
-    owner = listing.get("user_name") or "Satıcı bilgisi yok"
-    phone = listing.get("user_phone") or listing.get("contact_phone") or "Telefon yok"
-    description = listing.get("description") or "Açıklama yok"
-    if len(description) > 600:
-        description = description[:600] + "..."
-
-    image_url = listing.get("image_url")
-    images = listing.get("images") if isinstance(listing.get("images"), list) else []
-    if not image_url and images:
-        first = images[0]
-        if isinstance(first, dict):
-            image_url = first.get("image_url") or first.get("public_url")
-        elif isinstance(first, str):
-            image_url = first
-
-    extra_images: List[str] = []
-    if images:
-        for img in images[1:]:
-            if isinstance(img, dict):
-                url = img.get("image_url") or img.get("public_url")
-            elif isinstance(img, str):
-                url = img
-            else:
-                url = None
-            if url:
-                extra_images.append(url)
-
-    detail_msg = f"![{title}]({image_url})\n" if image_url else ""
-    detail_msg += (
-        f"**{title}**\n{price_txt} | {location} | {category}\n"
-        f"Satıcı: {owner} | Telefon: {phone}\n\nAçıklama:\n{description}"
-    )
-    if extra_images:
-        links = "\n".join([f"[Foto {i + 2}]({url})" for i, url in enumerate(extra_images)])
-        if links:
-            detail_msg += f"\n\nEk görseller:\n{links}"
-    return detail_msg
 
 
 def merge_unique_urls(existing: List[str], new_urls: List[str]) -> List[str]:
