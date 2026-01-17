@@ -15,6 +15,7 @@ import json
 from loguru import logger
 import re
 from config import settings
+from services.text_normalization import normalize_for_match
 
 
 class CategorySearchAgent(BaseAgent):
@@ -80,6 +81,54 @@ class SearchComposerAgent(BaseAgent):
         """
         try:
             message_lower = user_message.lower()
+
+            def _clean_search_query(msg: str) -> str | None:
+                if not msg:
+                    return None
+                raw_tokens = re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ\+]+", msg)
+                if not raw_tokens:
+                    return None
+                stop_tokens = {
+                    "var",
+                    "mi",
+                    "mu",
+                    "mı",
+                    "mü",
+                    "varmi",
+                    "varmı",
+                    "mevcut",
+                    "mevcutmu",
+                    "bulunur",
+                    "bulunurmu",
+                    "ara",
+                    "arama",
+                    "bul",
+                    "ariyorum",
+                    "arıyorum",
+                    "bakiyorum",
+                    "bakıyorum",
+                    "istiyorum",
+                    "lazim",
+                    "lazım",
+                    "satilik",
+                    "satılık",
+                    "fiyati",
+                    "fiyatı",
+                    "ne",
+                    "nedir",
+                }
+                cleaned: list[str] = []
+                for tok in raw_tokens:
+                    norm = normalize_for_match(tok)
+                    if not norm:
+                        continue
+                    if norm in stop_tokens:
+                        continue
+                    if len(norm) <= 1:
+                        continue
+                    cleaned.append(tok)
+                joined = " ".join(cleaned).strip()
+                return joined or None
 
             # Deterministic category inference (prevents false 0 results)
             inferred_category = None
@@ -255,10 +304,112 @@ class SearchComposerAgent(BaseAgent):
                 }
 
             min_price, max_price = _extract_price_filters(user_message)
+            cleaned_query = _clean_search_query(user_message)
 
-            search_text = user_message
+            search_text = cleaned_query or user_message
             if inferred_category:
-                search_text = _category_only_search_text(user_message)
+                search_text = _category_only_search_text(cleaned_query or user_message)
+
+            def _tokenize_for_fuzzy(text: str) -> list[str]:
+                norm = normalize_for_match(text)
+                if not norm:
+                    return []
+                return [t for t in re.findall(r"[0-9a-zA-Zçğıöşü]+", norm) if len(t) >= 2]
+
+            def _edit_distance(a: str, b: str) -> int:
+                if a == b:
+                    return 0
+                if not a:
+                    return len(b)
+                if not b:
+                    return len(a)
+                dp = list(range(len(b) + 1))
+                for i, ca in enumerate(a, 1):
+                    prev = dp[0]
+                    dp[0] = i
+                    for j, cb in enumerate(b, 1):
+                        cur = dp[j]
+                        cost = 0 if ca == cb else 1
+                        dp[j] = min(
+                            dp[j] + 1,
+                            dp[j - 1] + 1,
+                            prev + cost,
+                        )
+                        prev = cur
+                return dp[-1]
+
+            def _fuzzy_match_token(token: str, words: list[str]) -> bool:
+                if not token:
+                    return False
+                if token in words:
+                    return True
+                for w in words:
+                    if not w:
+                        continue
+                    if abs(len(w) - len(token)) > 2:
+                        continue
+                    threshold = 1 if max(len(w), len(token)) <= 6 else 2
+                    if _edit_distance(token, w) <= threshold:
+                        return True
+                return False
+
+            def _extract_metadata_keywords_text(metadata: Any) -> str:
+                if isinstance(metadata, dict):
+                    return str(metadata.get("keywords_text") or "").strip()
+                if isinstance(metadata, str):
+                    raw = metadata.strip()
+                    if not raw:
+                        return ""
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            return str(parsed.get("keywords_text") or "").strip()
+                    except Exception:
+                        return raw
+                return ""
+
+            async def _fuzzy_fallback_search() -> list[Dict[str, Any]]:
+                if not cleaned_query:
+                    return []
+                tokens = _tokenize_for_fuzzy(cleaned_query)
+                if not tokens:
+                    return []
+                if len(tokens) > 3:
+                    return []
+
+                try:
+                    fallback = await search_listings_tool.execute(
+                        category=inferred_category,
+                        min_price=min_price,
+                        max_price=max_price,
+                        search_text=None,
+                        limit=50,
+                    )
+                except Exception:
+                    return []
+
+                if not isinstance(fallback, dict) or not fallback.get("success"):
+                    return []
+                pool = (fallback.get("data") or {}).get("listings") or []
+                if not pool:
+                    return []
+
+                matched: list[Dict[str, Any]] = []
+                for listing in pool:
+                    if not isinstance(listing, dict):
+                        continue
+                    text = " ".join([
+                        str(listing.get("title") or ""),
+                        str(listing.get("description") or ""),
+                        str(listing.get("category") or ""),
+                        _extract_metadata_keywords_text(listing.get("metadata")),
+                    ])
+                    words = _tokenize_for_fuzzy(text)
+                    if not words:
+                        continue
+                    if all(_fuzzy_match_token(tok, words) for tok in tokens):
+                        matched.append(listing)
+                return matched
 
             if getattr(settings, "debug", False):
                 logger.info(
@@ -292,6 +443,11 @@ class SearchComposerAgent(BaseAgent):
                         all_listings = (fallback.get("data") or {}).get("listings") or []
                 except Exception:
                     pass
+
+            if not all_listings:
+                fuzzy_hits = await _fuzzy_fallback_search()
+                if fuzzy_hits:
+                    all_listings = fuzzy_hits
 
             if not isinstance(market_data, dict):
                 market_data = {}
