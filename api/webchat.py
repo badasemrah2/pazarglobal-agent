@@ -484,6 +484,13 @@ def user_refuses_images(message: str) -> bool:
     return bool(mentions_image and refuses)
 
 
+def is_short_no(message: str) -> bool:
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    return msg in {"hayir", "hayır", "yok", "no", "istemiyorum", "istemiyom"}
+
+
 def is_search_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
@@ -1158,12 +1165,75 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
 
     lowered = text.lower()
 
-    price = parse_price_input(text)
-    location = parse_location_input(text)
-    condition = parse_condition_input(text)
+    price = None
+    location = None
+    condition = None
+    category = None
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    title_line = ""
+    description_lines: list[str] = []
+
+    label_patterns = {
+        "price": re.compile(r"\b(fiyat|price)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
+        "condition": re.compile(r"\b(durum|kondisyon|condition)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
+        "location": re.compile(r"\b(lokasyon|konum|location|şehir|sehir)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
+        "category": re.compile(r"\b(kategori|category)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
+    }
+
+    for line in lines:
+        handled = False
+        for key, pat in label_patterns.items():
+            match = pat.search(line)
+            if not match:
+                continue
+            value = (match.group(2) or "").strip()
+            if key == "price":
+                parsed_price = parse_price_input(value)
+                if parsed_price is None:
+                    parsed_price = parse_price_input(line)
+                if parsed_price is not None:
+                    price = parsed_price
+            elif key == "condition":
+                parsed_condition = parse_condition_input(value)
+                if not parsed_condition:
+                    parsed_condition = parse_condition_input(line)
+                if parsed_condition:
+                    condition = parsed_condition
+            elif key == "location":
+                parsed_location = parse_location_input(value)
+                if not parsed_location:
+                    parsed_location = parse_location_input(line)
+                if parsed_location:
+                    location = parsed_location
+            elif key == "category":
+                normalized = normalize_category_input(value)
+                if not normalized and value:
+                    normalized = normalize_category_input(value.lower())
+                if normalized:
+                    category = normalized
+            handled = True
+            break
+
+        if handled:
+            continue
+
+        if not title_line:
+            title_line = line
+        else:
+            description_lines.append(line)
+
+    if price is None:
+        price = parse_price_input(text)
+    if location is None:
+        location = parse_location_input(text)
+    if condition is None:
+        condition = parse_condition_input(text)
+    if category is None:
+        category = normalize_category_input(text)
 
     # Remove obvious tokens for title extraction
-    title_candidate = text
+    title_candidate = title_line or text
     # Strip price-like parts
     title_candidate = re.sub(r"\b(fiyat|price)\b\s*[:=]?\s*\d+[\d\.\,\s]*\s*(tl|₺)?", " ", title_candidate, flags=re.IGNORECASE)
     title_candidate = re.sub(r"\b\d{1,3}(?:[\.,]\d{3})+\b", " ", title_candidate)
@@ -1176,6 +1246,8 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
         title_candidate,
         flags=re.IGNORECASE,
     )
+    # Strip label tokens that often leak into titles
+    title_candidate = re.sub(r"\b(durum|kondisyon|condition|lokasyon|konum|location|kategori|category)\b", " ", title_candidate, flags=re.IGNORECASE)
     # Strip common filler words
     title_candidate = re.sub(r"\b(acil|satılık|satilik)\b", " ", title_candidate, flags=re.IGNORECASE)
 
@@ -1187,9 +1259,9 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
 
     # Description: keep the original message as fallback short description
     description = ""
-    # If user explicitly wrote a long-ish sentence, preserve it.
-    if len(text) >= 10:
-        # Avoid using the whole string if it is mostly title+numbers.
+    if description_lines:
+        description = " ".join(description_lines).strip()
+    elif len(text) >= 10 and not title_line:
         description = text
 
     # If user asks to publish/cancel etc, do not treat as listing content.
@@ -1207,6 +1279,8 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
         fields["location"] = location
     if condition:
         fields["condition"] = condition
+    if category:
+        fields["category"] = category
     return fields
 
 
@@ -1972,6 +2046,9 @@ def normalize_category_input(message: str) -> Optional[str]:
         "vasıta": "Otomotiv",
         "vasita": "Otomotiv",
         "elektronik": "Elektronik",
+        "eloktronik": "Elektronik",
+        "elekronik": "Elektronik",
+        "elektronic": "Elektronik",
         "telefon": "Elektronik",
         "bilgisayar": "Elektronik",
         "ev": "Ev & Yaşam",
@@ -3781,6 +3858,27 @@ async def process_webchat_message(
 
             # Deterministic slot filling: if the draft is missing exactly one next slot,
             # treat the user's next message as that slot input (avoid depending on sticky session state).
+            slot = next_missing_slot(existing_draft)
+
+            # If the user is at the image step and says a short "no", treat it as opting out of photos.
+            if existing_draft and draft_id and slot == "images" and is_short_no(message_body):
+                try:
+                    await supabase_client.update_draft_allow_no_images(draft_id, True)
+                    existing_draft = await supabase_client.get_draft(draft_id) or existing_draft
+                except Exception:
+                    pass
+                response_data.update({
+                    "draft_id": draft_id,
+                    "draft": existing_draft,
+                    "type": "draft_update",
+                })
+                return await finalize_response({
+                    "success": True,
+                    "message": "Tamam, resimsiz devam edelim. " + build_next_step_message(existing_draft),
+                    "data": response_data,
+                    "intent": intent,
+                })
+
             if existing_draft and draft_id and is_cancel_command(message_body) and not user_refuses_images(message_body):
                 # User wants to stop this flow.
                 try:
@@ -3813,8 +3911,6 @@ async def process_webchat_message(
                                 existing_draft = refreshed
                 except Exception:
                     pass
-
-                slot = next_missing_slot(existing_draft)
 
                 # Dynamic fallback: user asks what to do next while we're waiting for slot content.
                 # Do NOT persist this meta/help message into listing fields.
@@ -3887,8 +3983,16 @@ async def process_webchat_message(
                             pass
                         try:
                             if extracted.get("condition") and hasattr(supabase_client, "update_draft_condition"):
-                                if not str(listing_now.get("condition") or "").strip():
+                                current_condition = str(listing_now.get("condition") or "").strip()
+                                if (not current_condition) or current_condition.lower() in {"sıfır", "sifir"}:
                                     await supabase_client.update_draft_condition(draft_id, str(extracted["condition"]))
+                        except Exception:
+                            pass
+                        try:
+                            if extracted.get("category") and hasattr(supabase_client, "update_draft_category"):
+                                current_category = str(listing_now.get("category") or "").strip()
+                                if not current_category or current_category.lower() in {"diger", "diğer"}:
+                                    await supabase_client.update_draft_category(draft_id, str(extracted["category"]))
                         except Exception:
                             pass
 
