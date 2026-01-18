@@ -3574,22 +3574,26 @@ async def process_webchat_message(
 
         # INTENT SWITCH ERGONOMICS:
         # If the user is locked in create_listing but says a clear search command (e.g. "benzer ara"),
-        # don't silently ignore it. Guide them to the explicit cancel keyword.
-        # HOWEVER: if locked in publish_or_delete and user tries to search, allow override.
+        # automatically switch to search mode - this is more user-friendly than requiring explicit cancel.
         if locked_intent == "create_listing" and is_search_command(message_body):
-            return await finalize_response({
-                "success": True,
-                "message": (
-                    "Şu an ilan oluşturma akışındasın. Arama moduna geçmek için önce 'iptal' (veya 'vazgeç') yaz. "
-                    "Sonra 'benzer ara' ya da 'telefon ara' gibi arama isteğini yazabilirsin."
-                ),
-                "data": {
-                    "type": "conversation",
-                    "intent": "create_listing",
-                    "hint": {"cancel": "iptal", "then": "benzer ara"},
-                },
-                "intent": "create_listing",
+            # Auto-switch: user clearly wants to search, not continue listing creation
+            prev_locked = locked_intent
+            session.pop("locked_intent", None)
+            session["intent"] = "search_listings"
+            session["locked_intent"] = "search_listings"
+            locked_intent = "search_listings"
+            intent = "search_listings"
+            intent_reason = "search_override_from_create"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, intent)
+            await _record_fsm_event("intent_switch", session_id, session, {
+                "prev_locked": prev_locked,
+                "new_intent": intent,
+                "trigger": "search_command_during_create",
+                "message_preview": message_body[:50]
             })
+            # Note: This will fall through to search_listings handling below
         
         # SEARCH OVERRIDE: Allow search queries to override publish_or_delete lock
         # when no publish confirmation is pending.
