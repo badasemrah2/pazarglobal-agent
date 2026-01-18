@@ -188,14 +188,19 @@ async def process_whatsapp_message(
             result = await composer.orchestrate_search(message_body)
             
             if result["success"] and result["listings"]:
+                # Emoji number mapping for better visibility
+                emoji_numbers = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+                
                 response = f"🔍 {result['count']} ilan bulundu:\n\n"
                 for i, listing in enumerate(result["listings"][:5], 1):
-                    response += f"{i}. {listing.get('title', 'Başlıksız')}\n"
+                    num_emoji = emoji_numbers.get(i, f"{i}.")
+                    response += f"{num_emoji} {listing.get('title', 'Başlıksız')}\n"
                     response += f"   💰 {listing.get('price', 'N/A')} TL\n"
                     response += f"   📍 {listing.get('category', 'Kategori belirtilmemiş')}\n\n"
                 
                 if result["count"] > 5:
                     response += f"...ve {result['count'] - 5} ilan daha.\n"
+                response += "Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz."
                 
                 return response
             else:

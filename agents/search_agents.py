@@ -672,7 +672,11 @@ class SearchComposerAgent(BaseAgent):
             # Limit to 5 items for response to avoid token blowup
             preview_listings = all_listings[:5]
             remaining = max(len(all_listings) - len(preview_listings), 0)
-            msg_lines = [f"{len(all_listings)} ilan bulundu."]
+            msg_lines = [f"🔍 {len(all_listings)} ilan bulundu."]
+            
+            # Emoji number mapping for better visibility
+            emoji_numbers = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+            
             if preview_listings:
                 for idx, listing in enumerate(preview_listings, 1):
                     title = listing.get("title") or "Başlıksız"
@@ -689,7 +693,8 @@ class SearchComposerAgent(BaseAgent):
                         elif isinstance(first_img, str):
                             image_url = first_img
                     short_desc = (listing.get("description") or "")[:120]
-                    msg_lines.append(f"{idx}. {title} - {price_txt} - {category}")
+                    num_emoji = emoji_numbers.get(idx, f"{idx}.")
+                    msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
                     if image_url:
                         msg_lines.append(f"![{title}]({image_url})")
                     if short_desc:

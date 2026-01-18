@@ -4732,12 +4732,17 @@ async def process_webchat_message(
                     })
 
                 msg_lines = [f"🔍 Son {len(listings)} ilan:"]
+                
+                # Emoji number mapping for better visibility
+                emoji_numbers = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
+                
                 for idx, listing in enumerate(listings, 1):
                     title = listing.get("title") or "Başlıksız"
                     price = listing.get("price")
                     price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
                     category = listing.get("category") or "Kategori yok"
-                    msg_lines.append(f"{idx}. {title} - {price_txt} - {category}")
+                    num_emoji = emoji_numbers.get(idx, f"{idx}.")
+                    msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
 
                 msg_lines.append("Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
                 return await finalize_response({
