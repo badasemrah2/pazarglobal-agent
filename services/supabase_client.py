@@ -1082,7 +1082,30 @@ class SupabaseClient:
 
             # Best-effort: generate listing-level metadata keywords to improve search recall.
             # This does NOT block publishing if generation fails.
-            listing_metadata: Dict[str, Any] = {}
+            # STANDARDIZED METADATA FORMAT (same as frontend):
+            # {
+            #   "source": "agent" | "web",
+            #   "created_via": "webchat" | "whatsapp" | "manual",
+            #   "client_app": "pazarglobal-agent",
+            #   "flow_version": "2026-01-18",
+            #   "keyword_source": "llm" | "fallback" | "existing",
+            #   "created_at_client": ISO timestamp,
+            #   "keywords": [...],
+            #   "keywords_text": "...",
+            #   "attributes": {}
+            # }
+            from datetime import datetime, timezone
+            
+            listing_metadata: Dict[str, Any] = {
+                "source": "agent",
+                "created_via": "webchat",
+                "client_app": "pazarglobal-agent",
+                "flow_version": "2026-01-18",
+                "keyword_source": "llm",  # will be updated below
+                "created_at_client": datetime.now(timezone.utc).isoformat(),
+                "attributes": {},
+            }
+            
             try:
                 if isinstance(listing_data, dict):
                     existing_keywords = listing_data.get("_keywords")
@@ -1094,6 +1117,7 @@ class SupabaseClient:
                 if isinstance(existing_keywords, list) and existing_keywords:
                     keywords = [str(k).strip().lower() for k in existing_keywords if str(k).strip()]
                     keywords_text = " ".join(keywords)
+                    listing_metadata["keyword_source"] = "existing"
                 else:
                     title = str(listing_data.get("title") or "").strip() if isinstance(listing_data, dict) else ""
                     category = str(listing_data.get("category") or "").strip() if isinstance(listing_data, dict) else ""
@@ -1108,6 +1132,7 @@ class SupabaseClient:
                     )
                     keywords = generated.get("keywords") or []
                     keywords_text = generated.get("keywords_text") or ""
+                    listing_metadata["keyword_source"] = "llm"
 
                 if keywords:
                     listing_metadata["keywords"] = keywords
@@ -1124,7 +1149,9 @@ class SupabaseClient:
                 if not listing_metadata.get("keywords") and title_f:
                     fallback = self._fallback_listing_keywords(title=title_f, category=category_f, description=desc_f)
                     if fallback.get("keywords"):
-                        listing_metadata.update(fallback)
+                        listing_metadata["keywords"] = fallback["keywords"]
+                        listing_metadata["keywords_text"] = fallback.get("keywords_text", "")
+                        listing_metadata["keyword_source"] = "fallback"
             except Exception:
                 pass
 
@@ -1143,9 +1170,7 @@ class SupabaseClient:
             if not user_phone and isinstance(listing_data, dict):
                 user_phone = (listing_data.get("contact_phone") or "").strip() or None
 
-            # Add provenance to metadata so we can debug multi-channel write paths.
-            listing_metadata.setdefault("source", "agent")
-            listing_metadata.setdefault("created_via", "webchat")
+            # Metadata already initialized with standard format above
             
             # Insert into listings
             result = self.client.table("listings").insert({
