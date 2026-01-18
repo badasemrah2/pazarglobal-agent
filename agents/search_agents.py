@@ -120,15 +120,28 @@ class SearchComposerAgent(BaseAgent):
                 return result
 
             def _expand_with_synonyms(query: str) -> list[str]:
-                """Expand query with synonyms for broader matching."""
+                """Expand query with synonyms for broader matching.
+                
+                IMPORTANT: Only expand when query is a SINGLE generic term.
+                For multi-word queries like "samsung telefon", don't replace
+                "telefon" with "iphone" - that would give wrong results.
+                """
                 queries = [query]
-                query_lower = query.lower()
+                query_lower = query.lower().strip()
+                tokens = [t for t in re.findall(r"[a-zA-ZçğıöşüÇĞİÖŞÜ]+", query_lower) if len(t) >= 3]
+                
+                # Only expand for single-word queries (generic terms)
+                # Multi-word queries should NOT be expanded with synonyms
+                if len(tokens) != 1:
+                    return queries
+                
+                single_token = tokens[0]
                 for term, synonyms in SEARCH_SYNONYMS.items():
-                    if term in query_lower:
-                        for syn in synonyms[:3]:  # Limit to avoid explosion
-                            expanded = query_lower.replace(term, syn)
-                            if expanded not in queries:
-                                queries.append(expanded)
+                    if term == single_token:
+                        for syn in synonyms[:5]:  # Get more synonyms for single terms
+                            if syn not in queries:
+                                queries.append(syn)
+                        break
                 return queries
 
             def _clean_search_query(msg: str) -> str | None:
@@ -226,6 +239,8 @@ class SearchComposerAgent(BaseAgent):
                 # Product types like "ayakkabı", "kazak", "telefon" are NOT generic categories -
                 # they are specific product types that should be searched for.
                 # Generic category terms are things like "giyim", "elektronik", "ev eşyası" etc.
+                # BUT: "araba" is a special case - it maps to Otomotiv category but listings
+                # don't usually contain "araba" in title, they have brand names instead.
                 generic_category_terms = {
                     "giyim",          # broad category - not a specific product
                     "ev",             # real estate broad
@@ -235,6 +250,9 @@ class SearchComposerAgent(BaseAgent):
                     "spor",           # broad category
                     "hobi",           # broad category
                     "antika",         # broad category
+                    "araba",          # maps to Otomotiv - listings have brand names not "araba"
+                    "otomobil",       # same as araba
+                    "araç",           # same as araba
                 }
                 if meaningful and meaningful[0] in generic_category_terms:
                     return None
