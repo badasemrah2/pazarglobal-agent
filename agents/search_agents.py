@@ -82,9 +82,60 @@ class SearchComposerAgent(BaseAgent):
         try:
             message_lower = user_message.lower()
 
+            # Synonym mappings for common search terms
+            # Maps user's term -> list of terms to also search for
+            SEARCH_SYNONYMS: dict[str, list[str]] = {
+                "araba": ["otomobil", "araç", "bmw", "mercedes", "audi", "toyota", "honda", "ford", "fiat", "renault", "citroen", "volkswagen", "opel", "hyundai", "kia"],
+                "otomobil": ["araba", "araç"],
+                "araç": ["araba", "otomobil"],
+                "telefon": ["cep telefonu", "akıllı telefon", "iphone", "samsung", "xiaomi", "huawei"],
+                "bilgisayar": ["laptop", "notebook", "pc", "masaüstü"],
+                "laptop": ["bilgisayar", "notebook", "dizüstü"],
+                "notebook": ["laptop", "bilgisayar", "dizüstü"],
+                "harddisk": ["hard disk", "hdd", "ssd", "depolama"],
+                "hard disk": ["harddisk", "hdd", "ssd", "depolama"],
+                "portabledriver": ["portable driver", "taşınabilir disk", "harici disk"],
+                "portable driver": ["portabledriver", "taşınabilir disk", "harici disk"],
+                "dürbün": ["dürbin", "teleskop", "gözlem"],
+                "dürbin": ["dürbün", "teleskop", "gözlem"],
+            }
+
+            # Compound word normalization: split common Turkish compound words
+            COMPOUND_SPLITS: dict[str, str] = {
+                "harddisk": "hard disk",
+                "portabledriver": "portable driver",
+                "animeposter": "anime poster",
+                "kahvemakinesi": "kahve makinesi",
+                "cepTelefonu": "cep telefonu",
+                "ceptelefonu": "cep telefonu",
+                "akillitelefon": "akıllı telefon",
+                "akıllıtelefon": "akıllı telefon",
+            }
+
+            def _normalize_compound_words(msg: str) -> str:
+                """Split common compound words for better matching."""
+                result = msg.lower()
+                for compound, split in COMPOUND_SPLITS.items():
+                    result = result.replace(compound.lower(), split)
+                return result
+
+            def _expand_with_synonyms(query: str) -> list[str]:
+                """Expand query with synonyms for broader matching."""
+                queries = [query]
+                query_lower = query.lower()
+                for term, synonyms in SEARCH_SYNONYMS.items():
+                    if term in query_lower:
+                        for syn in synonyms[:3]:  # Limit to avoid explosion
+                            expanded = query_lower.replace(term, syn)
+                            if expanded not in queries:
+                                queries.append(expanded)
+                return queries
+
             def _clean_search_query(msg: str) -> str | None:
                 if not msg:
                     return None
+                # First normalize compound words
+                msg = _normalize_compound_words(msg)
                 raw_tokens = re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ\+]+", msg)
                 if not raw_tokens:
                     return None
@@ -425,6 +476,42 @@ class SearchComposerAgent(BaseAgent):
             all_listings = []
             if isinstance(search_res, dict) and search_res.get("success"):
                 all_listings = (search_res.get("data") or {}).get("listings") or []
+
+            # If no results, try synonym-based search
+            if not all_listings and cleaned_query:
+                synonym_queries = _expand_with_synonyms(cleaned_query)
+                for syn_query in synonym_queries[1:]:  # Skip first (original query)
+                    try:
+                        syn_result = await search_listings_tool.execute(
+                            category=inferred_category,
+                            min_price=min_price,
+                            max_price=max_price,
+                            search_text=syn_query,
+                            limit=20,
+                        )
+                        if isinstance(syn_result, dict) and syn_result.get("success"):
+                            syn_listings = (syn_result.get("data") or {}).get("listings") or []
+                            if syn_listings:
+                                all_listings = syn_listings
+                                break
+                    except Exception:
+                        pass
+
+            # If still no results but we have a category, try category-only search
+            # This is for generic terms like "araba" where listings may not have "araba" in title
+            if not all_listings and inferred_category:
+                try:
+                    category_fallback = await search_listings_tool.execute(
+                        category=inferred_category,
+                        min_price=min_price,
+                        max_price=max_price,
+                        search_text=None,  # No text filter, just category
+                        limit=20,
+                    )
+                    if isinstance(category_fallback, dict) and category_fallback.get("success"):
+                        all_listings = (category_fallback.get("data") or {}).get("listings") or []
+                except Exception:
+                    pass
 
             if not all_listings and inferred_category and search_text:
                 try:
