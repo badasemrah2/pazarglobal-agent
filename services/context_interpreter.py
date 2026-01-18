@@ -47,7 +47,7 @@ class ContextDecision:
         )
     
     @classmethod
-    def switch_to(cls, target_intent: str, reason: str = None) -> "ContextDecision":
+    def switch_to(cls, target_intent: str, reason: Optional[str] = None) -> "ContextDecision":
         return cls(
             action=ContextAction.SWITCH,
             target_intent=target_intent,
@@ -55,7 +55,7 @@ class ContextDecision:
         )
     
     @classmethod
-    def cancel_flow(cls, reason: str = None) -> "ContextDecision":
+    def cancel_flow(cls, reason: Optional[str] = None) -> "ContextDecision":
         return cls(action=ContextAction.CANCEL, reason=reason)
     
     @classmethod
