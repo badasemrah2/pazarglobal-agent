@@ -144,6 +144,65 @@ class SearchComposerAgent(BaseAgent):
                         break
                 return queries
 
+            def _parse_brand_and_product(query: str) -> tuple[str | None, str | None]:
+                """Parse multi-word query into brand + product type.
+                
+                Examples:
+                - "samsung telefon" -> ("samsung", "telefon")
+                - "dell laptop" -> ("dell", "laptop")
+                - "nike ayakkabı" -> ("nike", "ayakkabı")
+                - "telefon" -> (None, "telefon")
+                - "samsung" -> ("samsung", None)
+                """
+                query_lower = query.lower().strip()
+                tokens = [t for t in re.findall(r"[a-zA-ZçğıöşüÇĞİÖŞÜ0-9]+", query_lower) if len(t) >= 2]
+                
+                if not tokens:
+                    return (None, None)
+                if len(tokens) == 1:
+                    # Check if it's a known brand
+                    known_brands = {
+                        "samsung", "apple", "iphone", "xiaomi", "huawei", "oppo", "vivo",  # phones
+                        "dell", "hp", "lenovo", "asus", "acer", "msi", "macbook",  # laptops
+                        "nike", "adidas", "puma", "reebok", "converse",  # shoes
+                        "bmw", "mercedes", "audi", "toyota", "honda", "ford", "fiat", "renault", "citroen",  # cars
+                        "arçelik", "beko", "vestel", "bosch", "siemens",  # appliances
+                    }
+                    if tokens[0] in known_brands:
+                        return (tokens[0], None)
+                    return (None, tokens[0])
+                
+                # Multi-word query
+                known_brands = {
+                    "samsung", "apple", "iphone", "xiaomi", "huawei", "oppo", "vivo",
+                    "dell", "hp", "lenovo", "asus", "acer", "msi", "macbook",
+                    "nike", "adidas", "puma", "reebok", "converse",
+                    "bmw", "mercedes", "audi", "toyota", "honda", "ford", "fiat", "renault", "citroen",
+                    "arçelik", "beko", "vestel", "bosch", "siemens", "seagate", "western",
+                }
+                product_types = {
+                    "telefon", "laptop", "bilgisayar", "notebook", "ayakkabı", "ayakkabi",
+                    "araba", "otomobil", "kazak", "ceket", "tv", "televizyon",
+                    "disk", "harddisk", "ssd", "hoparlör", "kulaklık",
+                }
+                
+                brand = None
+                product = None
+                
+                for token in tokens:
+                    if token in known_brands and not brand:
+                        brand = token
+                    elif token in product_types and not product:
+                        product = token
+                
+                # If no brand found, first token might still be the brand
+                if not brand and tokens[0] not in product_types:
+                    brand = tokens[0]
+                    if len(tokens) > 1:
+                        product = tokens[1]
+                
+                return (brand, product)
+
             def _clean_search_query(msg: str) -> str | None:
                 if not msg:
                     return None
@@ -481,19 +540,69 @@ class SearchComposerAgent(BaseAgent):
                     f"[search] fast_path category={inferred_category} min={min_price} max={max_price} search_text={search_text!r}"
                 )
 
-            search_task = search_listings_tool.execute(
-                category=inferred_category,
-                min_price=min_price,
-                max_price=max_price,
-                search_text=search_text,
-                limit=20,
-            )
-            market_task = market_price_tool.execute(product_key=user_message)
-            search_res, market_data = await asyncio.gather(search_task, market_task, return_exceptions=True)
-
+            # Parse multi-word queries for brand + product type (e.g., "samsung telefon")
+            brand, product_type = _parse_brand_and_product(cleaned_query or user_message)
+            
+            # For multi-word queries with brand + product, search by brand only first
+            # then filter results by product type presence in keywords_text
             all_listings = []
-            if isinstance(search_res, dict) and search_res.get("success"):
-                all_listings = (search_res.get("data") or {}).get("listings") or []
+            
+            if brand and product_type:
+                # Multi-word search strategy: search by brand, filter by product type
+                logger.info(f"[search] Multi-word query detected: brand={brand}, product_type={product_type}")
+                
+                try:
+                    brand_result = await search_listings_tool.execute(
+                        category=inferred_category,
+                        min_price=min_price,
+                        max_price=max_price,
+                        search_text=brand,  # Search by brand only
+                        limit=50,
+                    )
+                    if isinstance(brand_result, dict) and brand_result.get("success"):
+                        brand_listings = (brand_result.get("data") or {}).get("listings") or []
+                        
+                        # Filter by product type in title, description, or keywords
+                        for listing in brand_listings:
+                            if not isinstance(listing, dict):
+                                continue
+                            text = " ".join([
+                                str(listing.get("title") or "").lower(),
+                                str(listing.get("description") or "").lower(),
+                                _extract_metadata_keywords_text(listing.get("metadata")).lower(),
+                            ])
+                            # Check if product type matches
+                            product_matches = [product_type]
+                            # Add common variations
+                            if product_type in ["telefon", "phone"]:
+                                product_matches.extend(["telefon", "phone", "cep", "akıllı"])
+                            elif product_type in ["laptop", "bilgisayar", "notebook"]:
+                                product_matches.extend(["laptop", "bilgisayar", "notebook", "dizüstü"])
+                            elif product_type in ["ayakkabı", "ayakkabi"]:
+                                product_matches.extend(["ayakkabı", "ayakkabi", "koşu", "spor"])
+                            
+                            if any(pm in text for pm in product_matches):
+                                all_listings.append(listing)
+                except Exception as e:
+                    logger.warning(f"Multi-word search failed: {e}")
+            
+            # Standard search if multi-word didn't work or wasn't applicable
+            if not all_listings:
+                search_task = search_listings_tool.execute(
+                    category=inferred_category,
+                    min_price=min_price,
+                    max_price=max_price,
+                    search_text=search_text,
+                    limit=20,
+                )
+                market_task = market_price_tool.execute(product_key=user_message)
+                search_res, market_data = await asyncio.gather(search_task, market_task, return_exceptions=True)
+                
+                if isinstance(search_res, dict) and search_res.get("success"):
+                    all_listings = (search_res.get("data") or {}).get("listings") or []
+            else:
+                # Still get market data
+                market_data = await market_price_tool.execute(product_key=user_message)
 
             # If no results, try synonym-based search
             if not all_listings and cleaned_query:
