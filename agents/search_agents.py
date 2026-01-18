@@ -171,28 +171,24 @@ class SearchComposerAgent(BaseAgent):
                 if len(meaningful) >= 2:
                     return msg
 
+                # Only TRUE category-level terms should skip search_text.
+                # Product types like "ayakkabı", "kazak", "telefon" are NOT generic categories -
+                # they are specific product types that should be searched for.
+                # Generic category terms are things like "giyim", "elektronik", "ev eşyası" etc.
                 generic_category_terms = {
-                    "telefon",
-                    "laptop",
-                    "bilgisayar",
-                    "araba",
-                    "ev",
-                    "emlak",
-                    "giyim",
-                    "kıyafet",
-                    "ayakkabı",
-                    "ayakkabi",
-                    "oyuncak",
-                    "bisiklet",
-                    "mobilya",
-                    "koltuk",
-                    "masa",
-                    "sandalye",
-                    "yatak",
+                    "giyim",          # broad category - not a specific product
+                    "ev",             # real estate broad
+                    "emlak",          # real estate broad
+                    "elektronik",     # broad category
+                    "otomotiv",       # broad category
+                    "spor",           # broad category
+                    "hobi",           # broad category
+                    "antika",         # broad category
                 }
                 if meaningful and meaningful[0] in generic_category_terms:
                     return None
 
+                # For specific product types, keep the search_text so we can filter properly
                 return msg
 
             def _extract_price_filters(msg: str) -> tuple[float | None, float | None]:
