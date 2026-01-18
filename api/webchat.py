@@ -571,6 +571,30 @@ def is_confirm_command(message: str) -> bool:
     ])
 
 
+def is_resume_listing_command(message: str) -> bool:
+    """Detect if user wants to return to paused listing creation."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    return any(phrase in msg for phrase in [
+        "ilana devam",
+        "ilana dön",
+        "ilana don",
+        "ilana geri",
+        "ilan devam",
+        "satışa devam",
+        "satisa devam",
+        "satmaya devam",
+        "ilan oluşturmaya devam",
+        "ilan olusturmaya devam",
+        "taslağa devam",
+        "taslaga devam",
+        "draft devam",
+        "ürün eklemeye devam",
+        "urun eklemeye devam",
+    ])
+
+
 def is_cancel_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
@@ -770,6 +794,58 @@ def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> b
     # Reset only when we have non-media listing fields that indicate an older draft.
     # Do NOT reset drafts that only have images; otherwise we wipe newly uploaded photos and loop.
     return draft_has_non_media_content(draft)
+
+
+def detects_product_change(message: str, current_draft: Dict[str, Any]) -> Optional[str]:
+    """Detect if user wants to change the product they're selling.
+    
+    Returns the new product name if detected, None otherwise.
+    Examples:
+    - "aslında MacBook satayım" -> "MacBook"
+    - "iPhone değil Samsung olsun" -> "Samsung"
+    - "yok ya, bisiklet satayım" -> "bisiklet"
+    """
+    msg = normalize_for_match(message)
+    if not msg:
+        return None
+    
+    # Check for product change indicators
+    change_indicators = [
+        "aslında", "aslinda",
+        "yok ya", "yokya",
+        "değil", "degil",
+        "yerine", 
+        "bunun yerine",
+        "bunu değil", "bunu degil",
+        "onu değil", "onu degil",
+        "değiştirdim", "degistirdim",
+        "fikrimi değiştirdim", "fikrimi degistirdim",
+        "başka", "baska",
+        "farklı", "farkli",
+    ]
+    
+    has_change_indicator = any(ind in msg for ind in change_indicators)
+    has_sell_verb = any(v in msg for v in ["satayım", "satayim", "satıyorum", "satiyorum", "satmak", "satacağım", "satacagim"])
+    
+    if has_change_indicator and has_sell_verb:
+        # Try to extract the new product name
+        # Common patterns: "aslında X satayım", "X satayım aslında"
+        import re
+        patterns = [
+            r"(?:aslında|aslinda)\s+(\w+(?:\s+\w+)?)\s+(?:satayım|satayim|satmak)",
+            r"(\w+(?:\s+\w+)?)\s+(?:satayım|satayim|satmak)\s+(?:aslında|aslinda)",
+            r"(?:yerine|bunun yerine)\s+(\w+(?:\s+\w+)?)",
+            r"(\w+)\s+(?:olsun|satayım|satayim)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, msg)
+            if match:
+                product = match.group(1).strip()
+                # Filter out common non-product words
+                if product.lower() not in {"ben", "bunu", "onu", "şu", "su", "bir", "bu", "o"}:
+                    return product.title()
+    
+    return None
 
 
 async def handle_publish_or_delete_flow(
@@ -3454,6 +3530,30 @@ async def process_webchat_message(
                 "intent": "small_talk",
             })
 
+        # SOFT CONTEXT RESUME: If user wants to return to paused listing creation
+        paused_ctx = session.get("paused_context")
+        if paused_ctx and is_resume_listing_command(message_body):
+            draft_id = paused_ctx.get("draft_id")
+            if draft_id:
+                # Restore create_listing context
+                session["intent"] = "create_listing"
+                session["locked_intent"] = "create_listing"
+                session["active_draft_id"] = draft_id
+                session.pop("paused_context", None)
+                session_dirty = True
+                
+                # Get draft and show current status
+                existing_draft = await supabase_client.get_draft(draft_id)
+                if existing_draft:
+                    prompt = build_next_step_message(existing_draft)
+                    slot = next_missing_slot(existing_draft)
+                    return await finalize_response({
+                        "success": True,
+                        "message": f"Tamam, ilan oluşturmaya devam ediyoruz! 📝\n\n{prompt}",
+                        "data": {"type": "slot_prompt", "slot": slot, "draft_id": draft_id},
+                        "intent": "create_listing",
+                    })
+
         # Get or determine intent
         intent = session.get("intent")
         locked_intent = session.get("locked_intent")
@@ -3575,13 +3675,20 @@ async def process_webchat_message(
         # INTENT SWITCH ERGONOMICS:
         # If the user is locked in create_listing but says a clear search command (e.g. "benzer ara"),
         # automatically switch to search mode - this is more user-friendly than requiring explicit cancel.
+        # SOFT CONTEXT: Remember we were in create_listing so we can offer to return after search.
         if locked_intent == "create_listing" and is_search_command(message_body):
-            # Auto-switch: user clearly wants to search, not continue listing creation
+            # Preserve create_listing context for potential return
+            session["paused_context"] = {
+                "intent": "create_listing",
+                "draft_id": session.get("active_draft_id"),
+                "reason": "user_initiated_search",
+            }
+            # Switch to search but don't lock it - allow easy return
             prev_locked = locked_intent
             session.pop("locked_intent", None)
             session["intent"] = "search_listings"
-            session["locked_intent"] = "search_listings"
-            locked_intent = "search_listings"
+            # Don't lock search - keep it flexible
+            locked_intent = None
             intent = "search_listings"
             intent_reason = "search_override_from_create"
             session_dirty = True
@@ -3591,6 +3698,7 @@ async def process_webchat_message(
                 "prev_locked": prev_locked,
                 "new_intent": intent,
                 "trigger": "search_command_during_create",
+                "paused_context": "create_listing",
                 "message_preview": message_body[:50]
             })
             # Note: This will fall through to search_listings handling below
@@ -3917,6 +4025,30 @@ async def process_webchat_message(
                         existing_draft = await supabase_client.get_draft(draft_id)
                 except Exception:
                     pass
+
+            # FLEXIBLE PRODUCT CHANGE: User says "aslında MacBook satayım" while creating iPhone listing
+            # Instead of starting over, just update the title and continue
+            if existing_draft and draft_id:
+                new_product = detects_product_change(message_body, existing_draft)
+                if new_product:
+                    try:
+                        # Update title with new product, clear description to regenerate
+                        await supabase_client.update_draft_title(draft_id, new_product)
+                        await supabase_client.update_draft_description(draft_id, "")
+                        existing_draft = await supabase_client.get_draft(draft_id)
+                        response_data.update({
+                            "draft_id": draft_id,
+                            "draft": existing_draft,
+                            "type": "draft_update",
+                        })
+                        return await finalize_response({
+                            "success": True,
+                            "message": f"Tamam, şimdi **{new_product}** satıyoruz! 🔄\n\n{build_next_step_message(existing_draft)}",
+                            "data": response_data,
+                            "intent": intent,
+                        })
+                    except Exception:
+                        pass
 
             # If the user refuses to upload images, allow a no-photo listing.
             if existing_draft and draft_id and user_refuses_images(message_body):
@@ -4931,9 +5063,15 @@ async def process_webchat_message(
                 _store_search_context(session, message_body, result["listings_full"])
                 session_dirty = True
 
+            # SOFT CONTEXT: If user was creating a listing, offer to return
+            search_message = result.get("message", "Search completed")
+            paused_ctx = session.get("paused_context")
+            if paused_ctx and paused_ctx.get("intent") == "create_listing" and paused_ctx.get("draft_id"):
+                search_message += "\n\n💡 _İlan oluşturmaya devam etmek için 'ilana devam' yazabilirsin._"
+
             return await finalize_response({
                 "success": result.get("success", False),
-                "message": result.get("message", "Search completed"),
+                "message": search_message,
                 "data": response_data,
                 "intent": intent
             })
