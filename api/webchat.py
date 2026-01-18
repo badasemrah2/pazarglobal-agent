@@ -1957,10 +1957,12 @@ def infer_category_from_draft(draft: Dict[str, Any]) -> Optional[str]:
 
 
 def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
+    if not draft:
+        return "title"  # No draft = need everything starting with title
     listing = (draft or {}).get("listing_data") or {}
     images = (draft or {}).get("images") or []
     # DEBUG: log draft state to diagnose photo-loss loop
-    logger.debug(f"next_missing_slot: draft_id={draft.get('id')}, images_count={len(images)}, listing_keys={list(listing.keys())}")
+    logger.debug(f"next_missing_slot: draft_id={(draft or {}).get('id')}, images_count={len(images)}, listing_keys={list(listing.keys())}")
     allow_no_images = bool(isinstance(listing, dict) and listing.get("allow_no_images"))
     if not (listing.get("title") or "").strip():
         return "title"
@@ -3776,6 +3778,60 @@ async def process_webchat_message(
                     session["active_draft_id"] = draft_id
                     session_dirty = True
 
+            # NO MEDIA - User says "ilan vermek istiyorum" without any photos
+            # Create a new draft and show intro message with format hint
+            if not draft_id and not session.get("pending_media_urls"):
+                # Check if user already has a draft in progress
+                existing_user_draft = None
+                if user_id:
+                    existing_user_draft = await supabase_client.get_latest_draft_for_user(user_id)
+                
+                if existing_user_draft and existing_user_draft.get("id"):
+                    # User has an existing draft - use it
+                    draft_id = existing_user_draft.get("id")
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+                else:
+                    # Create a fresh draft
+                    draft_created = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                    draft_id = (draft_created or {}).get("id")
+                    if draft_id:
+                        session["active_draft_id"] = draft_id
+                        session_dirty = True
+                
+                # Lock intent to create_listing so next messages stay in this flow
+                session["locked_intent"] = "create_listing"
+                session["intent"] = "create_listing"
+                session_dirty = True
+                
+                # Show intro message for text-only listing creation
+                intro_msg = (
+                    "📝 **İlan Oluşturma**\n\n"
+                    "Ne satmak istiyorsunuz? Aşağıdaki formatta tek seferde bilgi verebilir veya tek tek ilerleyebiliriz:\n\n"
+                    "```\n"
+                    "Başlık: (ürün adı)\n"
+                    "Açıklama: (kısa açıklama)\n"
+                    "Fiyat: (TL cinsinden)\n"
+                    "Lokasyon: (şehir)\n"
+                    "```\n\n"
+                    "**Örnek:** `iPhone 14 128GB siyah, kutulu, az kullanılmış, 35000 TL, İstanbul`\n\n"
+                    "Veya sadece ürün adını yazarak başlayabilirsiniz."
+                )
+                
+                log_fsm_event(
+                    "response_ready",
+                    session_id,
+                    session,
+                    response_type="create_listing_intro_no_media",
+                )
+                
+                return await finalize_response({
+                    "success": True,
+                    "message": intro_msg,
+                    "data": {"type": "create_listing_intro", "draft_id": draft_id},
+                    "intent": "create_listing",
+                })
+
             if session.get("pending_media_urls") and draft_id:
                 analyses = session.get("pending_media_analysis") or []
                 analysis_by_url: Dict[str, Any] = {}
@@ -3826,6 +3882,27 @@ async def process_webchat_message(
                     session_dirty = True
                     # DEBUG: log recovered draft state
                     logger.info(f"Recovered draft {draft_id} for user {user_id}: images={len(existing_draft.get('images') or [])}")
+
+            # If still no draft exists, create one so we can accept user's listing data
+            if not existing_draft and not draft_id:
+                draft_created = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                draft_id = (draft_created or {}).get("id")
+                if draft_id:
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+                    existing_draft = await supabase_client.get_draft(draft_id)
+                    logger.info(f"Created new draft {draft_id} for user {user_id} (no media)")
+                else:
+                    logger.warning(f"Failed to create draft for user {user_id}, session {session_id}")
+
+            # If we still have no draft after all recovery attempts, return a helpful message
+            if not draft_id and not existing_draft:
+                return await finalize_response({
+                    "success": False,
+                    "message": "İlan taslağı oluşturulamadı. Lütfen tekrar deneyin veya önce giriş yapın.",
+                    "data": {"type": "error"},
+                    "intent": intent,
+                })
 
             # If the user explicitly starts a new listing, reset the single in-progress draft
             # to prevent reusing an old item's data (common with non-sticky sessions).
@@ -3953,7 +4030,7 @@ async def process_webchat_message(
                         })
 
                 # Hybrid: try extracting multiple fields from one freeform message.
-                if not is_command_only_message(message_body) and not looks_like_greeting(message_body):
+                if draft_id and not is_command_only_message(message_body) and not looks_like_greeting(message_body):
                     extracted = extract_listing_fields_from_freeform(message_body)
                     if extracted:
                         listing_now = (existing_draft or {}).get("listing_data") or {}
