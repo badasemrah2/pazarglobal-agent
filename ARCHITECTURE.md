@@ -713,4 +713,61 @@ SearchComposerAgent paralel arama yapıp sonuçları birleştirir; “listing at
 
 ---
 
+## ⚠️ Technical Debt Notice (v1 - MVP)
+
+```
+Current implementation includes hard-coded flexibility
+inside FSM (webchat.py) for MVP speed.
+
+Intent interpretation functions like:
+- is_search_command()
+- is_cancel_command()
+- detects_product_change()
+- is_resume_listing_command()
+
+are currently embedded in the FSM logic.
+
+This works but violates separation of concerns.
+```
+
+### Current vs Target Architecture
+
+**Current (v1):**
+```
+User Message → FSM (intent + state + response) → Response
+```
+
+**Target (v2):**
+```
+User Message → ContextInterpreter → ContextDecision → FSM (state only) → Response
+```
+
+### ContextDecision Actions (Planned)
+
+| Action | Description |
+|--------|-------------|
+| `CONTINUE` | Continue current flow |
+| `PAUSE` | Pause current flow, do side action (e.g., search) |
+| `SWITCH` | Switch to different flow entirely |
+| `CANCEL` | Cancel current flow |
+| `MODIFY` | Modify current context (e.g., change product) |
+
+### Migration Path
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 1 (MVP) | ✅ Done | Hard-coded flexibility in FSM |
+| Phase 2 | 🔜 Planned | Extract ContextInterpreter layer |
+| Phase 3 | 📋 Backlog | ML-based intent classification |
+
+### Decision Log
+
+| Date | Decision | Reason |
+|------|----------|--------|
+| 2026-01-19 | Hard-coded flexibility in FSM | MVP speed, user-facing bug fix |
+| 2026-01-19 | Added `paused_context` | Enable flow switching without losing state |
+| TBD | Extract ContextInterpreter | When FSM complexity becomes unmanageable |
+
+---
+
 Bu mimari, OpenAI'ın resmi SDK desenlerini takip eder ve production-ready bir sistem sağlar.
