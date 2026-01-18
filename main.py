@@ -61,6 +61,18 @@ async def health_check():
     }
 
 
+@app.post("/admin/clear-search-cache")
+async def clear_search_cache():
+    """Admin endpoint to clear search cache after metadata updates"""
+    from services.redis_client import redis_client
+    count = await redis_client.clear_search_cache()
+    return {
+        "status": "success",
+        "message": f"Cleared {count} search cache entries",
+        "cleared_count": count
+    }
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler"""

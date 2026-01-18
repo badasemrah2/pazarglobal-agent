@@ -295,6 +295,26 @@ class RedisClient:
             await self.incr_metric("cache_miss")
             return None
 
+    async def clear_search_cache(self) -> int:
+        """Clear all search cache entries. Returns number of keys deleted."""
+        try:
+            if self.disabled:
+                count = len([k for k in _IN_MEMORY_CACHE.keys() if k.startswith("search:")])
+                _IN_MEMORY_CACHE.clear()
+                logger.info(f"Cleared {count} in-memory search cache entries")
+                return count
+
+            client = await self.get_client()
+            keys = await client.keys("search:*")
+            if keys:
+                count = await client.delete(*keys)
+                logger.info(f"Cleared {count} Redis search cache entries")
+                return count
+            return 0
+        except Exception as e:
+            logger.error(f"Error clearing search cache: {e}")
+            return 0
+
     async def set_search_cache(self, query: str, results: list, filters: Optional[Dict[str, Any]] = None) -> bool:
         """Cache search results"""
         try:
