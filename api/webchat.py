@@ -622,6 +622,25 @@ def is_cancel_command(message: str) -> bool:
     ])
 
 
+def is_add_image_to_listing_command(message: str) -> bool:
+    """Detect if user wants to add an image to existing listing."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    return any(phrase in msg for phrase in [
+        "resmi ilana ekle",
+        "resimi ilana ekle",
+        "foto ekle ilana",
+        "fotoğraf ekle ilana",
+        "fotograf ekle ilana",
+        "görsel ekle ilana",
+        "gorsel ekle ilana",
+        "ilana ekle",
+        "ilana foto",
+        "ilana resim",
+    ])
+
+
 def is_hesitation_signal(message: str) -> bool:
     """
     Detect user hesitation or uncertainty signals.
@@ -1148,17 +1167,20 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
 
     prompt_line = "Bu görsel ile ne yapmak istiyorsunuz?"
     options = [
-        "📦 İlan vermek",
-        "🔍 Benzer ilanları aramak",
-        "💰 Fiyat araştırması yapmak",
+        "📦 İlan vermek → 'ilan' yazın",
+        "🔍 Benzer ilanları aramak → 'ara' yazın",
+        "💰 Fiyat araştırması yapmak → 'fiyat' yazın",
     ]
+    
+    # If user was already creating a listing, offer to add image to listing
+    add_to_listing_note = "\n💡 Ya da bu resmi devam ettiğiniz ilana eklemek için → 'resmi ilana ekle' yazın"
 
     return "\n\n".join([
         "📷 Görseli aldım ve analiz ettim.",
         "\n".join(summary_lines),
         prompt_line,
         "\n".join(options),
-        "(Cevap olarak: 'ilan', 'ara' veya 'fiyat' yazabilirsiniz.)",
+        "(Cevap olarak: 'ilan', 'ara' veya 'fiyat' yazabilirsiniz.)" + add_to_listing_note,
     ])
 
 
@@ -1232,6 +1254,7 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
 
     Goal: support power-user one-shot messages like:
     "iphone 14 2.el bursa fiyat 18000 tl temiz"
+    or comma-separated: "iphone 14 siyah, kutulu, tertemiz, 22000 tl, Bursa"
     Without relying on LLM.
     """
 
@@ -1247,6 +1270,14 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     category = None
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    
+    # Check if message is comma-separated (e.g., "iphone, description, price, location")
+    comma_separated = False
+    comma_parts = [p.strip() for p in text.split(',') if p.strip()]
+    if len(comma_parts) >= 2:
+        # Likely comma-separated format
+        comma_separated = True
+    
     title_line = ""
     description_lines: list[str] = []
 
@@ -1257,47 +1288,87 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
         "category": re.compile(r"\b(kategori|category)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
     }
 
-    for line in lines:
-        handled = False
-        for key, pat in label_patterns.items():
-            match = pat.search(line)
-            if not match:
+    # COMMA-SEPARATED PARSING
+    if comma_separated and len(comma_parts) >= 2:
+        # Heuristic for comma-separated format:
+        # part[0] = title
+        # part[1...n-2] = description/condition
+        # part[n-1] or part containing number+tl = price
+        # part containing city = location
+        
+        for i, part in enumerate(comma_parts):
+            part_lower = part.lower()
+            
+            # Try to parse as price
+            if price is None and ("tl" in part_lower or "₺" in part):
+                parsed = parse_price_input(part)
+                if parsed is not None:
+                    price = parsed
+                    continue
+            
+            # Try to parse as location (city names)
+            if location is None:
+                parsed_loc = parse_location_input(part)
+                if parsed_loc:
+                    location = parsed_loc
+                    continue
+            
+            # Try to parse as condition
+            if condition is None:
+                parsed_cond = parse_condition_input(part)
+                if parsed_cond:
+                    condition = parsed_cond
+                    continue
+            
+            # First part is likely title
+            if i == 0:
+                title_line = part
+            else:
+                # Rest are description
+                description_lines.append(part)
+    else:
+        # LABEL-BASED PARSING (original logic)
+        for line in lines:
+            handled = False
+            for key, pat in label_patterns.items():
+                match = pat.search(line)
+                if not match:
+                    continue
+                value = (match.group(2) or "").strip()
+                if key == "price":
+                    parsed_price = parse_price_input(value)
+                    if parsed_price is None:
+                        parsed_price = parse_price_input(line)
+                    if parsed_price is not None:
+                        price = parsed_price
+                elif key == "condition":
+                    parsed_condition = parse_condition_input(value)
+                    if not parsed_condition:
+                        parsed_condition = parse_condition_input(line)
+                    if parsed_condition:
+                        condition = parsed_condition
+                elif key == "location":
+                    parsed_location = parse_location_input(value)
+                    if not parsed_location:
+                        parsed_location = parse_location_input(line)
+                    if parsed_location:
+                        location = parsed_location
+                elif key == "category":
+                    normalized = normalize_category_input(value)
+                    if not normalized and value:
+                        normalized = normalize_category_input(value.lower())
+                    if normalized:
+                        category = normalized
+                handled = True
+                break
+
+            if handled:
                 continue
-            value = (match.group(2) or "").strip()
-            if key == "price":
-                parsed_price = parse_price_input(value)
-                if parsed_price is None:
-                    parsed_price = parse_price_input(line)
-                if parsed_price is not None:
-                    price = parsed_price
-            elif key == "condition":
-                parsed_condition = parse_condition_input(value)
-                if not parsed_condition:
-                    parsed_condition = parse_condition_input(line)
-                if parsed_condition:
-                    condition = parsed_condition
-            elif key == "location":
-                parsed_location = parse_location_input(value)
-                if not parsed_location:
-                    parsed_location = parse_location_input(line)
-                if parsed_location:
-                    location = parsed_location
-            elif key == "category":
-                normalized = normalize_category_input(value)
-                if not normalized and value:
-                    normalized = normalize_category_input(value.lower())
-                if normalized:
-                    category = normalized
-            handled = True
-            break
 
-        if handled:
-            continue
-
-        if not title_line:
-            title_line = line
-        else:
-            description_lines.append(line)
+            if not title_line:
+                title_line = line
+            else:
+                description_lines.append(line)
 
     if price is None:
         price = parse_price_input(text)
@@ -1402,10 +1473,12 @@ async def maybe_enrich_title_description(
     draft: Dict[str, Any],
     user_message: str,
 ) -> Optional[Dict[str, str]]:
-    """Improve title/description using TitleAgent + DescriptionAgent.
+    """Improve or generate title/description using TitleAgent + DescriptionAgent.
 
     Uses user beyanı + optional vision 'görsel izlenim'.
     Disabled automatically for tests (OPENAI_API_KEY='test') and on any failure.
+    
+    Works even if title/description are missing (generates from user message + vision).
     """
 
     try:
@@ -1421,8 +1494,9 @@ async def maybe_enrich_title_description(
         title = str(listing.get("title") or "").strip()
         description = str(listing.get("description") or "").strip()
 
-        # If either field is missing, we can't improve safely.
-        if not title or not description:
+        # If BOTH are completely empty, we can try to generate from user message + vision
+        # If at least one exists, we can improve
+        if not title and not description and not user_message.strip():
             return None
 
         vision = _unwrap_vision_product((draft or {}).get("vision_product"))
@@ -1441,13 +1515,22 @@ async def maybe_enrich_title_description(
             "image_count": image_count,
         }
 
-        # TitleAgent: minimal improvement
+        # TitleAgent: generate or improve title
         title_agent = TitleAgent()
-        title_msg = (
-            "Aşağıdaki bilgilerle TASLAK başlığını minimal şekilde iyileştir.\n"
-            "Kullanıcı beyanını koru; sadece netleştir ve vitrinde güçlü hale getir.\n\n"
-            + json.dumps(known, ensure_ascii=False)
-        )
+        if title:
+            title_msg = (
+                "Aşağıdaki bilgilerle TASLAK başlığını minimal şekilde iyileştir.\n"
+                "Kullanıcı beyanını koru; sadece netleştir ve vitrinde güçlü hale getir.\n\n"
+                + json.dumps(known, ensure_ascii=False)
+            )
+        else:
+            title_msg = (
+                "Aşağıdaki bilgilerle ürün için KATŞıCı bir BAŞLIK oluştur.\n"
+                "Kullanıcı mesajı ve görsel analizinden yararlan.\n"
+                "Başlık kısa, açık ve satışa uygun olmalı.\n\n"
+                + json.dumps(known, ensure_ascii=False)
+            )
+        
         title_result = await title_agent.run(title_msg, context={"draft_id": draft_id})
 
         out_title = ""
@@ -1456,13 +1539,22 @@ async def maybe_enrich_title_description(
                 data = (call.get("result") or {}).get("data") or {}
                 out_title = str(data.get("title") or "").strip()
 
-        # DescriptionAgent: always improve
+        # DescriptionAgent: always improve or generate
         desc_agent = DescriptionAgent()
-        desc_msg = (
-            "Aşağıdaki bilgilerle TASLAK açıklamasını mutlaka iyileştir.\n"
-            "Kullanıcı beyanına sadık kal; varsa görsel izlenimi temkinli şekilde ekle.\n\n"
-            + json.dumps(known, ensure_ascii=False)
-        )
+        if description:
+            desc_msg = (
+                "Aşağıdaki bilgilerle TASLAK açıklamasını mutlaka iyileştir.\n"
+                "Kullanıcı beyanına sadık kal; varsa görsel izlenimi temkinli şekilde ekle.\n\n"
+                + json.dumps(known, ensure_ascii=False)
+            )
+        else:
+            desc_msg = (
+                "Aşağıdaki bilgilerle ürün için YARARLı bir AÇIKLAMA oluştur.\n"
+                "Kullanıcı mesajı ve varsa görsel analizinden yararlan.\n"
+                "Açıklama detaylı ama konkret olmalı (durum, hatalar, kutu/fatura vb.).\n\n"
+                + json.dumps(known, ensure_ascii=False)
+            )
+        
         desc_result = await desc_agent.run(desc_msg, context={"draft_id": draft_id})
 
         out_desc = ""
