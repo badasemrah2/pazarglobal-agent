@@ -944,7 +944,7 @@ class SupabaseClient:
             return False
     
     # Listing Images Operations
-    async def add_listing_image(self, listing_id: str, image_url: str, metadata: Dict = None) -> bool:
+    async def add_listing_image(self, listing_id: str, image_url: str, metadata: Optional[Dict] = None) -> bool:
         """
         Add image to draft (active_drafts.images) or to published listing (product_images/images).
         If listing_id refers to a draft, append to images array; otherwise insert to product_images.

@@ -5574,7 +5574,7 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
                     if not url:
                         continue
                     analysis = analysis_by_url.get(url)
-                    meta = {"analysis": analysis} if isinstance(analysis, dict) and analysis else None
+                    meta = {"analysis": analysis} if isinstance(analysis, dict) and analysis else {}
                     await supabase_client.add_listing_image(draft_id, url, metadata=meta)
 
                 # Best-effort: store the first analysis as draft.vision_product
