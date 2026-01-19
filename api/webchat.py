@@ -92,6 +92,31 @@ FSM_PARK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes of user silence → parked
 FSM_COMPOSER_TIMEOUT_SECONDS = 45   # ComposerAgent hard timeout
 RESUME_KEYWORDS = {"devam", "kaldığımız yerden", "kaldigimiz yerden", "resume", "continue"}
 
+# === LLM OVERRIDE MECHANISM (v1.0) ===
+# When FSM deterministic parsing fails repeatedly for same intent,
+# LLM takes over for SINGLE task, returns JSON, FSM executes.
+# 
+# Whitelist: Only these fields can be overridden (prevents uncontrolled writes)
+LLM_OVERRIDE_ALLOWED_FIELDS = {"title", "description", "price", "location", "category", "condition"}
+LLM_OVERRIDE_MIN_FAILURES = 2  # How many FSM failures before LLM kicks in
+LLM_OVERRIDE_MAX_PER_SESSION = 3  # Max LLM overrides per session (rate limit)
+
+LLM_OVERRIDE_SYSTEM_PROMPT = """Sen bir pazar yeri asistanısın. Kullanıcı bir ilan alanını düzenlemek istiyor ama sistem anlayamadı.
+
+GÖREV: Kullanıcının mesajından tam olarak ne istediğini çıkar ve JSON formatında döndür.
+
+KURALLAR:
+1. SADECE şu alanları döndürebilirsin: title, description, price, location, category, condition
+2. Değeri OLDUĞU GİBİ al, yorumlama veya değiştirme
+3. Fiyat için sayı döndür (örn: "22000 tl" → 22000)
+4. Durumu normalize et: "sıfır"/"yeni" → "Sıfır", "2. el"/"kullanılmış" → "2. El"
+5. Eğer kullanıcı ne istediği belirsizse, null döndür
+
+ÇIKTI FORMATI (sadece JSON):
+{"field": "title", "value": "iPhone 14 Siyah 128GB"}
+veya belirsizse:
+{"field": null, "value": null, "reason": "Hangi alanı değiştirmek istediğiniz belirsiz"}"""
+
 
 logger = get_logger(__name__)
 
@@ -122,6 +147,171 @@ def _set_fsm_state(session: Dict[str, Any], state: str, intent: Optional[str] = 
     if intent:
         session["fsm_state_intent"] = intent
     logger.info(f"FSM state transition: {prev_state} → {state} (reason={reason}, intent={intent})")
+
+
+# === LLM OVERRIDE HELPER FUNCTIONS ===
+
+def _init_fsm_failure_log(session: Dict[str, Any]) -> None:
+    """Initialize fsm_failure_log in session if not exists."""
+    if "fsm_failure_log" not in session:
+        session["fsm_failure_log"] = {
+            "draft_id": None,
+            "field": None,
+            "attempts": 0,
+            "last_user_value": None,
+            "override_count": 0,  # Total overrides in this session
+        }
+
+
+def _record_fsm_edit_failure(
+    session: Dict[str, Any],
+    draft_id: str,
+    detected_field: Optional[str],
+    user_message: str
+) -> None:
+    """Record that FSM failed to parse an edit intent.
+    
+    Tracks consecutive failures for the same draft+field combination.
+    Resets if draft or field changes.
+    """
+    _init_fsm_failure_log(session)
+    log = session["fsm_failure_log"]
+    
+    # If same draft and same field (or no field detected yet), increment
+    if log.get("draft_id") == draft_id and (log.get("field") == detected_field or detected_field is None):
+        log["attempts"] = log.get("attempts", 0) + 1
+        log["last_user_value"] = user_message
+        logger.info(f"FSM edit failure recorded: draft={draft_id}, field={detected_field}, attempts={log['attempts']}")
+    else:
+        # Different draft or different field - reset tracking
+        log["draft_id"] = draft_id
+        log["field"] = detected_field
+        log["attempts"] = 1
+        log["last_user_value"] = user_message
+        logger.info(f"FSM edit failure log reset: draft={draft_id}, field={detected_field}")
+
+
+def _should_trigger_llm_override(session: Dict[str, Any], draft_id: str) -> bool:
+    """Check if LLM override should be triggered.
+    
+    Returns True if:
+    1. Same draft has had >= LLM_OVERRIDE_MIN_FAILURES consecutive failures
+    2. Session hasn't exceeded LLM_OVERRIDE_MAX_PER_SESSION overrides
+    """
+    _init_fsm_failure_log(session)
+    log = session["fsm_failure_log"]
+    
+    # Check if same draft
+    if log.get("draft_id") != draft_id:
+        return False
+    
+    # Check failure threshold
+    if log.get("attempts", 0) < LLM_OVERRIDE_MIN_FAILURES:
+        return False
+    
+    # Check session rate limit
+    if log.get("override_count", 0) >= LLM_OVERRIDE_MAX_PER_SESSION:
+        logger.warning(f"LLM override rate limit reached for session (count={log['override_count']})")
+        return False
+    
+    logger.info(f"LLM override triggered: draft={draft_id}, attempts={log['attempts']}")
+    return True
+
+
+def _clear_fsm_failure_log(session: Dict[str, Any]) -> None:
+    """Clear failure tracking after successful edit (FSM or LLM)."""
+    _init_fsm_failure_log(session)
+    log = session["fsm_failure_log"]
+    log["draft_id"] = None
+    log["field"] = None
+    log["attempts"] = 0
+    log["last_user_value"] = None
+    # Note: override_count is NOT reset - it's session-wide
+
+
+def _increment_llm_override_count(session: Dict[str, Any]) -> None:
+    """Increment the session-wide override counter."""
+    _init_fsm_failure_log(session)
+    session["fsm_failure_log"]["override_count"] = session["fsm_failure_log"].get("override_count", 0) + 1
+
+
+async def _llm_extract_edit_intent(user_message: str, draft_context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Use LLM to extract edit intent from user message.
+    
+    Returns:
+        {"field": "title", "value": "..."} on success
+        None on failure or ambiguity
+    """
+    try:
+        # Skip if API key is test
+        if str(getattr(settings, "openai_api_key", "") or "").strip().lower() in {"test", ""}:
+            return None
+        
+        # Build context for LLM
+        listing_data = draft_context.get("listing_data") or {}
+        current_values = {
+            "title": listing_data.get("title"),
+            "description": listing_data.get("description"),
+            "price": listing_data.get("price"),
+            "location": listing_data.get("location"),
+            "category": listing_data.get("category"),
+            "condition": listing_data.get("condition"),
+        }
+        
+        user_prompt = f"""Mevcut ilan bilgileri:
+{json.dumps(current_values, ensure_ascii=False, indent=2)}
+
+Kullanıcının mesajı:
+"{user_message}"
+
+Bu mesajdan kullanıcının hangi alanı hangi değere değiştirmek istediğini çıkar."""
+
+        response = await openai_client.chat_completion(
+            messages=[
+                {"role": "system", "content": LLM_OVERRIDE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            model="gpt-4o-mini",  # Cost-effective for simple extraction
+            max_tokens=150,
+            temperature=0.1,  # Low temperature for deterministic output
+        )
+        
+        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            return None
+        
+        # Parse JSON from response
+        # Handle potential markdown code blocks
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
+        
+        result = json.loads(content)
+        
+        # Validate result
+        field = result.get("field")
+        value = result.get("value")
+        
+        if not field or field not in LLM_OVERRIDE_ALLOWED_FIELDS:
+            logger.info(f"LLM override: field not in whitelist or null: {field}")
+            return None
+        
+        if value is None:
+            logger.info(f"LLM override: value is null for field {field}")
+            return None
+        
+        logger.info(f"LLM override extracted: field={field}, value={str(value)[:50]}...")
+        return {"field": field, "value": value}
+        
+    except json.JSONDecodeError as e:
+        logger.warning(f"LLM override JSON parse error: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"LLM override extraction failed: {e}")
+        return None
 
 
 async def _record_fsm_event(event: str, session_id: str, session: Dict[str, Any], detail: Dict[str, Any] | None = None) -> None:
@@ -956,6 +1146,23 @@ async def handle_publish_or_delete_flow(
 
     if pending:
         edit_request = extract_preview_edit(message_body)
+        
+        # === LLM OVERRIDE MECHANISM ===
+        # If FSM parsing failed, check if LLM override should kick in
+        if not edit_request and not is_cancel_command(message_body) and not is_confirm_command(message_body):
+            # Record FSM failure
+            _record_fsm_edit_failure(session, draft_id, None, message_body)
+            session_dirty = True
+            
+            # Check if we should trigger LLM override
+            if _should_trigger_llm_override(session, draft_id):
+                logger.info(f"Triggering LLM override for draft {draft_id}")
+                llm_result = await _llm_extract_edit_intent(message_body, draft)
+                if llm_result and llm_result.get("field") and llm_result.get("value") is not None:
+                    edit_request = llm_result
+                    _increment_llm_override_count(session)
+                    logger.info(f"LLM override successful: {llm_result}")
+        
         if edit_request:
             edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"], user_id)
             if not edit_result.get("success"):
@@ -967,6 +1174,9 @@ async def handle_publish_or_delete_flow(
                     "_session_dirty": session_dirty
                 }
 
+            # Clear failure log on successful edit
+            _clear_fsm_failure_log(session)
+            
             updated_draft = edit_result.get("draft") or draft
             preview_data = build_draft_preview_payload(updated_draft)
             pending["preview"] = preview_data
@@ -4240,9 +4450,36 @@ async def process_webchat_message(
                 # without forcing the publish flow.
                 if draft_ready_for_preview(existing_draft):
                     edit_request = extract_preview_edit(message_body)
+                    
+                    # === LLM OVERRIDE MECHANISM ===
+                    # If FSM parsing failed and user seems to want an edit, try LLM
+                    if not edit_request and not is_command_only_message(message_body) and not looks_like_greeting(message_body):
+                        # Check if message looks like an edit attempt (contains field keywords)
+                        msg_lower = message_body.lower()
+                        edit_keywords = {"başlık", "baslik", "title", "açıklama", "aciklama", "description", 
+                                        "fiyat", "price", "konum", "lokasyon", "location", "kategori", "category",
+                                        "durum", "condition", "olsun", "yap", "değiştir", "degistir"}
+                        looks_like_edit = any(kw in msg_lower for kw in edit_keywords)
+                        
+                        if looks_like_edit:
+                            # Record FSM failure
+                            _record_fsm_edit_failure(session, draft_id, None, message_body)
+                            session_dirty = True
+                            
+                            # Check if we should trigger LLM override
+                            if _should_trigger_llm_override(session, draft_id):
+                                logger.info(f"Triggering LLM override for draft {draft_id} in create_listing flow")
+                                llm_result = await _llm_extract_edit_intent(message_body, existing_draft)
+                                if llm_result and llm_result.get("field") and llm_result.get("value") is not None:
+                                    edit_request = llm_result
+                                    _increment_llm_override_count(session)
+                                    logger.info(f"LLM override successful in create_listing: {llm_result}")
+                    
                     if edit_request:
                         edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"], user_id)
                         if edit_result.get("success"):
+                            # Clear failure log on successful edit
+                            _clear_fsm_failure_log(session)
                             updated_draft = edit_result.get("draft") or await supabase_client.get_draft(draft_id) or existing_draft
                             return await finalize_response({
                                 "success": True,

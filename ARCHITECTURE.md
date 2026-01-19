@@ -713,6 +713,101 @@ SearchComposerAgent paralel arama yapıp sonuçları birleştirir; “listing at
 
 ---
 
+## 🔄 LLM Override Mechanism (v1.0)
+
+**Problem:** FSM'in regex tabanlı `extract_preview_edit()` fonksiyonu her zaman kullanıcının edit niyetini parse edemiyor.
+
+**Örnek Başarısız Durumlar:**
+- "başlık iphone 14 siyah olsun" → Parse edilemiyor (format: "başlık: değer" değil)
+- "açıklamayı daha detaylı yap" → Değer yok, intention var
+- "fiyatı 22 bin yap" → "22 bin" format sorunu
+
+### Çözüm: Conditioned LLM Override
+
+```text
+User: "başlık iphone 14 siyah olsun"
+              ↓
+    ┌─────────────────────────┐
+    │ FSM: extract_preview_edit│
+    │ (Regex parsing)          │
+    └──────────┬──────────────┘
+               │
+        ❌ Parse Failed
+               │
+    ┌──────────▼──────────────┐
+    │ Record FSM Failure       │
+    │ (session.fsm_failure_log)│
+    └──────────┬──────────────┘
+               │
+         attempts >= 2?
+               │
+        ┌──────┴──────┐
+        │ NO          │ YES
+        ▼             ▼
+   (wait next    ┌───────────────────┐
+    attempt)     │ LLM Override      │
+                 │ (gpt-4o-mini)     │
+                 │ Extract JSON:     │
+                 │ {field, value}    │
+                 └─────────┬─────────┘
+                           │
+                     ✅ {"field": "title", "value": "iPhone 14 Siyah"}
+                           │
+                    ┌──────▼─────────┐
+                    │ FSM Executes   │
+                    │ apply_preview_ │
+                    │ edit()         │
+                    └────────────────┘
+```
+
+### Güvenlik Mekanizmaları
+
+| Mekanizma | Değer | Açıklama |
+|-----------|-------|----------|
+| `ALLOWED_FIELDS` | title, description, price, location, category, condition | Whitelist - sadece bu alanlar override edilebilir |
+| `MIN_FAILURES` | 2 | LLM devreye girmeden önce FSM en az 2 kez başarısız olmalı |
+| `MAX_OVERRIDES_PER_SESSION` | 3 | Session başına maksimum LLM override sayısı |
+
+### Session State
+
+```python
+session["fsm_failure_log"] = {
+    "draft_id": "abc123",       # Hangi taslak için tracking
+    "field": "title",           # Son tespit edilen alan (nullable)
+    "attempts": 2,              # Ardışık başarısızlık sayısı
+    "last_user_value": "...",   # Kullanıcının son mesajı
+    "override_count": 1         # Session-wide override sayacı
+}
+```
+
+### Davranış Kuralları
+
+1. **LLM karar vermez, sadece parse eder**: JSON döndürür, FSM execute eder
+2. **Tek seferlik**: Override başarılı olunca failure log sıfırlanır
+3. **Fail-safe**: LLM başarısız olursa FSM devam eder (blocking yok)
+4. **Rate limited**: Session başına maksimum 3 override
+
+### İmplementasyon
+
+- `_init_fsm_failure_log()`: Session'da log initialize
+- `_record_fsm_edit_failure()`: FSM başarısızlığını kaydet
+- `_should_trigger_llm_override()`: Override koşullarını kontrol et
+- `_llm_extract_edit_intent()`: LLM ile JSON extract
+- `_clear_fsm_failure_log()`: Başarılı edit sonrası sıfırla
+- `_increment_llm_override_count()`: Override sayacını artır
+
+### TitleAgent/DescriptionAgent ile İlişki
+
+| Mekanizma | Amaç | Ne Zaman |
+|-----------|------|----------|
+| **TitleAgent** | Başlık oluştur/iyileştir (enrich) | Görsel analizi sonrası, otomatik |
+| **DescriptionAgent** | Açıklama oluştur/iyileştir (enrich) | Görsel analizi sonrası, otomatik |
+| **LLM Override** | Kullanıcının istediğini tam olarak uygula (edit) | FSM başarısız olduğunda, manual trigger |
+
+**Çakışma yok**: Enrichment agentlar "iyileştirme" yapar, LLM Override "kullanıcının söylediğini birebir uygulama" yapar.
+
+---
+
 ## ⚠️ Technical Debt Notice (v1 - MVP)
 
 ```
