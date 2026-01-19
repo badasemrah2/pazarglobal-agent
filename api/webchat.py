@@ -266,7 +266,7 @@ Kullanıcının mesajı:
 
 Bu mesajdan kullanıcının hangi alanı hangi değere değiştirmek istediğini çıkar."""
 
-        response = await openai_client.chat_completion(
+        response = await openai_client.create_chat_completion(
             messages=[
                 {"role": "system", "content": LLM_OVERRIDE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
@@ -4413,19 +4413,24 @@ async def process_webchat_message(
             if existing_draft and draft_id:
                 # AUTO CATEGORY (NO PROMPT):
                 # Avoid asking the user "Kategori nedir?" which causes hesitation.
-                # If category is missing, infer it deterministically from vision/title/description and persist it.
+                # If category is missing OR is "Diğer" (default), infer it deterministically from vision/title/description and persist it.
                 try:
                     listing_auto = (existing_draft or {}).get("listing_data") or {}
-                    if isinstance(listing_auto, dict) and not str(listing_auto.get("category") or "").strip():
-                        inferred = infer_category_from_draft(existing_draft)
-                        category_to_set = inferred or "Diğer"
-                        ok = await supabase_client.update_draft_category(draft_id, category_to_set)
-                        if ok:
-                            refreshed = await supabase_client.get_draft(draft_id)
-                            if refreshed:
-                                existing_draft = refreshed
-                except Exception:
-                    pass
+                    if isinstance(listing_auto, dict):
+                        current_category = str(listing_auto.get("category") or "").strip().lower()
+                        # Re-infer if empty or default "diğer"
+                        if not current_category or current_category in {"diğer", "diger"}:
+                            inferred = infer_category_from_draft(existing_draft)
+                            if inferred and inferred.lower() not in {"diğer", "diger"}:
+                                category_to_set = inferred
+                                ok = await supabase_client.update_draft_category(draft_id, category_to_set)
+                                if ok:
+                                    refreshed = await supabase_client.get_draft(draft_id)
+                                    if refreshed:
+                                        existing_draft = refreshed
+                                        logger.info(f"Auto-inferred category: {category_to_set} for draft {draft_id}")
+                except Exception as e:
+                    logger.warning(f"Category auto-inference failed: {e}")
 
                 # Dynamic fallback: user asks what to do next while we're waiting for slot content.
                 # Do NOT persist this meta/help message into listing fields.
