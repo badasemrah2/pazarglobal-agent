@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -9,7 +10,7 @@ _TR_MAP = str.maketrans({
     "ç": "c",
     "ğ": "g",
     "ı": "i",
-    "İ": "i",
+    "İ": "i",  # Turkish capital I with dot
     "ö": "o",
     "ş": "s",
     "ü": "u",
@@ -22,7 +23,14 @@ _TR_MAP = str.maketrans({
 
 
 def _norm(text: str) -> str:
-    s = (text or "").strip().lower().translate(_TR_MAP)
+    s = (text or "").strip()
+    # IMPORTANT: Translate Turkish İ BEFORE .lower() to avoid combining character issue
+    # İ (U+0130) -> i, but İ.lower() produces i + combining dot (U+0069 + U+0307)
+    s = s.translate(_TR_MAP)
+    s = s.lower()
+    # Remove any remaining combining characters (like U+0307 combining dot above)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
     # Replace separators with spaces, collapse whitespace
     # Keep '+' so room-format tokens like '2+1' survive for Emlak heuristics.
     s = re.sub(r"[^0-9a-z&+]+", " ", s)
