@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     listing_credit_cost: int = 55
 
     # Feature flags
-    enable_metadata_keyword_search: bool = False
+    enable_metadata_keyword_search: bool = True
     
     # Rate Limiting
     rate_limit_per_minute: int = 60
