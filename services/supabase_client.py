@@ -1317,23 +1317,31 @@ class SupabaseClient:
             
             if search_text:
                 if getattr(settings, "enable_metadata_keyword_search", False):
-                    # Also search in metadata keyword blob (best-effort) to improve recall.
-                    # Use both the full phrase and a few tokens so queries like "telefon arıyorum"
-                    # can still hit listings whose metadata contains "telefon".
-                    clauses: List[str] = [
-                        f"title.ilike.%{search_text}%",
-                        f"description.ilike.%{search_text}%",
-                    ]
-
+                    # Multi-word search strategy: prioritize full phrase, then individual tokens
+                    # For queries like "iPhone 17 pro max", we want exact matches first,
+                    # then partial matches (e.g., "iPhone 17" but not just "iPhone")
                     tokens = [t for t in re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ]+", search_text.lower()) if len(t) >= 3]
-                    # Keep it bounded so the OR string doesn't explode
-                    for tok in tokens[:4]:
-                        clauses.append(f"metadata->>keywords_text.ilike.%{tok}%")
-
-                    # Still include the full phrase as a fallback when it makes sense
-                    clauses.append(f"metadata->>keywords_text.ilike.%{search_text}%")
-
-                    query = query.or_(",".join(clauses))
+                    
+                    if len(tokens) >= 2:
+                        # Multi-word query: search full phrase in all fields (strict matching)
+                        # This prevents "iPhone 17 Pro Max" from matching "iPhone 13"
+                        clauses: List[str] = [
+                            f"title.ilike.%{search_text}%",
+                            f"description.ilike.%{search_text}%",
+                            f"metadata->>keywords_text.ilike.%{search_text}%",
+                        ]
+                        query = query.or_(",".join(clauses))
+                    else:
+                        # Single-word query: can use token-based search for better recall
+                        clauses: List[str] = [
+                            f"title.ilike.%{search_text}%",
+                            f"description.ilike.%{search_text}%",
+                        ]
+                        # Add individual token search for single words
+                        for tok in tokens[:4]:
+                            clauses.append(f"metadata->>keywords_text.ilike.%{tok}%")
+                        clauses.append(f"metadata->>keywords_text.ilike.%{search_text}%")
+                        query = query.or_(",".join(clauses))
                 else:
                     query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
             
