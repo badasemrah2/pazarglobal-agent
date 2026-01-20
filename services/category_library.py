@@ -252,7 +252,7 @@ _CATEGORIES: Tuple[CategorySpec, ...] = (
         ),
     ),
     CategorySpec(
-        # White goods / furniture / decoration are grouped under the unified main category
+        # White goods / furniture / decoration / personal care are grouped under the unified main category
         label="Ev & Yaşam",
         strong=(
             "buzdolabi",
@@ -278,6 +278,24 @@ _CATEGORIES: Tuple[CategorySpec, ...] = (
             "hali",
             "halı",
             "perde",
+            # Personal care products
+            "dus jeli",
+            "duş jeli",
+            "sampuan",
+            "şampuan",
+            "sabun",
+            "dis fircasi",
+            "diş fırçası",
+            "parfum",
+            "parfüm",
+            "deodorant",
+            "krem",
+            "losyon",
+            "tiras",
+            "tıraş",
+            "makyaj",
+            "bakim",
+            "bakım",
         ),
         weak=(
             "arcelik",
@@ -293,6 +311,15 @@ _CATEGORIES: Tuple[CategorySpec, ...] = (
             "indesit",
             "lg",
             "samsung",
+            # Personal care brands
+            "axe",
+            "dove",
+            "nivea",
+            "loreal",
+            "garnier",
+            "palmolive",
+            "head shoulders",
+            "gillette",
         ),
     ),
     CategorySpec(
