@@ -2935,7 +2935,7 @@ async def process_webchat_message(
             )
             return await finalize_response({
                 "success": True,
-                "message": "Bir süredir ses çıkmadı, beklemede kaldım 😴 Devam etmek için 'devam' yaz, ya da yeni bir şey söyle.",
+                "message": "Bir süredir sessizlik oldu, beklemeye geçtim 😴 'Devam' dersen kaldığımız yerden ilerleriz.",
                 "data": {"type": "parked"},
                 "intent": None,
             })
@@ -2962,14 +2962,14 @@ async def process_webchat_message(
                 await _record_fsm_event("parked_cancel", session_id, session, {})
                 return await finalize_response({
                     "success": True,
-                    "message": "Tamam, iptal ettim. Ne yapmak istersin? 😊",
+                    "message": "Tamam, iptal ettim. Ne yapalım? 😊",
                     "data": {"type": "parked_cancel"},
                     "intent": "small_talk",
                 })
             else:
                 return await finalize_response({
                     "success": True,
-                    "message": "Beklemedeydin. 'Devam' yazabilir ya da 'iptal' diyerek baştan başlayabilirsin 🔄",
+                    "message": "Hâlâ beklemedeyiz. 'Devam' veya 'iptal' diyebilirsin 🔄",
                     "data": {"type": session.get("fsm_state")},
                     "intent": None,
                 })
@@ -5045,7 +5045,7 @@ async def process_webchat_message(
                     await _record_fsm_event("timeout", session_id, session, {"stage": "composer"})
                     return await finalize_response({
                         "success": False,
-                        "message": "Şu an yanıt veremedim, akışı beklemeye aldım. Devam etmek için 'devam' yazabilir ya da yeniden başlatabilirsin.",
+                        "message": "Biraz uzun sürdü, akışı beklemeye aldım. 'Devam' yazarsan devam ederiz 😊",
                         "data": {"type": "timeout"},
                         "intent": None,
                     })

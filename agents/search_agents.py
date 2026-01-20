@@ -543,66 +543,26 @@ class SearchComposerAgent(BaseAgent):
             # Parse multi-word queries for brand + product type (e.g., "samsung telefon")
             brand, product_type = _parse_brand_and_product(cleaned_query or user_message)
             
-            # For multi-word queries with brand + product, search by brand only first
-            # then filter results by product type presence in keywords_text
+            # Multi-word search: use strict phrase matching (handled in supabase_client)
+            # Let the database do phrase matching for better accuracy
             all_listings = []
             
-            if brand and product_type:
-                # Multi-word search strategy: search by brand, filter by product type
-                logger.info(f"[search] Multi-word query detected: brand={brand}, product_type={product_type}")
-                
-                try:
-                    brand_result = await search_listings_tool.execute(
-                        category=inferred_category,
-                        min_price=min_price,
-                        max_price=max_price,
-                        search_text=brand,  # Search by brand only
-                        limit=50,
-                    )
-                    if isinstance(brand_result, dict) and brand_result.get("success"):
-                        brand_listings = (brand_result.get("data") or {}).get("listings") or []
-                        
-                        # Filter by product type in title, description, or keywords
-                        for listing in brand_listings:
-                            if not isinstance(listing, dict):
-                                continue
-                            text = " ".join([
-                                str(listing.get("title") or "").lower(),
-                                str(listing.get("description") or "").lower(),
-                                _extract_metadata_keywords_text(listing.get("metadata")).lower(),
-                            ])
-                            # Check if product type matches
-                            product_matches = [product_type]
-                            # Add common variations
-                            if product_type in ["telefon", "phone"]:
-                                product_matches.extend(["telefon", "phone", "cep", "akıllı"])
-                            elif product_type in ["laptop", "bilgisayar", "notebook"]:
-                                product_matches.extend(["laptop", "bilgisayar", "notebook", "dizüstü"])
-                            elif product_type in ["ayakkabı", "ayakkabi"]:
-                                product_matches.extend(["ayakkabı", "ayakkabi", "koşu", "spor"])
-                            
-                            if any(pm in text for pm in product_matches):
-                                all_listings.append(listing)
-                except Exception as e:
-                    logger.warning(f"Multi-word search failed: {e}")
+            # DISABLED: Brand + product filtering was causing false positives
+            # Now we rely on full phrase matching in supabase_client for multi-word queries
             
-            # Standard search if multi-word didn't work or wasn't applicable
-            if not all_listings:
-                search_task = search_listings_tool.execute(
-                    category=inferred_category,
-                    min_price=min_price,
-                    max_price=max_price,
-                    search_text=search_text,
-                    limit=20,
-                )
-                market_task = market_price_tool.execute(product_key=user_message)
-                search_res, market_data = await asyncio.gather(search_task, market_task, return_exceptions=True)
-                
-                if isinstance(search_res, dict) and search_res.get("success"):
-                    all_listings = (search_res.get("data") or {}).get("listings") or []
-            else:
-                # Still get market data
-                market_data = await market_price_tool.execute(product_key=user_message)
+            # Standard search - phrase matching will handle multi-word queries correctly
+            search_task = search_listings_tool.execute(
+                category=inferred_category,
+                min_price=min_price,
+                max_price=max_price,
+                search_text=search_text,
+                limit=20,
+            )
+            market_task = market_price_tool.execute(product_key=user_message)
+            search_res, market_data = await asyncio.gather(search_task, market_task, return_exceptions=True)
+            
+            if isinstance(search_res, dict) and search_res.get("success"):
+                all_listings = (search_res.get("data") or {}).get("listings") or []
 
             # If no results, try synonym-based search
             if not all_listings and cleaned_query:
