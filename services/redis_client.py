@@ -19,7 +19,7 @@ from loguru import logger
 
 # Redis TTL configuration (from environment with defaults)
 REDIS_TTL_SESSION = int(os.getenv("REDIS_TTL_SESSION", 900))  # 15 minutes
-REDIS_TTL_CACHE = int(os.getenv("REDIS_TTL_CACHE", 3600))  # 1 hour
+REDIS_TTL_CACHE = int(os.getenv("REDIS_TTL_CACHE", 300))  # 5 minutes (reduced for search accuracy)
 REDIS_TTL_RATE = int(os.getenv("REDIS_TTL_RATE", 60))  # 1 minute
 REDIS_TTL_CONVERSATION = int(os.getenv("REDIS_TTL_CONVERSATION", 1800))  # 30 minutes
 
