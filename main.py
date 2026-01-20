@@ -35,6 +35,57 @@ app.include_router(whatsapp.router)
 app.include_router(webchat.router)
 
 
+@app.post("/agent/run")
+async def agent_run(request: Request):
+    """
+    Unified agent endpoint for Edge Function traffic
+    Routes WhatsApp and WebChat requests to appropriate handlers
+    
+    Expected payload from Edge Function:
+    {
+        "user_id": str,
+        "phone": str,
+        "message": str,
+        "conversation_history": List[dict],
+        "media_paths": List[str] (optional),
+        "media_type": str (optional),
+        "draft_listing_id": str (optional),
+        "session_token": str (optional),
+        "user_context": dict (optional)
+    }
+    """
+    try:
+        data = await request.json()
+        logger.info(f"🎯 /agent/run called - user_id: {data.get('user_id')}, message: {data.get('message')[:50]}")
+        
+        # Import process function from webchat
+        from api.webchat import process_webchat_message
+        
+        # Convert Edge Function format to webchat format
+        result = await process_webchat_message(
+            message_body=data.get("message", ""),
+            session_id=data.get("session_token") or data.get("user_id"),  # Use session_token or user_id as session
+            user_id=data.get("user_id"),
+            media_url=data.get("media_paths", [None])[0] if data.get("media_paths") else None,
+            media_urls=data.get("media_paths")
+        )
+        
+        # Return in format Edge Function expects
+        return {
+            "success": result.get("success", True),
+            "response": result.get("message", ""),
+            "intent": result.get("intent"),
+            "data": result.get("data")
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ /agent/run error: {e}", exc_info=True)
+        return {
+            "success": False,
+            "response": "Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin."
+        }
+
+
 @app.get("/")
 async def root():
     """Root endpoint"""
