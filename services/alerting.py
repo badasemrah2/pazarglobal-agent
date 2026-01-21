@@ -6,8 +6,10 @@ import asyncio
 from typing import Optional, Dict, Any
 from datetime import datetime
 import httpx
-from services.logger import logger
-from services.supabase_client import get_supabase_client
+from services.logger import get_logger
+from services import supabase_client
+
+logger = get_logger(__name__)
 
 
 class AlertingService:
@@ -28,7 +30,7 @@ class AlertingService:
         self.telegram_chat_id = chat_id
         logger.info(f"✅ Telegram alerting configured (chat_id: {chat_id})")
     
-    async def send_alert(self, severity: str, message: str, details: Dict[str, Any] = None):
+    async def send_alert(self, severity: str, message: str, details: Optional[Dict[str, Any]] = None):
         """
         Send alert via multiple channels:
         1. Supabase audit_logs (always)
@@ -39,8 +41,7 @@ class AlertingService:
         
         # 1. Log to Supabase audit_logs
         try:
-            supabase = get_supabase_client()
-            supabase.table("audit_logs").insert({
+            supabase_client.client.table("audit_logs").insert({
                 "user_id": "system",
                 "action": f"alert_{severity}",
                 "metadata": {
@@ -63,7 +64,7 @@ class AlertingService:
         log_func = logger.critical if severity == "critical" else logger.warning
         log_func(f"🚨 ALERT [{severity.upper()}]: {message} | {details}")
     
-    async def _send_telegram(self, severity: str, message: str, details: Dict[str, Any] = None):
+    async def _send_telegram(self, severity: str, message: str, details: Optional[Dict[str, Any]] = None):
         """Send formatted message to Telegram"""
         emoji = "🔴" if severity == "critical" else "⚠️"
         text = f"{emoji} **PazarGlobal Alert**\n\n"
