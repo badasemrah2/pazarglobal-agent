@@ -1382,9 +1382,7 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
         product = analysis.get("product") or analysis.get("category")
         if product:
             parts.append(f"ürün: {product}")
-        condition = analysis.get("condition")
-        if condition:
-            parts.append(f"görsel izlenim: {condition}")
+        # condition silently used in background, not shown to user
         features = analysis.get("features")
         if isinstance(features, list) and features:
             parts.append("özellikler: " + ", ".join(features[:3]))
@@ -4061,29 +4059,30 @@ async def process_webchat_message(
                 session["intent"] = intent
                 session_dirty = True
 
-        # If no locked intent, deterministic override for clear user commands.
-        if not locked_intent and intent != "publish_or_delete":
-            override_intent = None
-            if is_create_listing_command(message_body):
-                override_intent = "create_listing"
-            elif is_search_command(message_body):
-                override_intent = "search_listings"
-            elif is_show_more_command(message_body):
-                # "Daha fazla" - show next page of search results
-                override_intent = "show_more_results"
-            if override_intent and override_intent != intent:
-                prev_locked = session.get("locked_intent")
-                intent = override_intent
-                session["intent"] = intent
-                # Don't lock "show_more_results", it's a one-time action
-                if override_intent != "show_more_results":
-                    session["locked_intent"] = intent
-                    locked_intent = intent
-                intent_reason = "command_override"
-                session_dirty = True
-                if not redis_disabled:
-                    await redis_client.set_intent(session_id, intent)
-                await _record_fsm_event("intent_lock", session_id, session, {"new_intent": override_intent, "prev_locked": prev_locked, "trigger": "command_override"})
+        # Deterministic override for EXPLICIT user commands - always overrides locked_intent
+        # User saying "ilan ver" or "ara" should start fresh intent even if something was locked
+        override_intent = None
+        if is_create_listing_command(message_body):
+            override_intent = "create_listing"
+        elif is_search_command(message_body):
+            override_intent = "search_listings"
+        elif is_show_more_command(message_body):
+            # "Daha fazla" - show next page of search results
+            override_intent = "show_more_results"
+        
+        if override_intent and override_intent != intent:
+            prev_locked = session.get("locked_intent")
+            intent = override_intent
+            session["intent"] = intent
+            # Don't lock "show_more_results", it's a one-time action
+            if override_intent != "show_more_results":
+                session["locked_intent"] = intent
+                locked_intent = intent
+            intent_reason = "command_override"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, intent)
+            await _record_fsm_event("intent_lock", session_id, session, {"new_intent": override_intent, "prev_locked": prev_locked, "trigger": "explicit_command_override"})
 
         if not intent:
             router_agent = IntentRouterAgent()
