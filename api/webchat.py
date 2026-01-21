@@ -741,6 +741,35 @@ def is_browse_all_command(message: str) -> bool:
     }
 
 
+def is_show_more_command(message: str) -> bool:
+    """Detects if user wants to see more search results (pagination)."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    return msg in {
+        "daha fazla",
+        "daha fazla göster",
+        "daha fazla goster",
+        "devam",
+        "devamı",
+        "devami",
+        "show more",
+        "more",
+        "sonraki",
+        "diğerleri",
+        "digerleri",
+        "next",
+        "devam et",
+        "devam göster",
+        "devam goster",
+        "kalan",
+        "kalanları göster",
+        "kalanlari goster",
+        "diğer ilanlar",
+        "diger ilanlar",
+    }
+
+
 def is_confirm_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
@@ -4039,12 +4068,17 @@ async def process_webchat_message(
                 override_intent = "create_listing"
             elif is_search_command(message_body):
                 override_intent = "search_listings"
+            elif is_show_more_command(message_body):
+                # "Daha fazla" - show next page of search results
+                override_intent = "show_more_results"
             if override_intent and override_intent != intent:
                 prev_locked = session.get("locked_intent")
                 intent = override_intent
                 session["intent"] = intent
-                session["locked_intent"] = intent
-                locked_intent = intent
+                # Don't lock "show_more_results", it's a one-time action
+                if override_intent != "show_more_results":
+                    session["locked_intent"] = intent
+                    locked_intent = intent
                 intent_reason = "command_override"
                 session_dirty = True
                 if not redis_disabled:
@@ -5250,6 +5284,99 @@ async def process_webchat_message(
                 "intent": "small_talk"  # Reset to allow new flow
             })
         
+        elif intent == "show_more_results":
+            # User wants to see next page of search results
+            log_fsm_event(
+                "pagination_show_more",
+                session_id,
+                session,
+                message_preview=message_body[:50]
+            )
+            
+            # Get cached search results
+            cached_listings = LAST_SEARCH_CACHE.get(session_id)
+            
+            if not cached_listings:
+                # Try to get from session search_context
+                search_ctx = session.get("search_context", {})
+                if not search_ctx or not search_ctx.get("results"):
+                    return await finalize_response({
+                        "success": False,
+                        "message": "Önce bir arama yapın. Örnek: 'ayakkabı varmı'",
+                        "data": {"type": "show_more_error"},
+                        "intent": "small_talk"
+                    })
+                # Use trimmed results from search_context (fallback)
+                cached_listings = search_ctx.get("results", [])
+            
+            # Get pagination state
+            current_offset = session.get("search_pagination_offset", 0)
+            total_count = session.get("search_total_count", len(cached_listings))
+            page_size = 5
+            
+            # Check if already at end
+            if current_offset >= total_count:
+                return await finalize_response({
+                    "success": True,
+                    "message": "Tüm sonuçlar gösterildi. 🎯\n\nYeni arama yapmak isterseniz ürün adı yazın.",
+                    "data": {"type": "pagination_end", "total": total_count},
+                    "intent": "small_talk"
+                })
+            
+            # Get next page
+            next_offset = current_offset + page_size
+            page_listings = cached_listings[current_offset:next_offset]
+            
+            if not page_listings:
+                return await finalize_response({
+                    "success": True,
+                    "message": "Başka sonuç bulunamadı.",
+                    "data": {"type": "pagination_end"},
+                    "intent": "small_talk"
+                })
+            
+            # Update pagination state
+            session["search_pagination_offset"] = next_offset
+            session_dirty = True
+            
+            # Format listings
+            msg_lines = []
+            for idx, listing in enumerate(page_listings, current_offset + 1):
+                title = listing.get("title") or "Başlıksız"
+                price = listing.get("price")
+                price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
+                category = listing.get("category") or "Kategori yok"
+                num_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"][idx - 1] if idx <= 10 else f"{idx}."
+                msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
+            
+            formatted = "\n".join(msg_lines)
+            
+            # Add pagination footer
+            showing_from = current_offset + 1
+            showing_to = min(next_offset, total_count)
+            
+            if next_offset < total_count:
+                footer = f"\n\n📄 {showing_from}-{showing_to} / {total_count} sonuç. Daha fazla için: **'devamı'** yaz"
+            else:
+                footer = f"\n\n📄 {showing_from}-{showing_to} / {total_count} sonuç (tümü gösterildi) ✅"
+            
+            footer += "\n\nDetay için: '1 nolu ilanın detayını göster' yazabilirsiniz."
+            message = formatted + footer
+            
+            return await finalize_response({
+                "success": True,
+                "message": message,
+                "data": {
+                    "type": "search_results_paginated",
+                    "listings": page_listings,
+                    "showing_from": showing_from,
+                    "showing_to": showing_to,
+                    "total": total_count,
+                    "has_more": next_offset < total_count
+                },
+                "intent": "small_talk"  # Don't lock intent
+            })
+        
         elif intent == "search_listings":
             log_fsm_event(
                 "flow_enter_search",
@@ -5390,18 +5517,70 @@ async def process_webchat_message(
 
             # Cache full results for follow-up detail requests
             # Store both in-memory cache AND session for Redis-less environments
-            if result.get("listings_full") is not None:
-                LAST_SEARCH_CACHE[session_id] = result["listings_full"]
+            full_listings = result.get("listings_full")
+            if full_listings is not None:
+                LAST_SEARCH_CACHE[session_id] = full_listings
                 
                 # Also persist in session using proper context manager
-                _store_search_context(session, message_body, result["listings_full"])
+                _store_search_context(session, message_body, full_listings)
                 session_dirty = True
+                
+                # Implement pagination: show first 5 results
+                page_size = 5
+                total_count = len(full_listings)
+                first_page = full_listings[:page_size]
+                
+                # Override search message with paginated results
+                search_message = result.get("message", "Arama sonuçları:")
+                
+                # Format first page listings
+                if first_page:
+                    msg_lines = [search_message, ""]
+                    for idx, listing in enumerate(first_page, 1):
+                        title = listing.get("title") or "Başlıksız"
+                        price = listing.get("price")
+                        price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
+                        category = listing.get("category") or "Kategori yok"
+                        num_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"][idx - 1] if idx <= 10 else f"{idx}."
+                        msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
+                    
+                    # Add pagination footer
+                    if total_count > page_size:
+                        footer = f"\n\n📄 1-{len(first_page)} / {total_count} sonuç. Daha fazla için: **'devamı'** yaz"
+                    else:
+                        footer = f"\n\n📄 {total_count} sonuç gösterildi ✅"
+                    
+                    msg_lines.append(footer)
+                    msg_lines.append("\nDetay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
+                    search_message = "\n".join(msg_lines)
+                    
+                    # Update response data with first page only
+                    response_data["listings"] = first_page
+                    response_data["showing_from"] = 1
+                    response_data["showing_to"] = len(first_page)
+                    response_data["total"] = total_count
+                    response_data["has_more"] = total_count > page_size
+            else:
+                search_message = result.get("message", "Search completed")
 
             # SOFT CONTEXT: If user was creating a listing, offer to return
-            search_message = result.get("message", "Search completed")
             paused_ctx = session.get("paused_context")
             if paused_ctx and paused_ctx.get("intent") == "create_listing" and paused_ctx.get("draft_id"):
                 search_message += "\n\n💡 _İlan oluşturmaya devam etmek için 'ilana devam' yazabilirsin._"
+            
+            # UNLOCK INTENT: After search completes, unlock so user can start a new flow (create_listing, new search, etc.)
+            # This prevents the "sticky search" bug where locked_intent=search_listings prevents creating listings after search
+            if session.get("locked_intent") == "search_listings":
+                session.pop("locked_intent", None)
+                session_dirty = True
+                log_fsm_event(
+                    "intent_unlock",
+                    session_id,
+                    session,
+                    prev_locked="search_listings",
+                    trigger="search_completed",
+                    message_preview=message_body[:50]
+                )
 
             return await finalize_response({
                 "success": result.get("success", False),

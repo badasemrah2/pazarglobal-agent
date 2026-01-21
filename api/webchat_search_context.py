@@ -87,6 +87,10 @@ def _store_search_context(session: Dict[str, Any], query: str, listings: Optiona
         "stored_at": _utc_now_iso(),
     }
     session["context_mode"] = "search"
+    # Pagination state - set to 5 because first page (0-5) is already shown
+    page_size = 5
+    session["search_pagination_offset"] = page_size  # Next page starts at 5
+    session["search_total_count"] = len(listings)  # Total available results
 
 
 def _store_active_listing(session: Dict[str, Any], listing: Dict[str, Any], source: str = "search") -> None:
