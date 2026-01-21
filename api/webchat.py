@@ -5346,8 +5346,14 @@ async def process_webchat_message(
                 price = listing.get("price")
                 price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
                 category = listing.get("category") or "Kategori yok"
+                location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
+                owner = listing.get("user_name") or "Anonim"
+                phone = listing.get("user_phone") or "Telefon yok"
                 num_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"][idx - 1] if idx <= 10 else f"{idx}."
-                msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
+                msg_lines.append(f"{num_emoji} **{title}**")
+                msg_lines.append(f"   💰 {price_txt} | 📍 {location}")
+                msg_lines.append(f"   👤 {owner} | 📞 {phone} | 🏷️ {category}")
+                msg_lines.append("")  # Empty line between listings
             
             formatted = "\n".join(msg_lines)
             
@@ -5405,7 +5411,7 @@ async def process_webchat_message(
                         "intent": intent
                     })
 
-                msg_lines = [f"🔍 Son {len(listings)} ilan:"]
+                msg_lines = [f"🔍 Son {len(listings)} ilan:", ""]
                 
                 # Emoji number mapping for better visibility
                 emoji_numbers = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟"}
@@ -5415,8 +5421,14 @@ async def process_webchat_message(
                     price = listing.get("price")
                     price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
                     category = listing.get("category") or "Kategori yok"
+                    location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
+                    owner = listing.get("user_name") or "Anonim"
+                    phone = listing.get("user_phone") or "Telefon yok"
                     num_emoji = emoji_numbers.get(idx, f"{idx}.")
-                    msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
+                    msg_lines.append(f"{num_emoji} **{title}**")
+                    msg_lines.append(f"   💰 {price_txt} | 📍 {location}")
+                    msg_lines.append(f"   👤 {owner} | 📞 {phone} | 🏷️ {category}")
+                    msg_lines.append("")  # Empty line between listings
 
                 msg_lines.append("Detay için: '1 nolu ilanın detayını göster' yazabilirsiniz.")
                 return await finalize_response({
@@ -5541,8 +5553,14 @@ async def process_webchat_message(
                         price = listing.get("price")
                         price_txt = f"{price} ₺" if price is not None else "Fiyat belirtilmemiş"
                         category = listing.get("category") or "Kategori yok"
+                        location = listing.get("location") or listing.get("user_location") or "Konum belirtilmemiş"
+                        owner = listing.get("user_name") or "Anonim"
+                        phone = listing.get("user_phone") or "Telefon yok"
                         num_emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"][idx - 1] if idx <= 10 else f"{idx}."
-                        msg_lines.append(f"{num_emoji} {title} - {price_txt} - {category}")
+                        msg_lines.append(f"{num_emoji} **{title}**")
+                        msg_lines.append(f"   💰 {price_txt} | 📍 {location}")
+                        msg_lines.append(f"   👤 {owner} | 📞 {phone} | 🏷️ {category}")
+                        msg_lines.append("")  # Empty line between listings
                     
                     # Add pagination footer
                     if total_count > page_size:
