@@ -61,5 +61,9 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     rate_limit_per_hour: int = 1000
     
+    # Alerting (Optional - for internal alerts without external services)
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    
 # Global settings instance
 settings = Settings()

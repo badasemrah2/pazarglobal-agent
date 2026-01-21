@@ -9,6 +9,7 @@ from config import settings
 from api import whatsapp, webchat
 from services.logger import get_logger
 from services.monitoring import monitoring_router
+from services.alerting import get_alerting_service
 
 # Shared logger instance for this module
 logger = get_logger(__name__)
@@ -145,6 +146,13 @@ async def startup_event():
     logger.info("🚀 PazarGlobal Agent API starting...")
     logger.info(f"Environment: {settings.api_env}")
     logger.info(f"Debug mode: {settings.debug}")
+    
+    # Configure alerting if credentials provided
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        alerting = get_alerting_service()
+        alerting.configure_telegram(settings.telegram_bot_token, settings.telegram_chat_id)
+        logger.info("✅ Telegram alerting enabled")
+    
     logger.info("✅ API ready")
 
 

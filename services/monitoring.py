@@ -6,6 +6,7 @@ from typing import Dict, List, Any
 from datetime import datetime, timedelta
 from services import supabase_client, redis_client
 from services.logger import get_logger
+from services.alerting import get_alerting_service
 
 logger = get_logger(__name__)
 
@@ -254,7 +255,7 @@ async def get_health_dashboard() -> Dict[str, Any]:
     
     overall_healthy = len(critical_issues) == 0
     
-    return {
+    health_data = {
         "healthy": overall_healthy,
         "timestamp": datetime.now().isoformat(),
         "critical_issues": critical_issues,
@@ -266,6 +267,12 @@ async def get_health_dashboard() -> Dict[str, Any]:
             "moderation_api": moderation
         }
     }
+    
+    # Check thresholds and send alerts
+    alerting = get_alerting_service()
+    await alerting.check_and_alert(health_data)
+    
+    return health_data
 
 
 # FastAPI endpoint for health dashboard
