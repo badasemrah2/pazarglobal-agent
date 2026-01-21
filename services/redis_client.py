@@ -32,10 +32,11 @@ _IN_MEMORY_WA_AUTH: Dict[str, str] = {}
 
 
 class RedisClient:
-    """Redis client for session state management"""
+    """Redis client for session state management with connection pooling"""
     
     def __init__(self):
         self._client: Optional[Any] = None  # type: ignore
+        self._pool: Optional[Any] = None  # Connection pool
         # Auto-detect Redis availability from environment
         redis_url = os.getenv("REDIS_URL", "")
         self.disabled = not redis_url or redis_url == "redis://localhost:6379"
@@ -45,25 +46,35 @@ class RedisClient:
             logger.warning("⚠️ Redis disabled - using in-memory fallback")
     
     async def get_client(self) -> Optional[Any]:
-        """Get or create Redis client"""
+        """Get or create Redis client with connection pooling"""
         if self.disabled:
             return None
         if self._client is None:
             import redis.asyncio as redis  # local import to avoid module load when disabled
             from config import settings
-            self._client = await redis.from_url(
+            
+            # Create connection pool for better performance
+            self._pool = redis.ConnectionPool.from_url(
                 settings.redis_url,
                 db=settings.redis_db,
-                decode_responses=True
+                decode_responses=True,
+                max_connections=10,  # Limit concurrent connections
+                socket_connect_timeout=5,
+                socket_keepalive=True,
+                health_check_interval=30
             )
+            self._client = redis.Redis(connection_pool=self._pool)
+            logger.info("✅ Redis connection pool initialized (max_connections=10)")
         return self._client
     
     async def close(self):
-        """Close Redis connection"""
+        """Close Redis connection and pool"""
         if self.disabled:
             return
         if self._client:
             await self._client.close()
+        if self._pool:
+            await self._pool.disconnect()
     
     # Session State Management
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
