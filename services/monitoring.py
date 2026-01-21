@@ -64,8 +64,8 @@ async def check_draft_orphans(hours: int = 24) -> Dict[str, Any]:
     try:
         cutoff = datetime.now() - timedelta(hours=hours)
         
-        # Query Supabase for old drafts
-        response = await supabase_client.client.table("active_drafts") \
+        # Query Supabase for old drafts (Supabase client is sync, not async)
+        response = supabase_client.client.table("active_drafts") \
             .select("id, user_id, updated_at") \
             .lt("updated_at", cutoff.isoformat()) \
             .execute()
@@ -103,7 +103,7 @@ async def check_draft_conflicts(hours: int = 1) -> Dict[str, Any]:
     try:
         cutoff = datetime.now() - timedelta(hours=hours)
         
-        response = await supabase_client.client.table("audit_logs") \
+        response = supabase_client.client.table("audit_logs") \
             .select("id, user_id, metadata, created_at") \
             .eq("action", "draft_conflict_detected") \
             .gte("created_at", cutoff.isoformat()) \
@@ -143,7 +143,7 @@ async def check_fsm_state_distribution() -> Dict[str, Any]:
     """
     try:
         # Query last 1000 FSM state changes
-        response = await supabase_client.client.table("audit_logs") \
+        response = supabase_client.client.table("audit_logs") \
             .select("metadata") \
             .eq("action", "fsm_state_change") \
             .order("created_at", desc=True) \
@@ -189,7 +189,7 @@ async def check_moderation_api_failures(hours: int = 1) -> Dict[str, Any]:
         cutoff = datetime.now() - timedelta(hours=hours)
         
         # Count total moderation checks
-        total_response = await supabase_client.client.table("audit_logs") \
+        total_response = supabase_client.client.table("audit_logs") \
             .select("id", count="exact") \
             .eq("action", "vision_analysis") \
             .gte("created_at", cutoff.isoformat()) \
@@ -198,7 +198,7 @@ async def check_moderation_api_failures(hours: int = 1) -> Dict[str, Any]:
         total = total_response.count or 0
         
         # Count failures (where metadata contains error)
-        failure_response = await supabase_client.client.table("audit_logs") \
+        failure_response = supabase_client.client.table("audit_logs") \
             .select("id, metadata, created_at") \
             .eq("action", "vision_analysis") \
             .not_.is_("metadata->error", "null") \
