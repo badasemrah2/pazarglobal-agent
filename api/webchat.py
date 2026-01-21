@@ -27,6 +27,7 @@ from agents import (
 from agents.vision_safety_gate import vision_safety_gate
 from config import settings
 from services import openai_client, redis_client, supabase_client
+from services.redis_atomic import get_atomic_ops
 from services.logger import (
     bind_session_logger,
     ensure_session_trace,
@@ -2913,7 +2914,9 @@ async def process_webchat_message(
             if not session_dirty:
                 session_dirty = True
             if session_dirty:
-                await persist_session_state(session_id, session)
+                # Use atomic merge to prevent race conditions
+                atomic = get_atomic_ops(redis_client)
+                await atomic.atomic_merge_updates(session_id, session)
             response_type = None
             data = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(data, dict):
@@ -5768,7 +5771,9 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
             # Never fail the media analysis response because of draft persistence
             pass
 
-    await persist_session_state(chat_message.session_id, session)
+    # Use atomic merge to prevent race conditions
+    atomic = get_atomic_ops(redis_client)
+    await atomic.atomic_merge_updates(chat_message.session_id, session)
 
     if not redis_is_disabled():
         await redis_client.add_message(chat_message.session_id, {
@@ -5873,7 +5878,9 @@ async def create_session(user_id: Optional[str] = None):
     """Create a new chat session"""
     session_id = f"web_{uuid.uuid4()}"
     
-    await persist_session_state(session_id, {
+    # Use atomic merge for new session creation
+    atomic = get_atomic_ops(redis_client)
+    await atomic.atomic_merge_updates(session_id, {
         "user_id": user_id or str(uuid.uuid4()),
         "intent": None,
         "active_draft_id": None,

@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from api import whatsapp, webchat
 from services.logger import get_logger
+from services.monitoring import monitoring_router
 
 # Shared logger instance for this module
 logger = get_logger(__name__)
@@ -33,6 +34,7 @@ app.add_middleware(
 # Include routers
 app.include_router(whatsapp.router)
 app.include_router(webchat.router)
+app.include_router(monitoring_router)
 
 
 @app.post("/agent/run")
