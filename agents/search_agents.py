@@ -89,9 +89,11 @@ class SearchComposerAgent(BaseAgent):
                 "otomobil": ["araba", "araç"],
                 "araç": ["araba", "otomobil"],
                 "telefon": ["cep telefonu", "akıllı telefon", "iphone", "samsung", "xiaomi", "huawei"],
-                "bilgisayar": ["laptop", "notebook", "pc", "masaüstü"],
-                "laptop": ["bilgisayar", "notebook", "dizüstü"],
-                "notebook": ["laptop", "bilgisayar", "dizüstü"],
+                "bilgisayar": ["laptop", "notebook", "pc", "masaüstü", "dizüstü", "dizustu"],
+                "laptop": ["bilgisayar", "notebook", "dizüstü", "dizustu", "pc"],
+                "notebook": ["laptop", "bilgisayar", "dizüstü", "dizustu", "pc"],
+                "dizüstü": ["laptop", "notebook", "bilgisayar", "dizustu"],
+                "dizustu": ["laptop", "notebook", "bilgisayar", "dizüstü"],
                 "harddisk": ["hard disk", "hdd", "ssd", "depolama"],
                 "hard disk": ["harddisk", "hdd", "ssd", "depolama"],
                 "portabledriver": ["portable driver", "taşınabilir disk", "harici disk"],
@@ -309,6 +311,7 @@ class SearchComposerAgent(BaseAgent):
                     "spor",           # broad category
                     "hobi",           # broad category
                     "antika",         # broad category
+                    "koleksiyon",     # broad category (would match both "anime" and "kitap")
                     "araba",          # maps to Otomotiv - listings have brand names not "araba"
                     "otomobil",       # same as araba
                     "araç",           # same as araba
@@ -316,7 +319,9 @@ class SearchComposerAgent(BaseAgent):
                 if meaningful and meaningful[0] in generic_category_terms:
                     return None
 
-                # For specific product types, keep the search_text so we can filter properly
+                # For specific product types, ALWAYS keep the search_text so we can filter properly
+                # This is critical to avoid false positives like "kitap varmı" matching "anime resmi"
+                # because both are in "Hobi, Koleksiyon & Sanat" category
                 return msg
 
             def _extract_price_filters(msg: str) -> tuple[float | None, float | None]:

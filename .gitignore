@@ -47,6 +47,13 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+test_*.py
+pytest.ini
+
+# SQL Scripts (not needed in production)
+*.sql
+supabase_*.sql
+migrations/test_*.sql
 
 # Railway
 .railway/

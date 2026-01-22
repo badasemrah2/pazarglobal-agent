@@ -1332,17 +1332,22 @@ class SupabaseClient:
                         ]
                         query = query.or_(",".join(clauses))
                     else:
-                        # Single-word query: can use token-based search for better recall
+                        # Single-word query: use broader matching for better recall
+                        # This ensures "laptop" matches "Dell Laptop", "dizüstü" matches "dizüstü bilgisayar"
                         clauses: List[str] = [
                             f"title.ilike.%{search_text}%",
                             f"description.ilike.%{search_text}%",
+                            f"category.ilike.%{search_text}%",  # Added: search in category too
                         ]
-                        # Add individual token search for single words
+                        # Add individual token search for single words (broad recall)
                         for tok in tokens[:4]:
+                            clauses.append(f"title.ilike.%{tok}%")
+                            clauses.append(f"description.ilike.%{tok}%")
                             clauses.append(f"metadata->>keywords_text.ilike.%{tok}%")
                         clauses.append(f"metadata->>keywords_text.ilike.%{search_text}%")
                         query = query.or_(",".join(clauses))
                 else:
+                    # Legacy fallback: title/description only (less accurate but faster)
                     query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
             
             result = query.limit(limit).execute()
