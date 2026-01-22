@@ -3415,8 +3415,30 @@ async def process_webchat_message(
                 session["pending_media_analysis"] = []
                 session_dirty = True
 
+                # Build user-facing message with vision analysis
                 msg_parts = []
                 if added:
+                    # Show vision analysis for added images
+                    vision_summary_parts = []
+                    for url in incoming_media_urls:
+                        if url in existing_urls or url not in analysis_by_url:
+                            continue
+                        analysis = analysis_by_url.get(url, {})
+                        if isinstance(analysis, dict):
+                            product = analysis.get("product", "")
+                            condition = analysis.get("condition", "")
+                            features = analysis.get("features", [])
+                            if product:
+                                vision_summary_parts.append(f"📷 {product}")
+                            if condition:
+                                vision_summary_parts.append(f"Durum: {condition}")
+                            if isinstance(features, list) and features:
+                                vision_summary_parts.append(f"Özellikler: {', '.join(features[:3])}")
+                    
+                    if vision_summary_parts:
+                        msg_parts.append("\n".join(vision_summary_parts))
+                        msg_parts.append("")  # Empty line separator
+                    
                     msg_parts.append(f"Resim eklendi. Şu an {current_count} / 5 resim eklediniz.")
                 elif duplicates and not (blocked or ignored):
                     msg_parts.append("Bu görsel zaten ekli.")
@@ -3429,7 +3451,7 @@ async def process_webchat_message(
 
                 return await finalize_response({
                     "success": True,
-                    "message": " ".join(msg_parts),
+                    "message": "\n".join(msg_parts),
                     "data": {
                         "type": "image_added",
                         "draft_id": draft_id,
