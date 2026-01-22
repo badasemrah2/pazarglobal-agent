@@ -587,6 +587,108 @@ def is_show_draft_command(message: str) -> bool:
     )
 
 
+def is_edit_command(message: str) -> bool:
+    """Check if message is an edit command for preview (title/description)."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+    
+    # Edit keywords
+    edit_keywords = [
+        "duzenle", "düzenle", "degistir", "değiştir", "edit", 
+        "aciklama", "açıklama", "baslik", "başlık",
+        "ekle", "cikar", "çıkar", "sil", "kaldir", "kaldır"
+    ]
+    
+    return any(kw in msg for kw in edit_keywords)
+
+
+def parse_edit_command(message: str, draft: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Parse edit command into structured action.
+    
+    Returns:
+        {"action": "replace_description", "content": "yeni metin"}
+        {"action": "append_description", "content": "ek bilgi"}
+        {"action": "remove_from_description", "content": "silinecek kelime"}
+        {"action": "replace_title", "content": "yeni başlık"}
+        {"action": "remove_from_title", "content": "silinecek kelime"}
+        None if command not recognized
+    """
+    msg = normalize_for_match(message)
+    if not msg:
+        return None
+    
+    # Pattern 1: "Açıklama şu olsun: X" → Replace description
+    if "aciklama" in msg or "açıklama" in msg:
+        # Replace patterns
+        for pattern in ["su olsun", "şu olsun", "soyle olsun", "şöyle olsun", "degistir", "değiştir"]:
+            if pattern in msg:
+                # Extract content after pattern
+                idx = msg.find(pattern)
+                if idx != -1:
+                    content = message[idx + len(pattern):].strip()
+                    # Remove common separators
+                    for sep in [":", "-", "→"]:
+                        if content.startswith(sep):
+                            content = content[1:].strip()
+                    if content:
+                        return {"action": "replace_description", "content": content}
+        
+        # Append patterns
+        for pattern in ["ekle", "ekleyelim", "eklenir", "eklensin", "ilave et"]:
+            if pattern in msg:
+                # Extract content after "ekle"
+                idx = msg.find(pattern)
+                if idx != -1:
+                    content = message[idx + len(pattern):].strip()
+                    for sep in [":", "-", "→"]:
+                        if content.startswith(sep):
+                            content = content[1:].strip()
+                    if content:
+                        return {"action": "append_description", "content": content}
+        
+        # Remove patterns
+        for pattern in ["cikar", "çıkar", "sil", "kaldir", "kaldır"]:
+            if pattern in msg:
+                # Extract content after pattern
+                idx = msg.find(pattern)
+                if idx != -1:
+                    content = message[idx + len(pattern):].strip()
+                    for sep in [":", "-", "→"]:
+                        if content.startswith(sep):
+                            content = content[1:].strip()
+                    if content:
+                        return {"action": "remove_from_description", "content": content}
+    
+    # Pattern 2: "Başlık şu olsun: X" → Replace title
+    if "baslik" in msg or "başlık" in msg:
+        # Replace patterns
+        for pattern in ["su olsun", "şu olsun", "soyle olsun", "şöyle olsun", "degistir", "değiştir"]:
+            if pattern in msg:
+                idx = msg.find(pattern)
+                if idx != -1:
+                    content = message[idx + len(pattern):].strip()
+                    for sep in [":", "-", "→"]:
+                        if content.startswith(sep):
+                            content = content[1:].strip()
+                    if content:
+                        return {"action": "replace_title", "content": content}
+        
+        # Remove patterns
+        for pattern in ["cikar", "çıkar", "sil", "kaldir", "kaldır"]:
+            if pattern in msg:
+                idx = msg.find(pattern)
+                if idx != -1:
+                    content = message[idx + len(pattern):].strip()
+                    for sep in [":", "-", "→"]:
+                        if content.startswith(sep):
+                            content = content[1:].strip()
+                    if content:
+                        return {"action": "remove_from_title", "content": content}
+    
+    return None
+
+
 def is_help_or_next_step_query(message: str) -> bool:
     """Return True when the user asks what to do next (meta/help), not slot content.
 
@@ -1085,6 +1187,91 @@ def detects_product_change(message: str, current_draft: Dict[str, Any]) -> Optio
                     return product.title()
     
     return None
+
+
+async def handle_preview_edit_flow(
+    message_body: str,
+    session: Dict[str, Any],
+    draft: Dict[str, Any],
+    user_id: str
+) -> Optional[Dict[str, Any]]:
+    """Handle edit commands during preview phase.
+    
+    Returns:
+        Updated draft dict if edit was successful
+        None if command not recognized or failed
+    """
+    edit_cmd = parse_edit_command(message_body, draft)
+    if not edit_cmd:
+        return None
+    
+    action = edit_cmd["action"]
+    content = edit_cmd["content"]
+    listing = draft.get("listing_data", {})
+    
+    # Action handlers
+    if action == "replace_description":
+        listing["description"] = content
+        logger.info(f"Preview edit: replaced description with user content (len={len(content)})")
+    
+    elif action == "append_description":
+        current_desc = str(listing.get("description") or "").strip()
+        if current_desc:
+            # Re-run DescriptionAgent to merge cleanly
+            from agents.description_agent import DescriptionAgent
+            desc_agent = DescriptionAgent()
+            
+            result = await desc_agent.run(
+                user_message=f"Mevcut açıklama: {current_desc}\n\nEklenecek bilgi: {content}",
+                draft_id=draft["id"],
+                user_id=user_id,
+                phone_number=session.get("phone_number") or session.get("session_id")
+            )
+            
+            if result.get("success"):
+                updated_draft = result.get("draft", {})
+                listing["description"] = updated_draft.get("listing_data", {}).get("description", current_desc)
+                logger.info(f"Preview edit: appended to description via DescriptionAgent")
+            else:
+                # Fallback: simple append
+                listing["description"] = f"{current_desc}\n\n{content}"
+                logger.warning("DescriptionAgent failed during append, using simple concatenation")
+        else:
+            listing["description"] = content
+    
+    elif action == "remove_from_description":
+        current_desc = str(listing.get("description") or "").strip()
+        # Simple removal (case-insensitive)
+        import re
+        pattern = re.compile(re.escape(content), re.IGNORECASE)
+        new_desc = pattern.sub("", current_desc).strip()
+        listing["description"] = new_desc
+        logger.info(f"Preview edit: removed '{content}' from description")
+    
+    elif action == "replace_title":
+        listing["title"] = content
+        logger.info(f"Preview edit: replaced title with user content")
+    
+    elif action == "remove_from_title":
+        current_title = str(listing.get("title") or "").strip()
+        import re
+        pattern = re.compile(re.escape(content), re.IGNORECASE)
+        new_title = pattern.sub("", current_title).strip()
+        listing["title"] = new_title
+        logger.info(f"Preview edit: removed '{content}' from title")
+    
+    else:
+        logger.warning(f"Unknown edit action: {action}")
+        return None
+    
+    # Save updated draft
+    draft["listing_data"] = listing
+    try:
+        await supabase_client.update_draft(draft["id"], draft)
+        return draft
+    except Exception as e:
+        logger.error(f"Failed to save edited draft: {e}")
+        return None
 
 
 async def handle_publish_or_delete_flow(
@@ -5167,8 +5354,110 @@ async def process_webchat_message(
                 draft = result["draft"]
 
                 # Step-by-step UX: ask only the next missing slot.
-                # (Full summary is still available via build_draft_status_message if needed.)
                 slot = next_missing_slot(draft)
+                
+                # CRITICAL: If all slots filled AND publishable → Show PREVIEW (not just status message)
+                if slot is None and draft_is_publishable(draft):
+                    # Check if user sent edit command (preview already shown)
+                    if session.get("preview_shown") and is_edit_command(message_body):
+                        # Handle edit flow
+                        updated_draft = await handle_preview_edit_flow(
+                            message_body=message_body,
+                            session=session,
+                            draft=draft,
+                            user_id=user_id
+                        )
+                        
+                        if updated_draft:
+                            draft = updated_draft
+                            # Re-generate preview with edited content
+                            cost = int(settings.listing_credit_cost)
+                            balance_result = await get_wallet_balance_tool.execute(user_id=user_id)
+                            balance = balance_result.get("data", {}).get("balance") if balance_result.get("success") else None
+                            
+                            preview_data = build_draft_preview_payload(draft)
+                            response_text = format_preview_message(
+                                preview_data, 
+                                cost, 
+                                balance,
+                                highlight="✅ Değişiklik kaydedildi.",
+                                include_vision=not bool(session.get("vision_explained"))
+                            )
+                            
+                            response_data.update({
+                                "type": "publish_preview",
+                                "draft_id": result["draft_id"],
+                                "preview": preview_data,
+                                "credit_cost": cost
+                            })
+                            
+                            return await finalize_response({
+                                "success": True,
+                                "message": response_text,
+                                "data": response_data,
+                                "intent": intent
+                            })
+                        else:
+                            # Edit command not understood - soft fallback
+                            response_text = (
+                                "Düzenleme komutunu tam anlayamadım. Şunları deneyebilirsin:\n\n"
+                                "• \"Açıklama şu olsun: [yeni metin]\"\n"
+                                "• \"Açıklamaya [bilgi] ekle\"\n"
+                                "• \"Açıklamadan [kelime] sil\"\n"
+                                "• \"Başlık şu olsun: [yeni başlık]\"\n\n"
+                                "Ya da 'yayınla' yazarak devam edebilirsin."
+                            )
+                            response_data.update({
+                                "type": "publish_preview",
+                                "draft_id": result["draft_id"]
+                            })
+                            
+                            return await finalize_response({
+                                "success": True,
+                                "message": response_text,
+                                "data": response_data,
+                                "intent": intent
+                            })
+                    
+                    # First time showing preview - generate it
+                    cost = int(settings.listing_credit_cost)
+                    balance_result = await get_wallet_balance_tool.execute(user_id=user_id)
+                    balance = balance_result.get("data", {}).get("balance") if balance_result.get("success") else None
+                    
+                    preview_data = build_draft_preview_payload(draft)
+                    
+                    # Check if no images - add soft reminder
+                    highlight_msg = None
+                    if preview_data.get("image_count", 0) == 0:
+                        highlight_msg = "💡 İPUCU: İlan için fotoğraf eklemek ister misin? Daha fazla ilgi çeker."
+                    
+                    response_text = format_preview_message(
+                        preview_data, 
+                        cost, 
+                        balance,
+                        highlight=highlight_msg,
+                        include_vision=not bool(session.get("vision_explained"))
+                    )
+                    
+                    # Mark preview as shown
+                    session["preview_shown"] = True
+                    session_dirty = True
+                    
+                    response_data.update({
+                        "type": "publish_preview",
+                        "draft_id": result["draft_id"],
+                        "preview": preview_data,
+                        "credit_cost": cost
+                    })
+                    
+                    return await finalize_response({
+                        "success": True,
+                        "message": response_text,
+                        "data": response_data,
+                        "intent": intent
+                    })
+                
+                # Slot still missing OR not publishable yet
                 if slot is None:
                     response_text = build_draft_status_message(draft, include_vision=not bool(session.get("vision_explained")))
                 else:
