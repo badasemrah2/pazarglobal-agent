@@ -76,17 +76,45 @@ def is_search_command(message: str) -> bool:
 
 
 async def get_or_create_session(phone_number: str) -> str:
-    """Get or create session for phone number"""
+    """Get or create session for phone number, resolving to real Supabase user_id"""
+    from services.supabase_client import supabase_client
+    
     # Use phone number as session identifier
     session_id = f"whatsapp_{phone_number.replace('+', '').replace(':', '')}"
     
     # Check if session exists
     session = await redis_client.get_session(session_id)
     if not session:
-        # Create new session
+        # CRITICAL: Map phone_number to real Supabase user_id via user_security table
+        try:
+            # Query user_security table (has phone→user_id mapping + PIN)
+            response = supabase_client.table("user_security").select("user_id").eq("phone", phone_number).execute()
+            
+            if response.data and len(response.data) > 0:
+                real_user_id = response.data[0]["user_id"]
+                logger.info(f"✅ WhatsApp phone {phone_number} mapped to user_id: {real_user_id}")
+            else:
+                # User not registered or hasn't set up WhatsApp PIN
+                logger.warning(f"⚠️ WhatsApp phone {phone_number} NOT FOUND in user_security table!")
+                logger.error(f"❌ User must register via web and set WhatsApp PIN in profile settings")
+                # Return error message instead of creating phantom user
+                raise ValueError(
+                    "🔒 WhatsApp kullanımı için önce web sitesinden kayıt olup "
+                    "profil ayarlarından WhatsApp PIN tanımlamanız gerekiyor."
+                )
+        except ValueError as ve:
+            # Re-raise user-facing errors
+            raise ve
+        except Exception as e:
+            logger.error(f"❌ Failed to query user_security table: {e}")
+            raise Exception(
+                "Sistem hatası oluştu. Lütfen daha sonra tekrar deneyin."
+            )
+        
+        # Create new session with REAL user_id from user_security table
         await redis_client.set_session(session_id, {
             "phone_number": phone_number,
-            "user_id": str(uuid.uuid4()),  # Generate temp user_id
+            "user_id": real_user_id,  # ✅ Real user_id from user_security table
             "intent": None,
             "active_draft_id": None
         })
