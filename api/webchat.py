@@ -5598,8 +5598,18 @@ async def process_webchat_message(
             category = extracted.get("category")
 
             # Clean generic titles
-            if title and title.lower() in ["fiyat", "kaç para", "ne kadar", "ederi ne", "ürün", "urun", "eder"]:
-                title = None
+            if title:
+                # 1. Remove question suffixes inside specific titles (e.g. "iphone 11 ne kadar")
+                title = re.sub(
+                    r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|nedir|ne|kaca|kaça|eder|ederi|piyasası)(\s+|$)", 
+                    "", 
+                    title, 
+                    flags=re.IGNORECASE
+                ).strip()
+
+                # 2. Check if result is generic
+                if not title or title.lower() in ["fiyat", "ücret", "değer", "ürün", "urun"]:
+                    title = None
 
             # Fallback to vision
             if not title and vision_data:
