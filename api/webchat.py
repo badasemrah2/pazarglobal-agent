@@ -3776,12 +3776,15 @@ async def process_webchat_message(
                     "intent": "search_listings",
                 })
 
-            # price_research
+            # price_research - FIX: Intent lock eklendi (Problem 1)
+            session["intent"] = "price_research"
+            session["locked_intent"] = "price_research"
+            session_dirty = True
             return await finalize_response({
                 "success": True,
                 "message": "Anladım. Fiyat araştırması yapmak için 'kaç para eder' yazabilir veya ürünle ilgili kısa bir bilgi ekleyebilirsiniz.",
                 "data": {"type": "price_research_intro"},
-                "intent": None,
+                "intent": "price_research",
             })
 
         # PRE-INTENT BUFFER RULE:
@@ -5160,7 +5163,29 @@ async def process_webchat_message(
                 description = (listing.get("description") or "").strip()
                 category = (listing.get("category") or "").strip()
                 user_condition = str(listing.get("condition") or "").strip()
-                condition_for_price = canonicalize_condition(user_condition) or "2. El"
+                
+                # FIX Problem 5: Condition zorunlu kontrolü
+                # Eğer condition yoksa, önce durumu soralım!
+                if not user_condition:
+                    return await finalize_response({
+                        "success": True,
+                        "message": (
+                            "Fiyat araştırması için önce ürünün durumunu belirtmeniz gerekiyor. 📊\n\n"
+                            "Ürün sıfır mı, 2. el mi, yoksa az kullanılmış mı?\n\n"
+                            "(Örnek: 'sıfır', '2. el', 'az kullanılmış')"
+                        ),
+                        "data": {
+                            "type": "slot_prompt",
+                            "slot": "condition",
+                            "draft_id": draft_id,
+                            "reason": "required_for_price_inquiry"
+                        },
+                        "intent": intent,
+                    })
+                
+                condition_for_price = canonicalize_condition(user_condition)
+                if not condition_for_price:
+                    condition_for_price = "2. El"  # Fallback (eski davranış)
 
                 # If we don't have a title yet, fall back to vision product/category
                 if not title and isinstance(vision, dict):

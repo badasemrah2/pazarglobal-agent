@@ -372,6 +372,12 @@ class SupabaseClient:
 
         This is used when the platform enforces a single in-progress draft per user,
         but the user is clearly starting a brand-new listing flow.
+        
+        FIX Problem 2: Temizlik kapsamı genişletildi:
+        - listing_data tüm fieldları
+        - vision_product (önceki resim analizi kalmasın)
+        - images array
+        - metadata (buffered_media temizleniyor)
         """
         try:
             listing_data = {
@@ -379,6 +385,8 @@ class SupabaseClient:
                 "description": None,
                 "price": None,
                 "category": None,
+                "location": None,  # FIX: Eklendi
+                "condition": None,  # FIX: Eklendi
             }
             if phone_number:
                 listing_data["contact_phone"] = phone_number
@@ -387,7 +395,8 @@ class SupabaseClient:
                 "state": "in_progress",
                 "listing_data": listing_data,
                 "images": [],
-                "vision_product": {}
+                "vision_product": {},
+                "metadata": {}  # FIX: Metadata temizleniyor (buffered_media vb.)
             }).eq("id", draft_id).execute()
             return bool(result.data)
         except Exception as e:
