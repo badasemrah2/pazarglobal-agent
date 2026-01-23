@@ -3161,7 +3161,14 @@ async def process_webchat_message(
         if session.get("fsm_state") in {"parked", "timeout"}:
             logger.info(f"Session {session_id[:8]}... in {session.get('fsm_state')} state, awaiting resume/cancel")
             if is_resume_command(message_body):
-                restored_intent = session.get("parked_intent") or session.get("fsm_state_intent") or session.get("intent") or session.get("locked_intent") or "create_listing"
+                # Priority: parked_intent (explicit parking) > locked_intent (active flow) > intent > fsm_state_intent
+                restored_intent = (
+                    session.get("parked_intent") or 
+                    session.get("locked_intent") or 
+                    session.get("fsm_state_intent") or 
+                    session.get("intent") or 
+                    "create_listing"
+                )
                 session["locked_intent"] = restored_intent
                 session["intent"] = restored_intent
                 session["parked_intent"] = None
@@ -5190,6 +5197,24 @@ async def process_webchat_message(
                 # If we don't have a title yet, fall back to vision product/category
                 if not title and isinstance(vision, dict):
                     title = str(vision.get("product") or vision.get("category") or "").strip()
+                
+                # FIX: Title still missing after vision fallback → Prompt user!
+                if not title or title in ["ürün", "Ürün", "urun"]:
+                    return await finalize_response({
+                        "success": True,
+                        "message": (
+                            "Fiyat araştırması için ürün adını belirtmeniz gerekiyor. 🔍\n\n"
+                            "Hangi ürün için fiyat araştırması yapalım?\n\n"
+                            "(Örnek: 'iPhone 17 Pro Max', 'Nike Air Max 270', 'Samsung Galaxy S21 FE')"
+                        ),
+                        "data": {
+                            "type": "slot_prompt",
+                            "slot": "title",
+                            "draft_id": draft_id,
+                            "reason": "required_for_price_research"
+                        },
+                        "intent": "price_research",
+                    })
 
                 # If we don't have a useful category yet, best-effort map vision category to library.
                 # This improves cache hit rate (product_key includes category) and Perplexity query relevance.
