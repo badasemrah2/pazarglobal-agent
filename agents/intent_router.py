@@ -46,16 +46,16 @@ class IntentRouterAgent(BaseAgent):
                     "properties": {
                         "intent": {
                             "type": "string",
-                            "enum": ["create_listing", "publish_or_delete", "search_listings", "small_talk", "ambiguous"],
-                            "description": "The primary classified intent. Use 'ambiguous' if multiple clear intents detected."
+                            "enum": ["create_listing", "publish_or_delete", "search_listings", "price_research", "small_talk", "ambiguous"],
+                            "description": "The primary classified intent. Use 'ambiguous' if multiple clear intents detected. Use 'price_research' when user ONLY wants to learn price (no listing creation or search)."
                         },
                         "detected_intents": {
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": ["create_listing", "search_listings", "price_inquiry"]
+                                "enum": ["create_listing", "search_listings", "price_research"]
                             },
-                            "description": "List of all detected intents when ambiguous. Empty if not ambiguous."
+                            "description": "List of all detected intents when ambiguous. Empty if not ambiguous. price_research = standalone price inquiry."
                         },
                         "confidence": {
                             "type": "string",

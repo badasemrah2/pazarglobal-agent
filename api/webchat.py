@@ -403,7 +403,7 @@ async def _generate_clarification_message(detected_intents: List[str], original_
     option_num = 1
     
     # Always show in this order for consistency
-    if "price_inquiry" in detected_intents:
+    if "price_research" in detected_intents:
         options.append(f"{option_num}️⃣ **Fiyatını öğrenmek**")
         option_num += 1
     
@@ -460,8 +460,8 @@ def _parse_clarification_choice(message: str, detected_intents: List[str]) -> Op
     
     # Keyword-based selection (expanded for better coverage)
     if any(kw in msg for kw in ["fiyat", "fiyatini", "fiyatını", "deger", "değer", "kac para", "kaç para", "ogren", "öğren"]):
-        if "price_inquiry" in detected_intents:
-            return "price_inquiry"
+        if "price_research" in detected_intents:
+            return "price_research"
     
     if any(kw in msg for kw in ["ara", "arama", "bul", "goster", "göster", "bak", "ilanlara", "piyasa", "satilan", "satılan"]):
         if "search_listings" in detected_intents:
@@ -4344,7 +4344,7 @@ async def process_webchat_message(
                 })
 
             # Only lock "task" intents; keep small_talk unlocked.
-            if intent in {"create_listing", "search_listings"}:
+            if intent in {"create_listing", "search_listings", "price_research"}:
                 prev_locked_router = session.get("locked_intent")
                 session["locked_intent"] = intent
                 locked_intent = intent
@@ -4403,7 +4403,7 @@ async def process_webchat_message(
                         acknowledgment = {
                             "create_listing": "Tamam, ilan oluşturalım! 📝",
                             "search_listings": "Hemen arayalım! 🔍",
-                            "price_inquiry": "Fiyat araştırması yapıyorum... 📊"
+                            "price_research": "Fiyat araştırması yapıyorum... 📊"
                         }.get(user_choice, "Anladım.")
                         
                         # Store acknowledgment for use in the actual flow response
@@ -5572,80 +5572,104 @@ async def process_webchat_message(
                 "intent": publish_payload.get("intent")
             })
         
-        elif intent == "price_inquiry":
-            # Price research flow: quick estimation without creating full listing
-            log_fsm_event(
-                "flow_enter_price_inquiry",
-                session_id,
-                session,
-            )
-            
-            # Check if user provided image(s)
+        elif intent == "price_research":
+            # STANDALONE Price Research Flow
+            log_fsm_event("flow_enter_price_research", session_id, session)
+
+            # 1. Media Analysis (if needed)
             media_urls = session.get("pending_media_urls") or []
+            vision_data = {}
+            if media_urls:
+                vision_analyses = session.get("pending_media_analysis")
+                if not vision_analyses:
+                    vision_analyses = await analyze_media_with_vision(media_urls) 
+                    session["pending_media_analysis"] = vision_analyses
+                    session_dirty = True
+                if vision_analyses and isinstance(vision_analyses, list):
+                    first = vision_analyses[0]
+                    if isinstance(first, dict):
+                        vision_data = first.get("analysis") or {}
+
+            # 2. Extract Fields (Title, Condition, Category)
+            # Use heuristics first
+            extracted = extract_listing_fields_from_freeform(message_body)
+            title = extracted.get("title")
+            user_condition = extracted.get("condition")
+            category = extracted.get("category")
+
+            # Clean generic titles
+            if title and title.lower() in ["fiyat", "kaç para", "ne kadar", "ederi ne", "ürün", "urun", "eder"]:
+                title = None
+
+            # Fallback to vision
+            if not title and vision_data:
+                title = vision_data.get("product") or vision_data.get("category")
             
-            if not media_urls:
-                # Ask for image or product details
+            if not category and vision_data:
+                category = vision_data.get("category")
+
+            # 3. Validation
+            if not title:
                 return await finalize_response({
                     "success": True,
-                    "message": (
-                        "Fiyat araştırması için:\n\n"
-                        "📷 Ürünün fotoğrafını gönderebilirsiniz\n"
-                        "veya\n"
-                        "📝 Ürün bilgilerini yazın (marka, model, durum)\n\n"
-                        "Örnek: 'Samsung S21 128GB, 2. el, temiz'"
-                    ),
-                    "data": {"type": "price_inquiry", "awaiting_input": True},
-                    "intent": intent
+                    "message": "Fiyat araştırması için ürünün marka ve modelini yazmanız gerekiyor. 🔍\n\nÖrnek: 'iPhone 13 128GB'",
+                    "data": {"type": "slot_prompt", "slot": "title"},
+                    "intent": "price_research"
                 })
-            
-            # User has media - use vision analysis for price inquiry
-            vision_analyses = session.get("pending_media_analysis") or []
-            
-            if not vision_analyses:
-                # Run vision analysis
-                vision_analyses = await analyze_media_with_vision(media_urls)
-                session["pending_media_analysis"] = vision_analyses
-                session_dirty = True
-            
-            # Extract product info from vision
-            product_info = ""
-            for analysis in vision_analyses:
-                parsed = analysis.get("analysis") or {}
-                if isinstance(parsed, dict):
-                    product = parsed.get("product") or parsed.get("category", "")
-                    if product:
-                        product_info = product
-                        break
-            
-            # Clear pending media
-            session["pending_media_urls"] = []
-            session["pending_media_analysis"] = []
-            session["intent"] = None  # Reset intent
-            session["locked_intent"] = None
-            session_dirty = True
-            
-            # Generate response
-            if product_info:
-                response_msg = (
-                    f"📊 **{product_info}** için fiyat bilgisi:\n\n"
-                    "Piyasa fiyatlarını araştırıyorum... Bu özellik yakında aktif olacak!\n\n"
-                    "Şimdi ne yapmak istersiniz?\n"
-                    "• 'ilan ver' yazarak satış ilanı oluşturabilirsiniz\n"
-                    "• 'benzer ara' yazarak benzer ilanları görebilirsiniz"
-                )
+
+            # Condition normalization
+            condition = "2. El"  # Default
+            if user_condition:
+                parsed_cond = canonicalize_condition(user_condition)
+                if parsed_cond:
+                    condition = parsed_cond
+
+            # 4. Execute Price Search
+            price_resp = await supabase_client.suggest_price_cached(
+                title=title,
+                category=category or "Diğer",
+                description="",
+                condition=condition,
+                vision=vision_data,
+                user_claim=message_body
+            )
+
+            # 5. Format Response
+            if price_resp.get("success") and price_resp.get("price") is not None:
+                suggested = int(price_resp.get("price"))
+                cached = bool(price_resp.get("cached"))
+                confidence = price_resp.get("confidence")
+                
+                min_p = price_resp.get("min_price")
+                max_p = price_resp.get("max_price")
+                
+                # Better formatting
+                msg = f"📊 **{title}** ({condition})\n\n"
+                msg += f"💰 **Ortalama Piyasa Değeri: {suggested:,} TL**\n"
+                if min_p and max_p:
+                     msg += f"📉 Aralık: {min_p:,} TL - {max_p:,} TL\n"
+                
+                msg += f"\nBu bilgiler güncel pazar verilerine dayanmaktadır."
+                if confidence and float(confidence) < 0.5:
+                    msg += "\n⚠️ (Veri azlığından tahmin hata payı olabilir)"
+
+                msg += "\n\nNe yapmak istersiniz?\n"
+                msg += "• 'ilan ver' yazarak bu fiyattan satabilirsiniz\n"
+                msg += "• 'benzer ara' yazarak ilanlara bakabilirsiniz"
+                
+                return await finalize_response({
+                    "success": True,
+                    "message": msg,
+                    "data": {"type": "price_result", "price": suggested, "currency": "TL"},
+                    "intent": "price_research"
+                })
             else:
-                response_msg = (
-                    "Görselden ürün bilgisi çıkaramadım. 😔\n\n"
-                    "Ürün bilgilerini yazarak tekrar deneyebilirsiniz:\n"
-                    "Örnek: 'Samsung S21 128GB kaç para eder'"
-                )
-            
-            return await finalize_response({
-                "success": True,
-                "message": response_msg,
-                "data": {"type": "price_inquiry", "product": product_info},
-                "intent": "small_talk"  # Reset to allow new flow
-            })
+                return await finalize_response({
+                    "success": False,
+                    "message": f"'{title}' için güncel fiyat bilgisine ulaşamadım. 😔\nDaha detaylı model adı belirtebilir misiniz?",
+                    "data": {"type": "error"},
+                    "intent": "price_research"
+                })
         
         elif intent == "show_more_results":
             # User wants to see next page of search results

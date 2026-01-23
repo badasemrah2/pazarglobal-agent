@@ -10,6 +10,7 @@ Görevin:
   * create_listing: İlan hazırlamak veya düzenlemek istiyor
   * publish_or_delete: İlanını yayınlamak veya silmek istiyor  
   * search_listings: İlan aramak veya göz atmak istiyor
+  * price_research: SADECE fiyat öğrenmek istiyor (ilan verme veya arama OLMADAN)
   * small_talk: Genel sohbet, platform soruları veya belirsiz niyet
   * ambiguous: Birden fazla net niyet tespit edildi (kullanıcıya sormak gerekiyor)
 
@@ -27,8 +28,27 @@ Multi-Intent Detection (ÇIKARI AMBIGUOUS):
   
   🔥 HARD RULES - HER ZAMAN AMBIGUOUS:
   * create_listing + search_listings => "satmak istiyorum + piyasaya bakmak"
-  * "Fiyat öğrenme + ilan verme" => create_listing (fiyat öğrenme ilan vermenin parçası)
-  * "Fiyat öğrenme + piyasaya bakma" => search_listings (fiyat piyasa araştırmasının parçası)
+  * create_listing + price_research => "satmak istiyorum + kaç para eder"
+  * search_listings + price_research => "var mı + kaç para eder"
+  
+  ⚠️ PRICE_RESEARCH (STANDALONE) vs CONTEXT-LÜ FIYAT:
+  * "iPhone 17 Pro Max kaç para eder" => price_research ✅ (TEK niyet, SADECE fiyat)
+  * "Samsung Galaxy S24 fiyatı nedir" => price_research ✅ (TEK niyet)
+  * "ne kadara satılır" => price_research ✅ (TEK niyet)
+  * "piyasa değeri ne" => price_research ✅ (TEK niyet)
+  
+  FAKAT:
+  * "iPhone 13 satmak istiyorum kaç para eder" => create_listing ✅ (fiyat, ilan vermenin parçası)
+  * "Samsung S21 var mı kaç para" => search_listings ✅ (fiyat, arama context'inde)
+  * "MacBook satacağım kaç liraya koymalıyım" => create_listing ✅ (fiyat, ilan context'inde)
+  
+  🔑 Anahtar kelimeler (STANDALONE olduğunda => price_research):
+  * "kaç para", "kaç lira", "fiyat", "fiyatı", "fiyatını", "ne kadar", "piyasa değeri", "satılır", "eder"
+  
+  detected_intents array'ine tespit edilen TÜM intentleri ekle:
+  - create_listing: "satmak", "ilan vermek", "ilan oluştur", "satacağım", "satayım"
+  - search_listings: "var mı", "piyasada", "ilanlara bak", "satılanlar", "ara"
+  - price_research: "kaç para eder", "fiyatı nedir", "ne kadar" (STANDALONE)
   
   Ambiguous örnekleri (SADECE 2+ FARKLI İŞ varsa):
   * "iPhone 13 satacağım ama önce piyasadaki ilanlara bakayım" 
@@ -37,23 +57,27 @@ Multi-Intent Detection (ÇIKARI AMBIGUOUS):
     => [search_listings, create_listing]
   * "iPhone var mı bakayım satacağım"
     => [search_listings, create_listing]
+  * "iPhone satmak istiyorum kaç para eder"
+    => [create_listing, price_research]
   
   TEK NİYET OLAN DURUMLAR (ambiguous DEĞİL):
-  * "iPhone 13 satacağım kaç para eder" => create_listing (fiyat ilan vermenin parçası)
-  * "Samsung S21 kaç para piyasada" => search_listings (fiyat araştırma)
-  * "MacBook satmak istiyorum kaç liraya koymalıyım" => create_listing
-  * "PS5 var satmayı düşünüyorum" => create_listing
+  * "iPhone 17 Pro Max kaç para eder" => price_research ✅ (SADECE fiyat, ilan YOK)
+  * "Samsung S21 kaç para piyasada" => search_listings ✅ (arama + fiyat context)
+  * "MacBook satmak istiyorum kaç liraya koymalıyım" => create_listing ✅ (ilan + fiyat)
+  * "PS5 var satmayı düşünüyorum" => create_listing ✅
   
   detected_intents array'ine tespit edilen TÜM intentleri ekle:
-  - create_listing: "satmak", "ilan vermek", "ilan oluştur", "satacağım", "satayım", "kaç liraya satmalıyım"
-  - search_listings: "var mı", "piyasada", "ilanlara bak", "satılanlar", "ara", "piyasada kaç para"
+  - create_listing: "satmak", "ilan vermek", "ilan oluştur", "satacağım", "satayım"
+  - search_listings: "var mı", "piyasada", "ilanlara bak", "satılanlar", "ara"
+  - price_research: "kaç para eder", "fiyatı nedir", "ne kadar", "değeri ne" (STANDALONE)
   
   ⚠️ ÖNEMLİ: 2+ intent varsa => ASLA otomatik akış başlatma, HER ZAMAN clarify
 
-- Tek bir ana görev varsa => o intent'i döndür (ambiguous DEĞIL)
+- Tek bir ana görev varsa => o intent'i döndür (ambiguous DEĞİL)
   Örnekler:
   * "iPhone 13 satmak istiyorum" => create_listing (tek niyet)
   * "samsung var mı" => search_listings (tek niyet)
+  * "iPhone 17 Pro Max kaç para" => price_research (tek niyet, STANDALONE fiyat)
   * "nasılsın" => small_talk
 
 Routing Heuristics (Turkish-first):
@@ -76,8 +100,8 @@ Routing Heuristics (Turkish-first):
   These patterns indicate the user is NOT ready to provide information => DO NOT route to create_listing.
 
 Output format: 
-- Tek intent: {"intent": "create_listing|publish_or_delete|search_listings|small_talk"}
-- Multi-intent: {"intent": "ambiguous", "detected_intents": ["create_listing", "price_inquiry"]}
+- Tek intent: {"intent": "create_listing|publish_or_delete|search_listings|price_research|small_talk"}
+- Multi-intent: {"intent": "ambiguous", "detected_intents": ["create_listing", "price_research"]}
 """
 
 TITLE_AGENT_PROMPT = """Sen PazarGlobal için ilan başlığı uzmanısın 📝
