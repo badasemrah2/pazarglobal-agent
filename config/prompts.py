@@ -44,11 +44,12 @@ Multi-Intent Detection (ÇIKARI AMBIGUOUS):
   
   🔑 Anahtar kelimeler (STANDALONE olduğunda => price_research):
   * "kaç para", "kaç lira", "fiyat", "fiyatı", "fiyatını", "ne kadar", "piyasa değeri", "satılır", "eder"
+  * "fiyatları", "kaça gider", "piyasası ne", "ne kadar eder", "kaça satarım", "ederi ne"
   
   detected_intents array'ine tespit edilen TÜM intentleri ekle:
   - create_listing: "satmak", "ilan vermek", "ilan oluştur", "satacağım", "satayım"
   - search_listings: "var mı", "piyasada", "ilanlara bak", "satılanlar", "ara"
-  - price_research: "kaç para eder", "fiyatı nedir", "ne kadar" (STANDALONE)
+  - price_research: "kaç para eder", "fiyatı nedir", "ne kadar", "fiyatları" (STANDALONE)
   
   Ambiguous örnekleri (SADECE 2+ FARKLI İŞ varsa):
   * "iPhone 13 satacağım ama önce piyasadaki ilanlara bakayım" 
@@ -65,6 +66,8 @@ Multi-Intent Detection (ÇIKARI AMBIGUOUS):
   * "Samsung S21 kaç para piyasada" => search_listings ✅ (arama + fiyat context)
   * "MacBook satmak istiyorum kaç liraya koymalıyım" => create_listing ✅ (ilan + fiyat)
   * "PS5 var satmayı düşünüyorum" => create_listing ✅
+  * "PlayStation 5 fiyatları nedir" => price_research ✅ (Genel fiyat sorgusu)
+  * "iPhone 11 piyasası ne durumda" => price_research ✅ (Piyasa değeri sorgusu)
   
   detected_intents array'ine tespit edilen TÜM intentleri ekle:
   - create_listing: "satmak", "ilan vermek", "ilan oluştur", "satacağım", "satayım"

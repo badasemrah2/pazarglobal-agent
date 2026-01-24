@@ -24,6 +24,7 @@ from agents import (
     SmallTalkAgent,
     TitleAgent,
 )
+from agents.context_supervisor import consult_supervisor
 from agents.vision_safety_gate import vision_safety_gate
 from config import settings
 from services import openai_client, redis_client, supabase_client
@@ -68,6 +69,28 @@ from api.webchat_search_context import (
     _store_active_listing,
     _store_search_context,
 )
+
+
+def switch_intent(session: Dict[str, Any], new_intent: str, preserve_draft: bool = False) -> None:
+    """
+    Atomically switches the user's intent while managing context cleanup.
+    Prevents 'phantom code' where partial state from previous intent leaks into new one.
+    """
+    session["intent"] = new_intent
+    session["locked_intent"] = None
+    
+    # Reset FSM specific tracking
+    session.pop("expected_slot", None)
+    session.pop("pending_action", None)
+    
+    # Clean up draft/media context unless explicitly preserved
+    if not preserve_draft:
+        session["active_draft_id"] = None
+        session.get("pending_media_urls", []).clear()
+        session.get("pending_media_analysis", []).clear()
+        
+    session["intent_switched_at"] = time.time()
+    get_logger().info(f"Session intent switched to {new_intent} (preserve_draft={preserve_draft})")
 
 
 # In-memory caches are managed in api.webchat_store
@@ -4547,6 +4570,79 @@ async def process_webchat_message(
                 existing_draft = await supabase_client.get_latest_draft_for_user(user_id)
                 if existing_draft and existing_draft.get("id"):
                     draft_id = existing_draft.get("id")
+            
+            # --- SUPERVISOR CHECK (Sprint 4: Operator Logic) ---
+            # Checks if user is commenting/complaining instead of providing data
+            if existing_draft and message_body and len(message_body) > 3:
+                missing_slot_chk = next_missing_slot(existing_draft)
+                try:
+                    supervisor_dec = await consult_supervisor(message_body, "create_listing", missing_slot_chk)
+                     
+                    if supervisor_dec.action == "META_COMMENT" and supervisor_dec.suggested_reply:
+                        return await finalize_response({
+                            "success": True,
+                            "message": supervisor_dec.suggested_reply,
+                            "data": {"type": "slot_prompt", "slot": missing_slot_chk, "draft_id": draft_id},
+                            "intent": "create_listing",
+                        })
+                    
+                    if supervisor_dec.action == "CHANGE_INTENT" and supervisor_dec.new_intent:
+                         # Atomic intent switch with context cleanup
+                         switch_intent(
+                             session, 
+                             supervisor_dec.new_intent, 
+                             preserve_draft=(supervisor_dec.new_intent == "create_listing")
+                         )
+                         session_dirty = True
+                         
+                         response_msgs = {
+                             "search_listings": "Tamam, arama moduna geçiyorum. Ne arıyorsun? 🔍",
+                             "small_talk": "Peki, konuyu değiştirelim. Ne sormak istersin? 💬",
+                             "create_listing": "Tamam, ilan oluşturma moduna dönüyorum. 📝"
+                         }
+                         return await finalize_response({
+                             "success": True,
+                             "message": response_msgs.get(supervisor_dec.new_intent, "Tamam, işlemi değiştiriyorum."),
+                             "intent": supervisor_dec.new_intent
+                         })
+
+                    if supervisor_dec.action == "CORRECTION":
+                         target = supervisor_dec.target_slot
+                         # Corrections should clear the field so the natural flow re-asks for it
+                         updaters = {
+                             "title": supabase_client.update_draft_title,
+                             "description": supabase_client.update_draft_description,
+                             "price": supabase_client.update_draft_price,
+                             "category": supabase_client.update_draft_category,
+                             "condition": supabase_client.update_draft_condition
+                         }
+                         
+                         normalized_target = target
+                         if target == "category_id": normalized_target = "category"
+                         
+                         if normalized_target in updaters:
+                             # Clear field in DB
+                             await updaters[normalized_target](draft_id, None)
+                             
+                             # Update local copy so the loop immediately re-prompts for this field
+                             key_map = {
+                                 "title": "title", 
+                                 "description": "description", 
+                                 "price": "price", 
+                                 "category": "category", 
+                                 "condition": "condition"
+                             }
+                             if "listing_data" in existing_draft and isinstance(existing_draft["listing_data"], dict):
+                                 existing_draft["listing_data"][key_map.get(normalized_target)] = None
+                         
+                         # For other corrections, we fall through. 
+                         # The ComposerAgent (below) will handle the update if the message contains data.
+                         # If strictly correction without data ("Yanlış oldu"), the fall-through loop 
+                         # will re-ask the question, which is correct behavior after clearing.
+
+                except Exception as e:
+                    get_logger().error(f"Supervisor failed: {e}")
+            # --- END SUPERVISOR CHECK ---
                     session["active_draft_id"] = draft_id
                     session_dirty = True
                     # DEBUG: log recovered draft state
@@ -5638,7 +5734,7 @@ async def process_webchat_message(
             if title:
                 # 1. Remove question suffixes inside specific titles (e.g. "iphone 11 ne kadar")
                 title = re.sub(
-                    r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|nedir|ne|kaca|kaça|eder|ederi|piyasası)(\s+|$)", 
+                    r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|nedir|ne|kaca|kaça|eder|ederi|piyasası|piyasasi)(\s+|$)", 
                     "", 
                     title, 
                     flags=re.IGNORECASE

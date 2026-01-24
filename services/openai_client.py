@@ -158,3 +158,30 @@ class OpenAIClient:
 
 # Global instance
 openai_client = OpenAIClient()
+
+async def analyze_with_llm(
+    system_prompt: str,
+    user_message: str,
+    response_model: Any,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0
+) -> Any:
+    """
+    Helper for Structured Outputs using Pydantic models.
+    """
+    client = openai_client.client
+    
+    try:
+        completion = await client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            response_format=response_model,
+            temperature=temperature,
+        )
+        return completion.choices[0].message.parsed
+    except Exception as e:
+        logger.error(f"Structured Output failed: {e}")
+        raise e
