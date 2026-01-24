@@ -5162,7 +5162,15 @@ async def process_webchat_message(
                         "intent": intent,
                     })
 
-            if existing_draft and next_missing_slot(existing_draft) == "price" and user_asks_market_price(message_body):
+            # Check if we should enter/continue price research flow
+            is_price_inquiry = user_asks_market_price(message_body)
+            # If not explicit trigger, check if we are in a pending price research state
+            if not is_price_inquiry and session.get("pending_price_research"):
+                 # If user just provided a valid condition, we treat this as part of price research
+                 if canonicalize_condition(message_body):
+                     is_price_inquiry = True
+
+            if existing_draft and next_missing_slot(existing_draft) == "price" and is_price_inquiry:
                 listing = (existing_draft or {}).get("listing_data") or {}
                 vision = (existing_draft or {}).get("vision_product") or {}
 
@@ -5171,9 +5179,25 @@ async def process_webchat_message(
                 category = (listing.get("category") or "").strip()
                 user_condition = str(listing.get("condition") or "").strip()
                 
+                # Check if current message is a condition response
+                temp_condition = canonicalize_condition(message_body)
+                if temp_condition:
+                    user_condition = temp_condition
+                    # If inferred, update draft so we don't ask again
+                    if not listing.get("condition"):
+                        try:
+                            await supabase_client.update_draft_fields(draft_id, {"condition": temp_condition})
+                            # Update local reference for this execution
+                            if "listing_data" in existing_draft:
+                                existing_draft["listing_data"]["condition"] = temp_condition
+                        except Exception:
+                            pass
+
                 # FIX Problem 5: Condition zorunlu kontrolü
                 # Eğer condition yoksa, önce durumu soralım!
                 if not user_condition:
+                    session["pending_price_research"] = True
+                    session_dirty = True
                     return await finalize_response({
                         "success": True,
                         "message": (
@@ -5189,6 +5213,10 @@ async def process_webchat_message(
                         },
                         "intent": intent,
                     })
+
+                # We have condition, clear pending flag
+                session.pop("pending_price_research", None)
+                session_dirty = True
                 
                 condition_for_price = canonicalize_condition(user_condition)
                 if not condition_for_price:
@@ -5198,8 +5226,17 @@ async def process_webchat_message(
                 if not title and isinstance(vision, dict):
                     title = str(vision.get("product") or vision.get("category") or "").strip()
                 
+                # Clean title (remove "ne kadar" etc.)
+                if title:
+                    title = re.sub(
+                        r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|nedir|ne|kaca|kaça|eder|ederi|piyasası)(\s+|$)", 
+                        "", 
+                        title, 
+                        flags=re.IGNORECASE
+                    ).strip()
+                
                 # FIX: Title still missing after vision fallback → Prompt user!
-                if not title or title in ["ürün", "Ürün", "urun"]:
+                if not title or title.lower() in ["ürün", "Ürün", "urun", "fiyat", "ücret", "değer"]:
                     return await finalize_response({
                         "success": True,
                         "message": (
