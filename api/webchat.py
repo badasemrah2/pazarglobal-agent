@@ -71,7 +71,7 @@ from api.webchat_search_context import (
 )
 
 
-def switch_intent(session: Dict[str, Any], new_intent: str, preserve_draft: bool = False) -> None:
+def switch_intent(session: Dict[str, Any], new_intent: Optional[str], preserve_draft: bool = False) -> None:
     """
     Atomically switches the user's intent while managing context cleanup.
     Prevents 'phantom code' where partial state from previous intent leaks into new one.
@@ -82,6 +82,8 @@ def switch_intent(session: Dict[str, Any], new_intent: str, preserve_draft: bool
     # Reset FSM specific tracking
     session.pop("expected_slot", None)
     session.pop("pending_action", None)
+    session.pop("pending_copy_enrichment", None)
+    session.pop("copy_enrichment_offered", None)
     
     # Clean up draft/media context unless explicitly preserved
     if not preserve_draft:
@@ -90,7 +92,9 @@ def switch_intent(session: Dict[str, Any], new_intent: str, preserve_draft: bool
         session.get("pending_media_analysis", []).clear()
         
     session["intent_switched_at"] = time.time()
-    get_logger().info(f"Session intent switched to {new_intent} (preserve_draft={preserve_draft})")
+    get_logger().info(
+        f"Session intent switched to {new_intent or 'None'} (preserve_draft={preserve_draft})"
+    )
 
 
 # In-memory caches are managed in api.webchat_store
@@ -1890,7 +1894,7 @@ def draft_ready_for_preview(draft: Dict[str, Any]) -> bool:
     return bool(title and location and price is not None and condition)
 
 
-def format_ready_preview_message(draft: Dict[str, Any]) -> str:
+def format_ready_preview_message(draft: Dict[str, Any], include_improve_prompt: bool = False) -> str:
     preview = build_draft_preview_payload(draft)
     price = preview.get("price")
     if isinstance(price, (int, float)):
@@ -1913,6 +1917,12 @@ def format_ready_preview_message(draft: Dict[str, Any]) -> str:
         "Düzenlemek için: 'başlık: ...', 'açıklama: ...', 'fiyat: ...', 'lokasyon: ...' yazabilirsin.",
         "Daha fazla fotoğraf eklemek için yeni fotoğraf gönderebilirsin.",
     ]
+    if include_improve_prompt:
+        lines.extend([
+            "",
+            "İstersen başlık ve açıklamayı senin için daha da iyileştirebilirim.",
+            "Onaylıyor musun? (evet / hayır)",
+        ])
     return "\n".join(lines)
 
 
@@ -1920,6 +1930,7 @@ async def maybe_enrich_title_description(
     draft_id: str,
     draft: Dict[str, Any],
     user_message: str,
+    target: str = "both",
 ) -> Optional[Dict[str, str]]:
     """Improve or generate title/description using TitleAgent + DescriptionAgent.
 
@@ -1963,53 +1974,56 @@ async def maybe_enrich_title_description(
             "image_count": image_count,
         }
 
-        # TitleAgent: generate or improve title
-        title_agent = TitleAgent()
-        if title:
-            title_msg = (
-                "Aşağıdaki bilgilerle TASLAK başlığını minimal şekilde iyileştir.\n"
-                "Kullanıcı beyanını koru; sadece netleştir ve vitrinde güçlü hale getir.\n\n"
-                + json.dumps(known, ensure_ascii=False)
-            )
-        else:
-            title_msg = (
-                "Aşağıdaki bilgilerle ürün için KATŞıCı bir BAŞLIK oluştur.\n"
-                "Kullanıcı mesajı ve görsel analizinden yararlan.\n"
-                "Başlık kısa, açık ve satışa uygun olmalı.\n\n"
-                + json.dumps(known, ensure_ascii=False)
-            )
-        
-        title_result = await title_agent.run(title_msg, context={"draft_id": draft_id})
-
         out_title = ""
-        for call in (title_result or {}).get("tool_calls") or []:
-            if call.get("tool") == "update_title":
-                data = (call.get("result") or {}).get("data") or {}
-                out_title = str(data.get("title") or "").strip()
+        out_desc = ""
+
+        # TitleAgent: generate or improve title
+        if target in {"both", "title"}:
+            title_agent = TitleAgent()
+            if title:
+                title_msg = (
+                    "Aşağıdaki bilgilerle TASLAK başlığını minimal şekilde iyileştir.\n"
+                    "Kullanıcı beyanını koru; sadece netleştir ve vitrinde güçlü hale getir.\n\n"
+                    + json.dumps(known, ensure_ascii=False)
+                )
+            else:
+                title_msg = (
+                    "Aşağıdaki bilgilerle ürün için KATŞıCı bir BAŞLIK oluştur.\n"
+                    "Kullanıcı mesajı ve görsel analizinden yararlan.\n"
+                    "Başlık kısa, açık ve satışa uygun olmalı.\n\n"
+                    + json.dumps(known, ensure_ascii=False)
+                )
+            
+            title_result = await title_agent.run(title_msg, context={"draft_id": draft_id})
+
+            for call in (title_result or {}).get("tool_calls") or []:
+                if call.get("tool") == "update_title":
+                    data = (call.get("result") or {}).get("data") or {}
+                    out_title = str(data.get("title") or "").strip()
 
         # DescriptionAgent: always improve or generate
-        desc_agent = DescriptionAgent()
-        if description:
-            desc_msg = (
-                "Aşağıdaki bilgilerle TASLAK açıklamasını mutlaka iyileştir.\n"
-                "Kullanıcı beyanına sadık kal; varsa görsel izlenimi temkinli şekilde ekle.\n\n"
-                + json.dumps(known, ensure_ascii=False)
-            )
-        else:
-            desc_msg = (
-                "Aşağıdaki bilgilerle ürün için YARARLı bir AÇIKLAMA oluştur.\n"
-                "Kullanıcı mesajı ve varsa görsel analizinden yararlan.\n"
-                "Açıklama detaylı ama konkret olmalı (durum, hatalar, kutu/fatura vb.).\n\n"
-                + json.dumps(known, ensure_ascii=False)
-            )
-        
-        desc_result = await desc_agent.run(desc_msg, context={"draft_id": draft_id})
+        if target in {"both", "description"}:
+            desc_agent = DescriptionAgent()
+            if description:
+                desc_msg = (
+                    "Aşağıdaki bilgilerle TASLAK açıklamasını mutlaka iyileştir.\n"
+                    "Kullanıcı beyanına sadık kal; varsa görsel izlenimi temkinli şekilde ekle.\n\n"
+                    + json.dumps(known, ensure_ascii=False)
+                )
+            else:
+                desc_msg = (
+                    "Aşağıdaki bilgilerle ürün için YARARLı bir AÇIKLAMA oluştur.\n"
+                    "Kullanıcı mesajı ve varsa görsel analizinden yararlan.\n"
+                    "Açıklama detaylı ama konkret olmalı (durum, hatalar, kutu/fatura vb.).\n\n"
+                    + json.dumps(known, ensure_ascii=False)
+                )
 
-        out_desc = ""
-        for call in (desc_result or {}).get("tool_calls") or []:
-            if call.get("tool") == "update_description":
-                data = (call.get("result") or {}).get("data") or {}
-                out_desc = str(data.get("description") or "").strip()
+            desc_result = await desc_agent.run(desc_msg, context={"draft_id": draft_id})
+
+            for call in (desc_result or {}).get("tool_calls") or []:
+                if call.get("tool") == "update_description":
+                    data = (call.get("result") or {}).get("data") or {}
+                    out_desc = str(data.get("description") or "").strip()
 
         if not out_title and not out_desc:
             return None
@@ -2465,14 +2479,11 @@ _COMMAND_ONLY_TOKENS = {
 }
 
 
-def is_improve_command(message: str) -> bool:
-    """User requests deterministic title/description improvement in preview.
-
-    We keep this narrow to avoid accidentally treating normal sentences as a command.
-    """
+def get_improve_target(message: str) -> Optional[str]:
+    """Return 'title', 'description', 'both' or None based on explicit improve command."""
     msg = (message or "").strip().lower()
     if not msg:
-        return False
+        return None
 
     # Normalize Turkish chars (ş/ı/ğ/ç/ö/ü) and punctuation.
     transl = str.maketrans({
@@ -2487,14 +2498,52 @@ def is_improve_command(message: str) -> bool:
     msg_n = re.sub(r"[^a-z0-9\s]", " ", msg_n)
     msg_n = re.sub(r"\s+", " ", msg_n).strip()
 
-    # Accept: "iyileştir", "iyilestir", "iyilestir lutfen".
-    if msg_n == "iyilestir":
-        return True
+    # Targeted commands
+    title_cmds = {
+        "baslik iyilestir",
+        "basligi iyilestir",
+        "baslik iyilestir lutfen",
+        "basligi guzellestir",
+        "baslik daha guzel yaz",
+        "basligi daha guzel yaz",
+        "baslik vitrinlik yap",
+        "basligi vitrinlik yap",
+    }
+    desc_cmds = {
+        "aciklama iyilestir",
+        "aciklamayi iyilestir",
+        "aciklama iyilestir lutfen",
+        "aciklamayi zenginlestir",
+        "aciklama zenginlestir",
+        "aciklamayi detaylandir",
+        "aciklamayi genislet",
+        "aciklama vitrinlik yap",
+        "aciklamayi vitrinlik yap",
+    }
+    if msg_n in title_cmds:
+        return "title"
+    if msg_n in desc_cmds:
+        return "description"
+
+    # Flexible phrasing with explicit target words
+    if "baslik" in msg_n and any(tok in msg_n for tok in ["iyilestir", "guzellestir", "daha guzel", "vitrinlik", "zenginlestir"]):
+        return "title"
+    if "aciklama" in msg_n and any(tok in msg_n for tok in ["iyilestir", "guzellestir", "daha guzel", "vitrinlik", "zenginlestir", "detaylandir", "genislet"]):
+        return "description"
+
+    # Generic improve commands
+    if msg_n in {"iyilestir", "vitrinlik yap", "daha guzel yaz", "zenginlestir"}:
+        return "both"
     if msg_n.startswith("iyilestir "):
-        # Only allow small polite suffixes to stay deterministic.
         rest = msg_n[len("iyilestir "):].strip()
-        return rest in {"lutfen", "lutfenn", "pls", "please"}
-    return False
+        if rest in {"lutfen", "lutfenn", "pls", "please"}:
+            return "both"
+    return None
+
+
+def is_improve_command(message: str) -> bool:
+    """User requests deterministic title/description improvement in preview."""
+    return get_improve_target(message) is not None
 
 
 _FLOW_CONTROL_PATTERNS: list[re.Pattern[str]] = [
@@ -2630,10 +2679,23 @@ def user_asks_market_price(message: str) -> bool:
     if not msg:
         return False
     return any(phrase in msg for phrase in [
+        "kaç para",
+        "kac para",
         "kaç para eder",
         "kac para eder",
         "ne kadar eder",
         "ne kadara gider",
+        "ne kadar",
+        "fiyatı nedir",
+        "fiyati nedir",
+        "fiyat nedir",
+        "fiyatları",
+        "fiyatlari",
+        "ortalama fiyat",
+        "piyasa fiyat",
+        "piyasa fiyati",
+        "piyasa değeri",
+        "piyasa degeri",
         "piyasa",
         "fiyat öner",
         "fiyat oner",
@@ -3201,8 +3263,7 @@ async def process_webchat_message(
                     await redis_client.set_intent(session_id, restored_intent)
                 await _record_fsm_event("resumed", session_id, session, {"restored_intent": restored_intent})
             elif is_cancel_command(message_body):
-                session["locked_intent"] = None
-                session["intent"] = None
+                switch_intent(session, None, preserve_draft=False)
                 session["parked_intent"] = None
                 _set_fsm_state(session, "active", intent=None, reason="cancel_from_parked")
                 session_dirty = True
@@ -4091,11 +4152,7 @@ async def process_webchat_message(
             except Exception:
                 pass
 
-            session.pop("locked_intent", None)
-            session["intent"] = None
-            session["active_draft_id"] = None
-            session["pending_media_urls"] = []
-            session["pending_media_analysis"] = []
+            switch_intent(session, None, preserve_draft=False)
             session_dirty = True
             return await finalize_response({
                 "success": True,
@@ -4259,8 +4316,7 @@ async def process_webchat_message(
             }
             # Switch to search but don't lock it - allow easy return
             prev_locked = locked_intent
-            session.pop("locked_intent", None)
-            session["intent"] = "search_listings"
+            switch_intent(session, "search_listings", preserve_draft=False)
             # Don't lock search - keep it flexible
             locked_intent = None
             intent = "search_listings"
@@ -4283,8 +4339,7 @@ async def process_webchat_message(
             pending_publish = session.get("pending_publish")
             if not pending_publish or not isinstance(pending_publish, dict):
                 # No pending confirmation; allow search
-                session.pop("locked_intent", None)
-                session["intent"] = "search_listings"
+                switch_intent(session, "search_listings", preserve_draft=False)
                 session["locked_intent"] = "search_listings"
                 locked_intent = "search_listings"
                 intent = "search_listings"
@@ -4314,11 +4369,20 @@ async def process_webchat_message(
         elif is_show_more_command(message_body):
             # "Daha fazla" - show next page of search results
             override_intent = "show_more_results"
+        elif session.get("context_mode") == "search" and user_asks_market_price(message_body):
+            search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
+            query = (search_ctx or {}).get("query")
+            if query:
+                session["price_research_context"] = {"query": query, "source": "search_context"}
+            override_intent = "price_research"
         
         if override_intent and override_intent != intent:
             prev_locked = session.get("locked_intent")
             intent = override_intent
-            session["intent"] = intent
+            if override_intent == "show_more_results":
+                session["intent"] = intent
+            else:
+                switch_intent(session, intent, preserve_draft=(override_intent == "create_listing"))
             # Don't lock "show_more_results", it's a one-time action
             if override_intent != "show_more_results":
                 session["locked_intent"] = intent
@@ -4805,6 +4869,77 @@ async def process_webchat_message(
                 # If the draft is already ready (minimum set), allow inline edits and show a preview
                 # without forcing the publish flow.
                 if draft_ready_for_preview(existing_draft):
+                    # If user previously asked for improve prompt, handle yes/no now.
+                    if session.get("pending_copy_enrichment"):
+                        if is_confirm_command(message_body):
+                            session.pop("pending_copy_enrichment", None)
+                            session["copy_enrichment_offered"] = True
+                            session_dirty = True
+                            enriched = await maybe_enrich_title_description(
+                                draft_id,
+                                existing_draft,
+                                message_body,
+                                target="both",
+                            )
+                            if enriched:
+                                try:
+                                    if enriched.get("title"):
+                                        await supabase_client.update_draft_title(draft_id, enriched["title"])
+                                    if enriched.get("description"):
+                                        await supabase_client.update_draft_description(draft_id, enriched["description"])
+                                    if hasattr(supabase_client, "set_draft_listing_data_flag"):
+                                        await supabase_client.set_draft_listing_data_flag(draft_id, "_copy_enriched", True)
+                                    updated = await supabase_client.get_draft(draft_id)
+                                    if updated:
+                                        existing_draft = updated
+                                except Exception:
+                                    pass
+                            return await finalize_response({
+                                "success": True,
+                                "message": format_ready_preview_message(existing_draft),
+                                "data": {
+                                    "type": "draft_ready",
+                                    "draft_id": draft_id,
+                                    "preview": build_draft_preview_payload(existing_draft)
+                                },
+                                "intent": intent,
+                            })
+                        if is_cancel_command(message_body) or is_short_no(message_body):
+                            session.pop("pending_copy_enrichment", None)
+                            session["copy_enrichment_offered"] = True
+                            session_dirty = True
+                            return await finalize_response({
+                                "success": True,
+                                "message": format_ready_preview_message(existing_draft),
+                                "data": {
+                                    "type": "draft_ready",
+                                    "draft_id": draft_id,
+                                    "preview": build_draft_preview_payload(existing_draft)
+                                },
+                                "intent": intent,
+                            })
+
+                    # Offer improve prompt once when draft is ready and not yet enriched.
+                    listing_ready = (existing_draft or {}).get("listing_data") or {}
+                    if isinstance(listing_ready, dict):
+                        enrich_attempted = bool(listing_ready.get("_copy_enriched_attempted"))
+                        enrich_done = bool(listing_ready.get("_copy_enriched"))
+                        offered = bool(session.get("copy_enrichment_offered"))
+                        if (not enrich_attempted and not enrich_done) and not get_improve_target(message_body) and not offered:
+                            session["pending_copy_enrichment"] = True
+                            session["copy_enrichment_offered"] = True
+                            session_dirty = True
+                            return await finalize_response({
+                                "success": True,
+                                "message": format_ready_preview_message(existing_draft, include_improve_prompt=True),
+                                "data": {
+                                    "type": "draft_ready",
+                                    "draft_id": draft_id,
+                                    "preview": build_draft_preview_payload(existing_draft)
+                                },
+                                "intent": intent,
+                            })
+
                     edit_request = extract_preview_edit(message_body)
                     
                     # === LLM OVERRIDE MECHANISM ===
@@ -4901,7 +5036,8 @@ async def process_webchat_message(
 
                 # If we have the minimum set, optionally enrich and show a "wow" preview.
                 if draft_ready_for_preview(existing_draft):
-                    force_enrich = is_improve_command(message_body)
+                    improve_target = get_improve_target(message_body)
+                    force_enrich = improve_target is not None
 
                     listing_ready = (existing_draft or {}).get("listing_data") or {}
                     if not isinstance(listing_ready, dict):
@@ -4928,7 +5064,12 @@ async def process_webchat_message(
                             pass
 
                     if should_enrich:
-                        enriched = await maybe_enrich_title_description(draft_id, existing_draft, message_body)
+                        enriched = await maybe_enrich_title_description(
+                            draft_id,
+                            existing_draft,
+                            message_body,
+                            target=improve_target or "both",
+                        )
                         if enriched:
                             try:
                                 if enriched.get("title"):
@@ -5750,6 +5891,21 @@ async def process_webchat_message(
             
             if not category and vision_data:
                 category = vision_data.get("category")
+
+            # Fallback to search context query (e.g., user asked "ortalama fiyat" after a search)
+            if not title:
+                price_ctx = session.get("price_research_context")
+                if isinstance(price_ctx, dict):
+                    ctx_query = (price_ctx or {}).get("query")
+                    if ctx_query:
+                        title = ctx_query
+                        session.pop("price_research_context", None)
+                        session_dirty = True
+                if not title:
+                    search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
+                    ctx_query = (search_ctx or {}).get("query")
+                    if ctx_query:
+                        title = ctx_query
 
             # 3. Validation
             if not title:
