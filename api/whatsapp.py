@@ -24,7 +24,9 @@ def is_delete_command(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
         return False
-    return any(token in msg for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"])
+    if "ilanı sil" in msg or "ilani sil" in msg:
+        return True
+    return bool(re.search(r"\b(sil|kaldir|kaldır|delete)\b", msg))
 
 
 def is_create_listing_command(message: str) -> bool:

@@ -119,6 +119,7 @@ MEDIA_ANALYSIS_USER_PROMPT = (
 FSM_PARK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes of user silence → parked
 FSM_COMPOSER_TIMEOUT_SECONDS = 45   # ComposerAgent hard timeout
 MEDIA_ACTION_TTL_SECONDS = 10 * 60  # image-first choice timeout
+PARKED_INTENT_TTL_SECONDS = 10 * 60  # parked intent max retention
 RESUME_KEYWORDS = {"devam", "kaldığımız yerden", "kaldigimiz yerden", "resume", "continue"}
 
 # === LLM OVERRIDE MECHANISM (v1.0) ===
@@ -551,10 +552,11 @@ def is_delete_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
         return False
-    return any(
-        (t := normalize_for_match(token)) and t in msg
-        for token in ["sil", "ilanı sil", "ilani sil", "kaldır", "kaldir", "delete"]
-    )
+    # Match whole-word delete intents to avoid false positives (e.g., "nasılsın").
+    phrases = ["ilanı sil", "ilani sil"]
+    if any(p in msg for p in phrases):
+        return True
+    return bool(re.search(r"\b(sil|kaldir|kaldır|delete)\b", msg))
 
 
 def is_create_listing_command(message: str) -> bool:
@@ -3301,6 +3303,20 @@ async def process_webchat_message(
         # If already parked/timeout, require explicit resume keyword to continue.
         if session.get("fsm_state") in {"parked", "timeout"}:
             logger.info(f"Session {session_id[:8]}... in {session.get('fsm_state')} state, awaiting resume/cancel")
+            parked_age = _seconds_since(session.get("fsm_state_updated_at"), now_iso)
+            if parked_age is not None and parked_age > PARKED_INTENT_TTL_SECONDS:
+                # Parked session is stale; clear intent and return to small talk.
+                switch_intent(session, None, preserve_draft=False)
+                session["parked_intent"] = None
+                _set_fsm_state(session, "active", intent=None, reason="parked_expired")
+                session_dirty = True
+                await _record_fsm_event("parked_expired", session_id, session, {"parked_age_seconds": parked_age})
+                return await finalize_response({
+                    "success": True,
+                    "message": "Aradan biraz zaman geçtiği için kaldığımız yerden devam etmiyorum. Nasıl yardımcı olabilirim?",
+                    "data": {"type": "parked_expired"},
+                    "intent": "small_talk",
+                })
             if is_resume_command(message_body):
                 # Priority: parked_intent (explicit parking) > locked_intent (active flow) > intent > fsm_state_intent
                 restored_intent = (
@@ -3825,17 +3841,29 @@ async def process_webchat_message(
         if pending_created_at:
             age = _seconds_since(pending_created_at)
             if age is not None and age > MEDIA_ACTION_TTL_SECONDS:
+                was_awaiting = bool(session.get("awaiting_media_action"))
                 session["pending_media_urls"] = []
                 session["pending_media_analysis"] = []
                 session["awaiting_media_action"] = False
                 session.pop("pending_media_created_at", None)
                 session_dirty = True
-                return await finalize_response({
-                    "success": True,
-                    "message": "Görselin süresi doldu. Lütfen tekrar fotoğraf gönderir misin?",
-                    "data": {"type": "media_expired"},
-                    "intent": None,
-                })
+
+                if is_cancel_command(message_body):
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Tamam, iptal ettim. Başka nasıl yardımcı olabilirim?",
+                        "data": {"type": "media_expired_cancel"},
+                        "intent": "small_talk",
+                    })
+
+                # Only notify if user was actually choosing a media action.
+                if was_awaiting:
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Görselin süresi doldu. Lütfen tekrar fotoğraf gönderir misin?",
+                        "data": {"type": "media_expired"},
+                        "intent": None,
+                    })
 
         # IMAGE-FIRST MANDATORY CHOICE:
         # If we previously received images without a locked intent, we must ask what the user
