@@ -304,7 +304,11 @@ Bu mesajdan kullanıcının hangi alanı hangi değere değiştirmek istediğini
             temperature=0.1,  # Low temperature for deterministic output
         )
         
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        content = ""
+        try:
+            content = response.choices[0].message.content or ""
+        except Exception:
+            content = ""
         if not content:
             return None
         
@@ -647,6 +651,21 @@ def parse_edit_command(message: str, draft: Dict[str, Any]) -> Optional[Dict[str
     
     # Pattern 1: "Açıklama şu olsun: X" → Replace description
     if "aciklama" in msg or "açıklama" in msg:
+        # Remove patterns like: "Açıklamadan X çıkar" / "Açıklama dan X sil"
+        import re
+        remove_desc_match = re.search(
+            r"(?:açıklama|aciklama)\s*(?:dan|den)?\s*(.+?)\s*(?:çıkar|cikar|sil|kaldır|kaldir)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if remove_desc_match:
+            content = remove_desc_match.group(1).strip()
+            for sep in [":", "-", "→"]:
+                if content.startswith(sep):
+                    content = content[1:].strip()
+            if content:
+                return {"action": "remove_from_description", "content": content}
+
         # Replace patterns
         for pattern in ["su olsun", "şu olsun", "soyle olsun", "şöyle olsun", "degistir", "değiştir"]:
             if pattern in msg:
@@ -689,6 +708,20 @@ def parse_edit_command(message: str, draft: Dict[str, Any]) -> Optional[Dict[str
     
     # Pattern 2: "Başlık şu olsun: X" → Replace title
     if "baslik" in msg or "başlık" in msg:
+        import re
+        remove_title_match = re.search(
+            r"(?:başlık|baslik)\s*(?:tan|ten)?\s*(.+?)\s*(?:çıkar|cikar|sil|kaldır|kaldir)\b",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if remove_title_match:
+            content = remove_title_match.group(1).strip()
+            for sep in [":", "-", "→"]:
+                if content.startswith(sep):
+                    content = content[1:].strip()
+            if content:
+                return {"action": "remove_from_title", "content": content}
+
         # Replace patterns
         for pattern in ["su olsun", "şu olsun", "soyle olsun", "şöyle olsun", "degistir", "değiştir"]:
             if pattern in msg:
@@ -1250,9 +1283,11 @@ async def handle_preview_edit_flow(
             
             result = await desc_agent.run(
                 user_message=f"Mevcut açıklama: {current_desc}\n\nEklenecek bilgi: {content}",
-                draft_id=draft["id"],
-                user_id=user_id,
-                phone_number=session.get("phone_number") or session.get("session_id")
+                context={
+                    "draft_id": draft["id"],
+                    "user_id": user_id,
+                    "phone_number": session.get("phone_number") or session.get("session_id"),
+                },
             )
             
             if result.get("success"):
@@ -1291,11 +1326,14 @@ async def handle_preview_edit_flow(
         logger.warning(f"Unknown edit action: {action}")
         return None
     
-    # Save updated draft
-    draft["listing_data"] = listing
+    # Save updated fields
     try:
-        await supabase_client.update_draft(draft["id"], draft)
-        return draft
+        if action in {"replace_description", "append_description", "remove_from_description"}:
+            await supabase_client.update_draft_description(draft["id"], listing.get("description") or "")
+        elif action in {"replace_title", "remove_from_title"}:
+            await supabase_client.update_draft_title(draft["id"], listing.get("title") or "")
+        updated = await supabase_client.get_draft(draft["id"])
+        return updated or draft
     except Exception as e:
         logger.error(f"Failed to save edited draft: {e}")
         return None

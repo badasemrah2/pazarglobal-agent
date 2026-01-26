@@ -88,10 +88,16 @@ async def get_or_create_session(phone_number: str) -> str:
         # CRITICAL: Map phone_number to real Supabase user_id via user_security table
         try:
             # Query user_security table (has phone→user_id mapping + PIN)
-            response = supabase_client.table("user_security").select("user_id").eq("phone", phone_number).execute()
+            response = supabase_client.client.table("user_security").select("user_id").eq("phone", phone_number).execute()
             
-            if response.data and len(response.data) > 0:
-                real_user_id = response.data[0]["user_id"]
+            data = getattr(response, "data", None)
+            if isinstance(data, list) and data:
+                first = data[0] if isinstance(data[0], dict) else None
+                real_user_id = first.get("user_id") if isinstance(first, dict) else None
+            else:
+                real_user_id = None
+
+            if real_user_id:
                 logger.info(f"✅ WhatsApp phone {phone_number} mapped to user_id: {real_user_id}")
             else:
                 # User not registered or hasn't set up WhatsApp PIN
@@ -142,6 +148,8 @@ async def process_whatsapp_message(
         # Get or create session
         session_id = await get_or_create_session(from_number)
         session = await redis_client.get_session(session_id)
+        if not isinstance(session, dict):
+            session = {}
 
         # Deterministic intent override each message (prevents sticky small_talk from blocking tasks)
         current_intent = session.get("intent")
@@ -164,16 +172,21 @@ async def process_whatsapp_message(
         if not intent:
             # First message - classify intent
             router_agent = IntentRouterAgent()
-            intent = await router_agent.classify_intent(message_body)
-            await redis_client.set_intent(session_id, intent)
-            logger.info(f"New intent for {from_number}: {intent}")
+            router_result = await router_agent.classify_intent(message_body)
+            intent = (router_result or {}).get("intent") if isinstance(router_result, dict) else None
+            if intent:
+                await redis_client.set_intent(session_id, intent)
+                logger.info(f"New intent for {from_number}: {intent}")
         
         # Route to appropriate agent based on intent
         if intent == "create_listing":
             composer = ComposerAgent()
+            user_id = session.get("user_id")
+            if not user_id:
+                return "❌ Kullanıcı doğrulanamadı. Lütfen web üzerinden WhatsApp PIN oluşturun."
             result = await composer.orchestrate_listing_creation(
                 user_message=message_body,
-                user_id=session["user_id"],
+                user_id=user_id,
                 phone_number=from_number,
                 draft_id=session.get("active_draft_id"),
                 media_url=media_url
@@ -198,10 +211,13 @@ async def process_whatsapp_message(
         
         elif intent == "publish_or_delete":
             agent = PublishDeleteAgent()
+            user_id = session.get("user_id")
+            if not user_id:
+                return "❌ Kullanıcı doğrulanamadı. Lütfen web üzerinden WhatsApp PIN oluşturun."
             result = await agent.run(
                 user_message=message_body,
                 context={
-                    "user_id": session["user_id"],
+                    "user_id": user_id,
                     "draft_id": session.get("active_draft_id")
                 }
             )
