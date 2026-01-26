@@ -1,40 +1,80 @@
 # PazarGlobal Kullanıcı Rehberi
 
-## İlan verme
-- Üst menüde “İlan Ver” butonuna tıklayın.
-- Ürün adı, kısa açıklama, fiyat, lokasyon ve durum bilgilerini girin.
-- Fotoğraf eklemek için “Fotoğraf Ekle” alanını kullanın.
-- Önizlemeyi kontrol edin ve “Yayınla” butonuyla tamamlayın.
-
-## WhatsApp ile ilan verme
-- WhatsApp üzerinden ürün bilgilerini yazabilir veya fotoğraf gönderebilirsiniz.
-- Sistem gerekli bilgileri adım adım ister.
-- Yayınlamak için “yayınla” yazabilirsiniz.
-
-## Premium ilan nedir?
-- Premium ilanlar daha görünür olur ve daha hızlı öne çıkar.
-- Premium seçenekleri ilan önizleme adımında görüntülenir.
-
-## Kredi sistemi
-- İlan yayınlama bazı durumlarda kredi kullanabilir.
-- Kredi bakiyenizi profil bölümünden görebilirsiniz.
-- Kredi yüklemek için profil > cüzdan bölümüne gidin.
+## Hızlı Başlangıç
+- Satmak için: üst menüden “İlan Ver” → formu doldur → “Yayınla”.
+- Aramak için: arama kutusuna ürün yaz → filtrele → ilan detayını aç.
 
 ## Kayıt ve giriş
-- Kayıt için e‑posta ve telefon bilgisi gerekir.
-- Giriş yaptıktan sonra profil bilgilerinizi güncelleyebilirsiniz.
+- Ana sayfada “Kayıt Ol” seçeneğini açın.
+- E‑posta ve telefon numarası ile hesap oluşturun.
+- Doğrulama adımını tamamlayın, ardından “Giriş Yap” ile içeri girin.
 
-## Şifre değiştirme
-- Profil > Ayarlar bölümüne gidin.
-- “Şifre Değiştir” seçeneğini kullanın.
+## Profil ve temel ayarlar
+- Üst menüde Profil simgesine tıklayın.
+- “Profilim” bölümünden ad/telefon bilgilerinizi güncelleyin.
+- “Ayarlar” bölümünden şifreyi değiştirebilirsiniz.
 
-## WhatsApp PIN nedir?
-- WhatsApp üzerinden güvenli kullanım için PIN oluşturmanız istenebilir.
-- PIN ile hesabınız doğrulanır ve yetkisiz kullanımlar engellenir.
+## İlan verme (Web)
+1) Üst menüde “İlan Ver” butonuna tıklayın.
+2) Başlık, açıklama, fiyat, durum ve lokasyonu girin.
+3) Fotoğraf eklemek için “Fotoğraf Ekle” alanını kullanın.
+4) Önizleme ekranında bilgileri kontrol edin.
+5) “Yayınla” ile ilanı aktif edin.
 
-## İlanlarımı nasıl yönetirim?
+## İlan düzenleme / silme
 - Profil > İlanlarım sayfasına gidin.
-- Buradan ilanlarınızı görüntüleyebilir ve gerekli düzenlemeleri yapabilirsiniz.
+- Düzenlemek için ilgili ilan kartında “Düzenle”ye tıklayın.
+- Silmek için ilgili ilanda “Sil” seçeneğini kullanın.
+
+## İlan arama ve filtreleme
+- Üstteki arama kutusuna ürün adını yazın.
+- Kategori, fiyat aralığı ve şehir filtrelerini kullanabilirsiniz.
+- Bir ilanı açarak detayları inceleyin ve satıcıyla iletişime geçin.
+
+## İlan taslağı nedir?
+- İlan oluştururken bilgileriniz taslak olarak kaydedilir.
+- Önizleme ekranında başlık, açıklama, fiyat gibi alanları düzenleyebilirsiniz.
+- Hazır olduğunuzda “Yayınla” ile ilanı aktif edebilirsiniz.
+
+## Fotoğraf sayısı ve ekleme
+- Bir ilana en fazla 5 fotoğraf eklenebilir.
+- Eksik fotoğraf varsa önizleme ekranında hatırlatma görebilirsiniz.
+
+## WhatsApp üzerinden ilan verme
+1) WhatsApp’tan ürün bilgilerini yazabilir veya fotoğraf gönderebilirsiniz.
+2) Sistem gerekli bilgileri adım adım ister.
+3) “Yayınla” yazarak ilanı onaylayabilirsiniz.
+
+## WhatsApp PIN nedir ve neden gerekir?
+- PIN, WhatsApp üzerinden hesabınızı güvenli şekilde doğrulamak için kullanılır.
+- Amaç: yetkisiz kişilerin sizin adınıza ilan oluşturmasını engellemek.
+- Sistem sizden PIN istediğinde, ilk kayıt olurken oluşturduğunuz PIN’i girin.
+- Doğru PIN ile WhatsApp’ta 10 dakikalık bir oturum açılır.
+- 10 dakika sonra sistem tekrar PIN isterse, oturum süresi dolmuş demektir.
+- PIN’i tekrar girerek oturumu yeniden aktif edebilir ve kaldığınız yerden devam edebilirsiniz.
+
+## Kredi sistemi
+- Bazı işlemler için kredi gerekebilir (ör. ilan yayınlama).
+- Kredi bakiyesi profil > cüzdan bölümünde görünür.
+- Kredi yüklemek için profil > cüzdan adımlarını takip edin.
+
+## Yayınlama ücreti
+- Yayın ücreti varsa, önizleme/onarım ekranında açıkça gösterilir.
+- Onay verdiğinizde işlem tamamlanır.
+
+## Premium ilan
+- Premium ilanlar daha görünür olur.
+- Premium seçenekleri önizleme/yayınlama ekranında gösterilir.
+
+## Sık takılan konular (özet yönlendirme)
+- “İlan veremiyorum”: Profil > İlan Ver veya WhatsApp’tan ürün bilgisi gönder.
+- “Şifreyi unuttum”: Giriş ekranında “Şifremi Unuttum” seçeneği.
+- “İlanı silemedim”: Profil > İlanlarım üzerinden silmeyi deneyin.
+
+## Güvenlik ipuçları
+- PIN ve şifrenizi kimseyle paylaşmayın.
+- Sık oturum kapatıyorsanız tekrar PIN istenmesi normaldir.
 
 ## Destek
 - Sorun yaşarsanız destek sayfasından bize ulaşabilirsiniz.
+- emrahbadas@gmail.com adresine mail atarsanız size en kısa zamanda dönüş yapılacaktır.

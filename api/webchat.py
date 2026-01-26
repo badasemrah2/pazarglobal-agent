@@ -792,6 +792,39 @@ def is_help_or_next_step_query(message: str) -> bool:
     if any(t in msg for t in triggers):
         return True
 
+    return False
+
+
+def is_platform_info_query(message: str) -> bool:
+    """Return True when the user is asking general platform/how-to info."""
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+
+    triggers = [
+        "burası neresi",
+        "burasi neresi",
+        "nasıl çalışıyor",
+        "nasil calisiyor",
+        "temel mantığı",
+        "temel mantigi",
+        "platform hakkında",
+        "platform hakkinda",
+        "bilgi ver",
+        "bilgi",
+        "yardım",
+        "yardim",
+        "whatsapp",
+        "whatsapptan",
+        "whatsappten",
+        "whatsapp üzerinden",
+        "whatsapp uzerinden",
+        "ilan nasıl verilir",
+        "ilan nasil verilir",
+        "ilan verme",
+    ]
+    return any(t in msg for t in triggers)
+
     # Common short form: "ne yapayım?" / "ne yapcam" etc.
     if bool(re.search(r"\b(ne\s+yap(ay[ıi]m|maliyim|acag[ıi]m|mam\s+lazim))\b", msg)):
         return True
@@ -3373,6 +3406,13 @@ async def process_webchat_message(
                 and not is_cancel_command(message_body)
                 and not session.get("pending_publish")
             ):
+                session["locked_intent"] = None
+                session["intent"] = None
+                session_dirty = True
+
+        # If create_listing is locked but user asks platform/help questions, unlock.
+        if session.get("locked_intent") == "create_listing":
+            if is_help_or_next_step_query(message_body) or is_platform_info_query(message_body):
                 session["locked_intent"] = None
                 session["intent"] = None
                 session_dirty = True
