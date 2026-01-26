@@ -41,7 +41,7 @@ from services.text_normalization import (
     normalize_for_match,
     violates_listing_content_guard,
 )
-from tools import delete_listing_tool, get_wallet_balance_tool, publish_listing_tool
+from tools import get_wallet_balance_tool, publish_listing_tool
 
 from api.webchat_store import (
     IN_MEMORY_SESSION_CACHE,
@@ -101,23 +101,24 @@ def switch_intent(session: Dict[str, Any], new_intent: Optional[str], preserve_d
 
 MEDIA_ANALYSIS_SYSTEM_PROMPT = (
     "You are a marketplace vision assistant that returns concise Turkish JSON. "
-    "Always respond with a single JSON object containing these keys: product (string), "
-    "category (string), condition (string), features (array of up to 5 short strings), "
-    "description (string), safety_flags (array of short warning strings, empty array when no issues). "
-    "IMPORTANT: The 'condition' field is a VISUAL IMPRESSION from the photo (e.g. 'temiz', 'yıpranmış', 'çok iyi görünüyor'). "
-    "Do NOT infer or state marketplace condition like 'Sıfır'/'2. El'. If unsure, use empty string. "
-    "If you are unsure, set the field to an empty string or empty array."
+    "Always respond with a single JSON object containing these keys: "
+    "product (string), usage_area (string), visual_condition (string), "
+    "features (array of up to 5 short strings), category_tag (string, optional), "
+    "safety_flags (array of short warning strings, empty array when no issues). "
+    "IMPORTANT: 'visual_condition' is a VISUAL IMPRESSION from the photo (e.g. 'temiz', 'yıpranmış', 'çok iyi görünüyor'). "
+    "Do NOT infer or state marketplace condition like 'Sıfır'/'2. El'. "
+    "If unsure, use empty string/array. Do not include PII."
 )
 
 MEDIA_ANALYSIS_USER_PROMPT = (
     "Lütfen görseldeki ürünü analiz et ve yukarıdaki JSON şemasını doldur. "
-    "Ürünün türünü, olası kullanım alanını, durumunu ve dikkat çeken özelliklerini belirt. "
-    "Durum alanını 'görsel izlenim' olarak yaz (örn: 'temiz', 'yıpranmış', 'çok iyi görünüyor'). "
+    "Ürünün türünü, olası kullanım alanını, görsel izlenimini ve dikkat çeken özelliklerini belirt. "
     "'Sıfır/2. El' gibi kesin çıkarım yapma."
 )
 
 FSM_PARK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes of user silence → parked
 FSM_COMPOSER_TIMEOUT_SECONDS = 45   # ComposerAgent hard timeout
+MEDIA_ACTION_TTL_SECONDS = 10 * 60  # image-first choice timeout
 RESUME_KEYWORDS = {"devam", "kaldığımız yerden", "kaldigimiz yerden", "resume", "continue"}
 
 # === LLM OVERRIDE MECHANISM (v1.0) ===
@@ -1111,8 +1112,8 @@ def sanitize_classified_intent(message: str, router_result: str | dict | None) -
 
     msg = (message or "").strip().lower()
 
-    # Never enter publish/delete unless the user explicitly requested it.
-    if classified_intent == "publish_or_delete" and not (is_publish_command(msg) or is_delete_command(msg)):
+    # Never enter publish unless the user explicitly requested it.
+    if classified_intent == "publish_or_delete" and not is_publish_command(msg):
         # If it looks like a product query, prefer search.
         if is_search_command(msg):
             return {"intent": "search_listings", "detected_intents": []}
@@ -1348,6 +1349,15 @@ async def handle_publish_or_delete_flow(
     session_dirty: bool
 ) -> Dict[str, Any]:
     """Deterministic publish flow (no LLM): avoids looping confirmations and fake costs."""
+
+    if is_delete_command(message_body):
+        return {
+            "success": True,
+            "message": "İlan silme işlemini artık sadece platform üzerinden yapabilirsiniz. Profil > İlanlarım bölümünden silebilirsiniz.",
+            "data": {"type": "delete_disabled"},
+            "intent": "small_talk",
+            "_session_dirty": session_dirty,
+        }
 
     # Allow users to exit the publish/delete flow with a general cancel phrase.
     if is_cancel_command(message_body) and not user_refuses_images(message_body):
@@ -1632,10 +1642,15 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
         if not isinstance(analysis, dict):
             analysis = {"summary": analysis}
         parts: List[str] = []
-        product = analysis.get("product") or analysis.get("category")
+        product = analysis.get("product") or analysis.get("category_tag")
         if product:
             parts.append(f"ürün: {product}")
-        # condition silently used in background, not shown to user
+        usage_area = analysis.get("usage_area")
+        if usage_area:
+            parts.append(f"kullanım alanı: {usage_area}")
+        visual_condition = analysis.get("visual_condition")
+        if visual_condition:
+            parts.append(f"görsel durum: {visual_condition}")
         features = analysis.get("features")
         if isinstance(features, list) and features:
             parts.append("özellikler: " + ", ".join(features[:3]))
@@ -2115,8 +2130,8 @@ def _unwrap_vision_product(vision: Any) -> Dict[str, Any]:
 
 def generate_title_from_vision(vision: Any) -> str:
     v = _unwrap_vision_product(vision)
-    product = str(v.get("product") or v.get("category") or "").strip()
-    condition = str(v.get("condition") or "").strip()
+    product = str(v.get("product") or v.get("category_tag") or "").strip()
+    condition = str(v.get("visual_condition") or "").strip()
     features = v.get("features")
 
     feature_txt = ""
@@ -2141,8 +2156,9 @@ def generate_description_from_vision(vision: Any) -> str:
     v = _unwrap_vision_product(vision)
     if not v:
         return ""
-    product = str(v.get("product") or v.get("category") or "Ürün").strip()
-    condition = str(v.get("condition") or "").strip()
+    product = str(v.get("product") or v.get("category_tag") or "Ürün").strip()
+    condition = str(v.get("visual_condition") or "").strip()
+    usage_area = str(v.get("usage_area") or "").strip()
     features = v.get("features")
 
     feature_txt = ""
@@ -2154,6 +2170,8 @@ def generate_description_from_vision(vision: Any) -> str:
     sentences: List[str] = []
     if product:
         sentences.append(f"{product} satışa hazır.")
+    if usage_area:
+        sentences.append(f"Kullanım alanı: {usage_area}.")
     if condition:
         sentences.append(f"Görsel izlenim: {condition}.")
     if feature_txt:
@@ -2946,7 +2964,7 @@ def extract_vision_search_query(analyses: List[Dict[str, Any]]) -> str:
         analysis = (entry or {}).get("analysis")
         if not isinstance(analysis, dict):
             continue
-        for key in ["product", "category", "condition"]:
+        for key in ["product", "category_tag", "usage_area", "visual_condition"]:
             val = str(analysis.get(key) or "").strip()
             if val and val.lower() not in {"", "unknown", "bilinmiyor"}:
                 tokens.append(val)
@@ -3509,20 +3527,21 @@ async def process_webchat_message(
                 # Fall through to normal handling
                 pass
 
+        if is_delete_command(message_body):
+            return await finalize_response({
+                "success": True,
+                "message": "İlan silme işlemini artık sadece platform üzerinden yapabilirsiniz. Profil > İlanlarım bölümünden silebilirsiniz.",
+                "data": {"type": "delete_disabled"},
+                "intent": "small_talk",
+            })
+
         delete_listing_request: Optional[Dict[str, Any]] = None
         delete_listing_source: Optional[str] = None
-        if is_delete_command(message_body):
-            listing_candidate, listing_source = _resolve_listing_reference(session, message_body, session_id)
-            if listing_candidate:
-                delete_listing_request = {"listing": listing_candidate}
-                delete_listing_source = listing_source or "context"
 
         # If user issues a publish/delete/create command, override any sticky intent.
         # This prevents getting stuck in a previous flow (e.g., search_listings) when the user explicitly
         # changes their mind and wants to sell or publish.
-        wants_publish_delete_intent = is_publish_command(message_body) or (
-            is_delete_command(message_body) and delete_listing_request is None
-        )
+        wants_publish_delete_intent = is_publish_command(message_body)
         if wants_publish_delete_intent:
             prev_locked_pub = session.get("locked_intent")
             session["intent"] = "publish_or_delete"
@@ -3535,7 +3554,7 @@ async def process_webchat_message(
             if prev_locked_pub != "publish_or_delete":
                 await _record_fsm_event("intent_lock", session_id, session, {"new_intent": "publish_or_delete", "prev_locked": prev_locked_pub})
 
-        if is_create_listing_command(message_body) and not (is_publish_command(message_body) or is_delete_command(message_body)):
+        if is_create_listing_command(message_body) and not is_publish_command(message_body):
             prev_locked = session.get("locked_intent")
             session["intent"] = "create_listing"
             session["locked_intent"] = "create_listing"
@@ -3626,6 +3645,7 @@ async def process_webchat_message(
             merged = merge_unique_urls(pending_media_urls, all_media_urls)
             if merged != pending_media_urls:
                 session["pending_media_urls"] = merged
+                session["pending_media_created_at"] = _utc_now_iso()
                 pending_media_urls = merged
                 session_dirty = True
         all_media_urls = pending_media_urls
@@ -3729,6 +3749,7 @@ async def process_webchat_message(
                 # Clear session pending media so we don't re-process in later turns
                 session["pending_media_urls"] = []
                 session["pending_media_analysis"] = []
+                session.pop("pending_media_created_at", None)
                 session_dirty = True
 
                 # Build user-facing message with vision analysis
@@ -3742,12 +3763,15 @@ async def process_webchat_message(
                         analysis = analysis_by_url.get(url, {})
                         if isinstance(analysis, dict):
                             product = analysis.get("product", "")
-                            condition = analysis.get("condition", "")
+                            condition = analysis.get("visual_condition", "")
+                            usage_area = analysis.get("usage_area", "")
                             features = analysis.get("features", [])
                             if product:
                                 vision_summary_parts.append(f"📷 {product}")
+                            if usage_area:
+                                vision_summary_parts.append(f"Kullanım: {usage_area}")
                             if condition:
-                                vision_summary_parts.append(f"Durum: {condition}")
+                                vision_summary_parts.append(f"Görsel durum: {condition}")
                             if isinstance(features, list) and features:
                                 vision_summary_parts.append(f"Özellikler: {', '.join(features[:3])}")
                     
@@ -3782,6 +3806,23 @@ async def process_webchat_message(
             except Exception:
                 # Fall through to normal handling
                 pass
+
+        # IMAGE-FIRST TTL:
+        pending_created_at = session.get("pending_media_created_at")
+        if pending_created_at:
+            age = _seconds_since(pending_created_at)
+            if age is not None and age > MEDIA_ACTION_TTL_SECONDS:
+                session["pending_media_urls"] = []
+                session["pending_media_analysis"] = []
+                session["awaiting_media_action"] = False
+                session.pop("pending_media_created_at", None)
+                session_dirty = True
+                return await finalize_response({
+                    "success": True,
+                    "message": "Görselin süresi doldu. Lütfen tekrar fotoğraf gönderir misin?",
+                    "data": {"type": "media_expired"},
+                    "intent": None,
+                })
 
         # IMAGE-FIRST MANDATORY CHOICE:
         # If we previously received images without a locked intent, we must ask what the user
@@ -3852,7 +3893,7 @@ async def process_webchat_message(
                         if ok:
                             current_count += 1
 
-                    # Persist a single vision_product snapshot and auto-category suggestion (best-effort)
+                    # Persist a single vision_product snapshot (best-effort)
                     first_analysis = None
                     for entry in analyses or []:
                         a = (entry or {}).get("analysis") if isinstance(entry, dict) else None
@@ -3864,13 +3905,6 @@ async def process_webchat_message(
                             await supabase_client.update_draft_vision_product(draft_id, first_analysis)
                         except Exception:
                             pass
-                        try:
-                            cat_candidate = str(first_analysis.get("category") or "").strip()
-                            normalized_cat = normalize_category_input(cat_candidate) if cat_candidate else None
-                            if normalized_cat:
-                                await supabase_client.update_draft_category(draft_id, normalized_cat)
-                        except Exception:
-                            pass
 
                     # Clear buffered media in both session and draft listing_data (best-effort).
                     try:
@@ -3879,6 +3913,7 @@ async def process_webchat_message(
                         pass
                     session["pending_media_urls"] = []
                     session["pending_media_analysis"] = []
+                    session.pop("pending_media_created_at", None)
                     session_dirty = True
 
                 intro_draft = None
@@ -3911,7 +3946,7 @@ async def process_webchat_message(
             session_dirty = True
             return await finalize_response({
                 "success": True,
-                "message": "Anladım. Fiyat araştırması yapmak için 'kaç para eder' yazabilir veya ürünle ilgili kısa bir bilgi ekleyebilirsiniz.",
+                "message": "Anladım. Fiyat araştırması için ürün adı + durum bilgisini yazabilir misin? Örn: 'Citroen C3 otomatik 2. el'",
                 "data": {"type": "price_research_intro"},
                 "intent": "price_research",
             })
@@ -3937,6 +3972,7 @@ async def process_webchat_message(
                     new_analyses = await analyze_media_with_vision(new_urls)
                     cached_analyses = cached_analyses + new_analyses
                     session["pending_media_analysis"] = cached_analyses
+                    session["pending_media_created_at"] = _utc_now_iso()
                     session_dirty = True
 
                 # Store buffered media in DB (draft listing_data) for non-sticky sessions.
@@ -4661,6 +4697,7 @@ async def process_webchat_message(
                 # Clear pre-intent buffer after consumption
                 session["pending_media_urls"] = []
                 session["pending_media_analysis"] = []
+                session.pop("pending_media_created_at", None)
                 session_dirty = True
 
             draft_id = session.get("active_draft_id")
@@ -5711,6 +5748,8 @@ async def process_webchat_message(
                     await redis_client.set_active_draft(session_id, result["draft_id"])
                 if session.get("pending_media_urls"):
                     session["pending_media_urls"] = []
+                    session["pending_media_analysis"] = []
+                    session.pop("pending_media_created_at", None)
                     session_dirty = True
                 
                 draft = result["draft"]
@@ -6115,6 +6154,7 @@ async def process_webchat_message(
                     message_body = (message_body + " " + vision_query).strip()
                 session["pending_media_urls"] = []
                 session["pending_media_analysis"] = []
+                session.pop("pending_media_created_at", None)
                 session_dirty = True
 
             # Handle simple "ilan listele" style requests deterministically.
@@ -6427,6 +6467,8 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
 
     merged_urls = merge_unique_urls(session.get("pending_media_urls") or [], chat_message.media_urls)
     session["pending_media_urls"] = merged_urls
+    if merged_urls:
+        session["pending_media_created_at"] = _utc_now_iso()
 
     # Mark this session as starting a fresh listing draft if user proceeds to "ilan oluştur".
     # This prevents older draft fields (like a cached price) from leaking into a new flow.
@@ -6440,10 +6482,11 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
     session["vision_explained"] = True
 
     # IMPORTANT (non-sticky sessions): persist uploaded media into the active draft.
-    # The frontend uses /media/analyze, and the follow-up "ilan oluştur" message may
-    # land on a different instance where in-memory session state is missing.
+    # If intent is not locked to create_listing yet, buffer media instead of attaching
+    # to draft.images. This keeps image-first flows safe and reversible.
     if normalized_user_id and merged_urls:
         try:
+            attach_directly = session.get("locked_intent") == "create_listing" or session.get("intent") == "create_listing"
             draft = None
             draft_id = session.get("active_draft_id")
             if isinstance(draft_id, str) and draft_id:
@@ -6473,12 +6516,15 @@ async def analyze_media(chat_message: MediaAnalysisRequest):
                     if isinstance(entry, dict) and entry.get("image_url"):
                         analysis_by_url[str(entry["image_url"])] = entry.get("analysis")
 
-                for url in merged_urls:
-                    if not url:
-                        continue
-                    analysis = analysis_by_url.get(url)
-                    meta = {"analysis": analysis} if isinstance(analysis, dict) and analysis else {}
-                    await supabase_client.add_listing_image(draft_id, url, metadata=meta)
+                if attach_directly:
+                    for url in merged_urls:
+                        if not url:
+                            continue
+                        analysis = analysis_by_url.get(url)
+                        meta = {"analysis": analysis} if isinstance(analysis, dict) and analysis else {}
+                        await supabase_client.add_listing_image(draft_id, url, metadata=meta)
+                else:
+                    await supabase_client.set_buffered_media(draft_id, merged_urls, analyses or [])
 
                 # Best-effort: store the first analysis as draft.vision_product
                 first_analysis = None

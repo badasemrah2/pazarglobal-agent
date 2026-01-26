@@ -66,7 +66,7 @@ class ProcessImageTool(BaseTool):
         return "process_image"
     
     def get_description(self) -> str:
-        return "Process product image: analyze content, detect category, check safety. Requires draft_id."
+        return "Process product image: analyze content and return vision JSON. Requires draft_id."
     
     def get_parameters(self) -> Dict[str, Any]:
         return {
@@ -98,9 +98,11 @@ class ProcessImageTool(BaseTool):
             system_prompt = (
                 "You are a marketplace vision assistant that returns concise Turkish JSON. "
                 "Always respond with a single JSON object containing these keys: "
-                "product (string), category (string), condition (string), features (array of up to 5 short strings), "
-                "description (string), safety_flags (array of short warning strings). "
-                "Never return an empty object. If unsure, make your best guess."
+                "product (string), usage_area (string), visual_condition (string), "
+                "features (array of up to 5 short strings), category_tag (string, optional), "
+                "safety_flags (array of short warning strings, empty array when no issues). "
+                "IMPORTANT: visual_condition is a visual impression only (e.g. 'temiz', 'yıpranmış'). "
+                "Do NOT infer marketplace condition like 'Sıfır/2. El'. If unsure, use empty string/array."
             )
             user_prompt = "Görseldeki ürünü analiz et ve JSON alanlarını doldur."
 
@@ -136,38 +138,12 @@ class ProcessImageTool(BaseTool):
             # If metadata update fails, keep the previously stored URL.
             pass
 
-        # Best-effort: update category + vision_product for downstream draft summaries
+        # Best-effort: update vision_product for downstream summaries
         try:
-            detected_category = ""
-            if isinstance(analysis, dict):
-                detected_category = str(analysis.get("category") or "").strip()
-            detected_category = normalize_category(detected_category)
-            await supabase_client.update_draft_category(
+            await supabase_client.update_draft_vision_product(
                 draft_id,
-                detected_category or "Diğer",
-                vision_product=analysis if isinstance(analysis, dict) else {"raw": analysis_text}
+                analysis if isinstance(analysis, dict) else {"raw": analysis_text}
             )
-        except Exception:
-            pass
-
-        # Best-effort: auto-fill title/description if empty using vision output
-        try:
-            draft = await supabase_client.get_draft(draft_id)
-            listing_data = (draft or {}).get("listing_data") or {}
-            title_missing = not (listing_data.get("title") or "").strip()
-            desc_missing = not (listing_data.get("description") or "").strip()
-
-            if isinstance(analysis, dict):
-                product = str(analysis.get("product") or analysis.get("category") or "").strip()
-                description = str(analysis.get("description") or "").strip()
-                features = analysis.get("features")
-                if desc_missing and (not description) and isinstance(features, list) and features:
-                    description = "Öne çıkan özellikler: " + ", ".join([str(f) for f in features[:5] if f])
-
-                if title_missing and product:
-                    await supabase_client.update_draft_title(draft_id, product[:100])
-                if desc_missing and description:
-                    await supabase_client.update_draft_description(draft_id, description)
         except Exception:
             pass
 

@@ -1183,6 +1183,7 @@ class SupabaseClient:
             
             # Insert into listings
             result = self.client.table("listings").insert({
+                "id": draft_id,
                 "user_id": user_id,
                 "title": listing_data.get("title"),
                 "description": listing_data.get("description"),

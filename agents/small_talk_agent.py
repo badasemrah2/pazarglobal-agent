@@ -3,6 +3,7 @@ Small Talk Agent - Handles general conversation and platform questions
 """
 from .base_agent import BaseAgent
 from config.prompts import SMALL_TALK_AGENT_PROMPT
+from tools import read_site_guide_tool
 
 
 class SmallTalkAgent(BaseAgent):
@@ -12,5 +13,5 @@ class SmallTalkAgent(BaseAgent):
         super().__init__(
             name="SmallTalkAgent",
             system_prompt=SMALL_TALK_AGENT_PROMPT,
-            tools=[]  # No tools - purely conversational
+            tools=[read_site_guide_tool]
         )

@@ -21,6 +21,9 @@ from .wallet_tools import (
 from .image_tools import (
     process_image_tool
 )
+from .site_guide_tool import (
+    read_site_guide_tool
+)
 
 __all__ = [
     "BaseTool",
@@ -36,5 +39,6 @@ __all__ = [
     "get_wallet_balance_tool",
     "get_wallet_transactions_tool",
     "deduct_credits_tool",
-    "process_image_tool"
+    "process_image_tool",
+    "read_site_guide_tool",
 ]

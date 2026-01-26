@@ -1,0 +1,40 @@
+# PazarGlobal Kullanıcı Rehberi
+
+## İlan verme
+- Üst menüde “İlan Ver” butonuna tıklayın.
+- Ürün adı, kısa açıklama, fiyat, lokasyon ve durum bilgilerini girin.
+- Fotoğraf eklemek için “Fotoğraf Ekle” alanını kullanın.
+- Önizlemeyi kontrol edin ve “Yayınla” butonuyla tamamlayın.
+
+## WhatsApp ile ilan verme
+- WhatsApp üzerinden ürün bilgilerini yazabilir veya fotoğraf gönderebilirsiniz.
+- Sistem gerekli bilgileri adım adım ister.
+- Yayınlamak için “yayınla” yazabilirsiniz.
+
+## Premium ilan nedir?
+- Premium ilanlar daha görünür olur ve daha hızlı öne çıkar.
+- Premium seçenekleri ilan önizleme adımında görüntülenir.
+
+## Kredi sistemi
+- İlan yayınlama bazı durumlarda kredi kullanabilir.
+- Kredi bakiyenizi profil bölümünden görebilirsiniz.
+- Kredi yüklemek için profil > cüzdan bölümüne gidin.
+
+## Kayıt ve giriş
+- Kayıt için e‑posta ve telefon bilgisi gerekir.
+- Giriş yaptıktan sonra profil bilgilerinizi güncelleyebilirsiniz.
+
+## Şifre değiştirme
+- Profil > Ayarlar bölümüne gidin.
+- “Şifre Değiştir” seçeneğini kullanın.
+
+## WhatsApp PIN nedir?
+- WhatsApp üzerinden güvenli kullanım için PIN oluşturmanız istenebilir.
+- PIN ile hesabınız doğrulanır ve yetkisiz kullanımlar engellenir.
+
+## İlanlarımı nasıl yönetirim?
+- Profil > İlanlarım sayfasına gidin.
+- Buradan ilanlarınızı görüntüleyebilir ve gerekli düzenlemeleri yapabilirsiniz.
+
+## Destek
+- Sorun yaşarsanız destek sayfasından bize ulaşabilirsiniz.
