@@ -3348,6 +3348,19 @@ async def process_webchat_message(
             session_dirty = True
         user_id = normalized_user_id
 
+        # If publish flow is locked but user is asking a general question
+        # (not publish/confirm/cancel), unlock so small-talk can respond.
+        if session.get("locked_intent") == "publish_or_delete":
+            if (
+                not is_publish_command(message_body)
+                and not is_confirm_command(message_body)
+                and not is_cancel_command(message_body)
+                and not session.get("pending_publish")
+            ):
+                session["locked_intent"] = None
+                session["intent"] = None
+                session_dirty = True
+
         # Deterministic delete listing confirmation (session-based).
         # Check if there's a pending delete confirmation before processing other logic.
         pending_delete = session.get("pending_listing_delete")
