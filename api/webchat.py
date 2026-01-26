@@ -41,7 +41,7 @@ from services.text_normalization import (
     normalize_for_match,
     violates_listing_content_guard,
 )
-from tools import get_wallet_balance_tool, publish_listing_tool
+from tools import get_wallet_balance_tool, publish_listing_tool, read_site_guide_tool
 
 from api.webchat_store import (
     IN_MEMORY_SESSION_CACHE,
@@ -3416,6 +3416,26 @@ async def process_webchat_message(
                 session["locked_intent"] = None
                 session["intent"] = None
                 session_dirty = True
+
+        # Deterministic platform info: respond from guide without routing to create/search flows.
+        if is_platform_info_query(message_body):
+            guide_result = await read_site_guide_tool.execute(query=message_body)
+            sections = guide_result.get("data", {}).get("sections", []) if isinstance(guide_result, dict) else []
+            if sections:
+                parts = []
+                for sec in sections:
+                    title = sec.get("title") or "Rehber"
+                    content = sec.get("content") or ""
+                    parts.append(f"{title}\n{content}".strip())
+                response_text = "\n\n".join(parts)
+            else:
+                response_text = "Rehberde ilgili bir bölüm bulamadım. İstersen daha spesifik sorabilirsin."
+            return await finalize_response({
+                "success": True,
+                "message": response_text,
+                "data": {"type": "site_guide"},
+                "intent": "small_talk",
+            })
 
         # Deterministic delete listing confirmation (session-based).
         # Check if there's a pending delete confirmation before processing other logic.
