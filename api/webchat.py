@@ -801,15 +801,16 @@ def is_platform_info_query(message: str) -> bool:
     if not msg:
         return False
 
+    # Small talk or identity questions should not be routed to the guide.
+    if is_small_talk_query(msg):
+        return False
+
     # Do not treat explicit task intents as platform info.
     if is_create_listing_command(msg) or is_search_command(msg) or user_asks_market_price(msg):
         return False
 
     question_markers = [
         "nedir",
-        "ne",
-        "nasıl",
-        "nasil",
         "nasıl olur",
         "nasil olur",
         "bilgi",
@@ -843,8 +844,6 @@ def is_platform_info_query(message: str) -> bool:
     ]
     if any(t in msg for t in triggers):
         return True
-    return any(q in msg for q in question_markers)
-
     # Common short form: "ne yapayım?" / "ne yapcam" etc.
     if bool(re.search(r"\b(ne\s+yap(ay[ıi]m|maliyim|acag[ıi]m|mam\s+lazim))\b", msg)):
         return True
@@ -853,7 +852,35 @@ def is_platform_info_query(message: str) -> bool:
     if ("ne yap" in msg or "next" in msg) and "?" in msg:
         return True
 
-    return False
+    return any(q in msg for q in question_markers)
+
+
+def is_small_talk_query(message: str) -> bool:
+    msg = normalize_for_match(message)
+    if not msg:
+        return False
+
+    small_talk_triggers = [
+        "selam",
+        "merhaba",
+        "naber",
+        "nasilsin",
+        "nasil gidiyor",
+        "iyimisin",
+        "iyi misin",
+        "kimsin",
+        "sen nesin",
+        "nesin",
+        "adin ne",
+        "adın ne",
+        "sohbet",
+        "konus",
+        "konuş",
+        "konusalim",
+        "konuşalım",
+        "sohbet edelim",
+    ]
+    return any(t in msg for t in small_talk_triggers)
 
 
 def user_refuses_images(message: str) -> bool:
@@ -4582,6 +4609,8 @@ async def process_webchat_message(
             override_intent = "create_listing"
         elif is_search_command(message_body):
             override_intent = "search_listings"
+        elif is_small_talk_query(message_body):
+            override_intent = "small_talk"
         elif is_show_more_command(message_body):
             # "Daha fazla" - show next page of search results
             override_intent = "show_more_results"
