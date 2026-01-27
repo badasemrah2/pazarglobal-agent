@@ -51,19 +51,21 @@ def canonicalize_condition(raw: str | None) -> str | None:
     )
     text = " ".join(text.split())
 
-    # New / unused
+    # Explicit used
     if any(tok in text for tok in [
-        "sifir",
-        "0",
-        "hic kullan",
-        "kullanilmamis",
-        "paketli",
-        "kapali kutu",
-        "kutusunda",
-        "yeni",
-        "sifir ayar",
+        "2 el",
+        "2el",
+        "ikinci el",
+        "kullanilmis",
+        "kullanildi",
+        "kullandim",
+        "kullandık",
+        "kullandik",
+        "kullanildi",
+        "kullanilmis",
+        "used",
     ]):
-        return "Sıfır"
+        return "2. El"
 
     # Lightly used / like new
     if any(tok in text for tok in [
@@ -82,15 +84,19 @@ def canonicalize_condition(raw: str | None) -> str | None:
     ]):
         return "Az Kullanılmış"
 
-    # Explicit used
+    # New / unused
     if any(tok in text for tok in [
-        "2 el",
-        "2el",
-        "ikinci el",
-        "kullanilmis",
-        "used",
+        "sifir",
+        "0",
+        "hic kullan",
+        "kullanilmamis",
+        "paketli",
+        "kapali kutu",
+        "kutusunda",
+        "yeni",
+        "sifir ayar",
     ]):
-        return "2. El"
+        return "Sıfır"
 
     # Adjective-only condition labels ("orta", "normal"...) are typically used items.
     if any(tok in text for tok in ["orta", "normal", "idare", "vasat", "eski", "yipran"]):

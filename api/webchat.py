@@ -1966,8 +1966,24 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     if category is None:
         category = normalize_category_input(text)
 
+    has_structured = any([
+        price is not None,
+        bool(location),
+        bool(condition),
+        bool(category),
+    ])
+
     # Remove obvious tokens for title extraction
     title_candidate = title_line or text
+    if has_structured and not title_line:
+        # Prefer the part before pricing/condition/location keywords.
+        split_match = re.split(
+            r"\b(fiyat|price|tl|₺|2\s*\.?\s*el|ikinci\s*el|durum|kondisyon|konum|lokasyon|lokasyon|il|ilce|şehir|sehir)\b",
+            title_candidate,
+            flags=re.IGNORECASE,
+        )
+        if split_match:
+            title_candidate = split_match[0]
     # Strip price-like parts
     title_candidate = re.sub(r"\b(fiyat|price)\b\s*[:=]?\s*\d+[\d\.\,\s]*\s*(tl|₺)?", " ", title_candidate, flags=re.IGNORECASE)
     title_candidate = re.sub(r"\b\d{1,3}(?:[\.,]\d{3})+\b", " ", title_candidate)
@@ -1984,6 +2000,12 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     title_candidate = re.sub(r"\b(durum|kondisyon|condition|lokasyon|konum|location|kategori|category)\b", " ", title_candidate, flags=re.IGNORECASE)
     # Strip common filler words
     title_candidate = re.sub(r"\b(acil|satılık|satilik)\b", " ", title_candidate, flags=re.IGNORECASE)
+    title_candidate = re.sub(
+        r"\b(tamam|anladım|anladim|ozaman|o\s*zaman|satmak\s*istiyorum|satmak\s*istiyoruz|satiyorum|satıyorum|satmak)\b",
+        " ",
+        title_candidate,
+        flags=re.IGNORECASE,
+    )
 
     if location:
         # remove location occurrence (best effort)
@@ -1995,7 +2017,7 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     description = ""
     if description_lines:
         description = " ".join(description_lines).strip()
-    elif len(text) >= 10 and not title_line:
+    elif len(text) >= 10 and not title_line and not has_structured:
         description = text
 
     # If user asks to publish/cancel etc, do not treat as listing content.
@@ -2004,6 +2026,9 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
 
     fields: Dict[str, Any] = {}
     if title_candidate and len(title_candidate) >= 3:
+        if has_structured:
+            if len(title_candidate.split()) > 8:
+                title_candidate = ""
         fields["title"] = title_candidate
     if description and len(description.strip()) >= 6:
         fields["description"] = description.strip()
@@ -5126,6 +5151,29 @@ async def process_webchat_message(
                 # If the draft is already ready (minimum set), allow inline edits and show a preview
                 # without forcing the publish flow.
                 if draft_ready_for_preview(existing_draft):
+                    if is_publish_command(message_body):
+                        session["intent"] = "publish_or_delete"
+                        session["locked_intent"] = "publish_or_delete"
+                        session_dirty = True
+                        publish_payload = await handle_publish_or_delete_flow(
+                            message_body=message_body,
+                            session_id=session_id,
+                            session=session,
+                            user_id=user_id,
+                            redis_disabled=redis_disabled,
+                            session_dirty=session_dirty,
+                        )
+                        if publish_payload.pop("_session_dirty", False):
+                            session_dirty = True
+                        response_data["type"] = "publish_delete"
+                        if isinstance(publish_payload.get("data"), dict):
+                            response_data.update(publish_payload["data"])
+                        return await finalize_response({
+                            "success": publish_payload.get("success", False),
+                            "message": publish_payload.get("message", ""),
+                            "data": response_data,
+                            "intent": publish_payload.get("intent"),
+                        })
                     # If user previously asked for improve prompt, handle yes/no now.
                     if session.get("pending_copy_enrichment"):
                         if is_confirm_command(message_body):
@@ -5201,7 +5249,12 @@ async def process_webchat_message(
                     
                     # === LLM OVERRIDE MECHANISM ===
                     # If FSM parsing failed and user seems to want an edit, try LLM
-                    if not edit_request and not is_command_only_message(message_body) and not looks_like_greeting(message_body):
+                    if (
+                        not edit_request
+                        and not is_command_only_message(message_body)
+                        and not looks_like_greeting(message_body)
+                        and not is_publish_command(message_body)
+                    ):
                         # Check if message looks like an edit attempt (contains field keywords)
                         msg_lower = message_body.lower()
                         edit_keywords = {"başlık", "baslik", "title", "açıklama", "aciklama", "description", 

@@ -46,6 +46,34 @@ def _dedupe_preserve_order(items: List[str]) -> List[str]:
     return out
 
 
+def _augment_keywords(
+    *,
+    keywords: List[str],
+    title: str,
+    category: str,
+    vision_product: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    extras: List[str] = []
+    title_norm = (title or "").lower()
+    category_norm = (category or "").lower()
+    vision_norm = str((vision_product or {}).get("product") or "").lower()
+
+    if "elektronik" in category_norm:
+        extras.extend(["elektronik"])
+
+    if any(tok in title_norm for tok in ["iphone", "galaxy", "xiaomi", "telefon", "cep telefonu"]) or "telefon" in vision_norm:
+        extras.extend(["telefon", "cep telefonu", "akıllı telefon"])
+
+    normalized_extras: List[str] = []
+    for ex in extras:
+        kw = _normalize_keyword(ex)
+        if kw:
+            normalized_extras.append(kw)
+
+    combined = _dedupe_preserve_order(keywords + normalized_extras)
+    return combined
+
+
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
@@ -221,6 +249,14 @@ async def generate_listing_keywords(
                     kw = _normalize_keyword(ex)
                     if kw and kw not in normed:
                         normed.append(kw)
+
+            # Deterministic augmentation for better search recall
+            normed = _augment_keywords(
+                keywords=normed,
+                title=title,
+                category=category,
+                vision_product=vision,
+            )
 
             # Cap size
             normed = normed[: max(1, int(max_keywords))]
