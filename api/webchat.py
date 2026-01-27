@@ -6322,6 +6322,20 @@ async def process_webchat_message(
             user_condition = extracted.get("condition")
             category = extracted.get("category")
 
+            def _clean_price_title(raw_title: Optional[str]) -> Optional[str]:
+                if not raw_title:
+                    return None
+                cleaned = str(raw_title).strip()
+                cleaned = re.sub(
+                    r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|fiyat|nedir|ne|kaca|kaça|eder|ederi|piyasası|piyasasi)(\s+|$)",
+                    " ",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if not cleaned or cleaned.lower() in ["fiyat", "ücret", "değer", "ürün", "urun"]:
+                    return None
+                return cleaned
+
             def _derive_title_from_price_query(text: str) -> tuple[Optional[str], Optional[str]]:
                 if not text:
                     return None, None
@@ -6361,25 +6375,15 @@ async def process_webchat_message(
                 if cleaned.lower() in {"iphone", "telefon", "cep telefonu", "telefonu", "mobil"}:
                     return None, derived_condition
 
-                return cleaned, derived_condition
+                return _clean_price_title(cleaned), derived_condition
 
             # Clean generic titles
             if title:
-                # 1. Remove question suffixes inside specific titles (e.g. "iphone 11 ne kadar")
-                title = re.sub(
-                    r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|nedir|ne|kaca|kaça|eder|ederi|piyasası|piyasasi)(\s+|$)", 
-                    "", 
-                    title, 
-                    flags=re.IGNORECASE
-                ).strip()
-
-                # 2. Check if result is generic
-                if not title or title.lower() in ["fiyat", "ücret", "değer", "ürün", "urun"]:
-                    title = None
+                title = _clean_price_title(title)
 
             # Fallback to vision
             if not title and vision_data:
-                title = vision_data.get("product") or vision_data.get("category")
+                title = _clean_price_title(vision_data.get("product") or vision_data.get("category"))
             
             if not category and vision_data:
                 category = vision_data.get("category")
@@ -6394,18 +6398,28 @@ async def process_webchat_message(
 
             # Fallback to search context query (e.g., user asked "ortalama fiyat" after a search)
             if not title:
+                # If user only provided condition, reuse last price research title
+                if canonicalize_condition(message_body):
+                    last_price_ctx = session.get("last_price_research") if isinstance(session.get("last_price_research"), dict) else {}
+                    last_title = _clean_price_title((last_price_ctx or {}).get("title"))
+                    last_category = (last_price_ctx or {}).get("category")
+                    if last_title:
+                        title = last_title
+                        if not category and last_category:
+                            category = last_category
+
                 price_ctx = session.get("price_research_context")
                 if isinstance(price_ctx, dict):
                     ctx_query = (price_ctx or {}).get("query")
                     if ctx_query:
-                        title = ctx_query
+                        title = _clean_price_title(ctx_query)
                         session.pop("price_research_context", None)
                         session_dirty = True
                 if not title:
                     search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
                     ctx_query = (search_ctx or {}).get("query")
                     if ctx_query:
-                        title = ctx_query
+                        title = _clean_price_title(ctx_query)
 
             # 3. Validation
             if not title:
@@ -6422,6 +6436,13 @@ async def process_webchat_message(
                 parsed_cond = canonicalize_condition(user_condition)
                 if parsed_cond:
                     condition = parsed_cond
+
+            # Store last successful price research context for follow-ups like "sıfır fiyatı"
+            session["last_price_research"] = {
+                "title": title,
+                "category": category,
+            }
+            session_dirty = True
 
             # 4. Execute Price Search
             price_resp = await supabase_client.suggest_price_cached(
