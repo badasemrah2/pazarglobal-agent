@@ -6322,6 +6322,47 @@ async def process_webchat_message(
             user_condition = extracted.get("condition")
             category = extracted.get("category")
 
+            def _derive_title_from_price_query(text: str) -> tuple[Optional[str], Optional[str]]:
+                if not text:
+                    return None, None
+                raw = text.strip()
+                derived_condition = canonicalize_condition(raw)
+
+                cleaned = raw
+                cleaned = re.sub(
+                    r"\b(piyasa\s*fiyatı|piyasa\s*fiyati|piyasa)\b",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+                cleaned = re.sub(
+                    r"\b(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|fiyat|eder|ederi|değeri|degeri|kaç|kac)\b",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+                cleaned = re.sub(
+                    r"\b(sıfır|sifir|yeni|kutulu|kapalı\s+kutu|kapali\s+kutu|2\.?\s*el|ikinci\s+el|kullanılmış|kullanilmis|az\s+kullanılmış|az\s+kullanilmis|temiz|çok\s+temiz|cok\s+temiz)\b",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+                cleaned = re.sub(r"[^\w\s\+\-]", " ", cleaned, flags=re.UNICODE)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                cleaned = re.sub(r"\b[1iİI]phone\b", "iPhone", cleaned, flags=re.IGNORECASE)
+
+                if not cleaned:
+                    return None, derived_condition
+
+                tokens = re.findall(r"[a-zA-ZçğıöşüÇĞİÖŞÜ0-9]+", cleaned)
+                if not any(ch.isdigit() for ch in cleaned) and len(tokens) < 2:
+                    return None, derived_condition
+
+                if cleaned.lower() in {"iphone", "telefon", "cep telefonu", "telefonu", "mobil"}:
+                    return None, derived_condition
+
+                return cleaned, derived_condition
+
             # Clean generic titles
             if title:
                 # 1. Remove question suffixes inside specific titles (e.g. "iphone 11 ne kadar")
@@ -6342,6 +6383,14 @@ async def process_webchat_message(
             
             if not category and vision_data:
                 category = vision_data.get("category")
+
+            # Fallback: derive title/condition from freeform price query (even without explicit labels)
+            if not title:
+                derived_title, derived_condition = _derive_title_from_price_query(message_body)
+                if derived_title:
+                    title = derived_title
+                if derived_condition and not user_condition:
+                    user_condition = derived_condition
 
             # Fallback to search context query (e.g., user asked "ortalama fiyat" after a search)
             if not title:
