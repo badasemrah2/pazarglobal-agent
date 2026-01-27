@@ -6653,6 +6653,11 @@ async def process_webchat_message(
                 "type": "search_results"
             })
 
+            def _strip_search_cache_block(text: str) -> str:
+                if not text:
+                    return text
+                return re.sub(r"\[SEARCH_CACHE\](\[.*?\]|\{.*?\})", "", text, flags=re.DOTALL).strip()
+
             # Cache full results for follow-up detail requests
             # Store both in-memory cache AND session for Redis-less environments
             full_listings = result.get("listings_full")
@@ -6669,7 +6674,7 @@ async def process_webchat_message(
                 first_page = full_listings[:page_size]
                 
                 # Override search message with paginated results
-                search_message = result.get("message", "Arama sonuçları:")
+                search_message = _strip_search_cache_block(result.get("message", "Arama sonuçları:"))
                 
                 # Format first page listings
                 if first_page:
@@ -6699,7 +6704,7 @@ async def process_webchat_message(
                     response_data["total"] = total_count
                     response_data["has_more"] = total_count > page_size
             else:
-                search_message = result.get("message", "Search completed")
+                search_message = _strip_search_cache_block(result.get("message", "Search completed"))
 
             # SOFT CONTEXT: If user was creating a listing, offer to return
             paused_ctx = session.get("paused_context")
