@@ -801,6 +801,25 @@ def is_platform_info_query(message: str) -> bool:
     if not msg:
         return False
 
+    # Do not treat explicit task intents as platform info.
+    if is_create_listing_command(msg) or is_search_command(msg) or user_asks_market_price(msg):
+        return False
+
+    question_markers = [
+        "nedir",
+        "ne",
+        "nasıl",
+        "nasil",
+        "nasıl olur",
+        "nasil olur",
+        "bilgi",
+        "rehber",
+        "yardım",
+        "yardim",
+        "hakkında",
+        "hakkinda",
+    ]
+
     triggers = [
         "burası neresi",
         "burasi neresi",
@@ -821,9 +840,10 @@ def is_platform_info_query(message: str) -> bool:
         "whatsapp uzerinden",
         "ilan nasıl verilir",
         "ilan nasil verilir",
-        "ilan verme",
     ]
-    return any(t in msg for t in triggers)
+    if any(t in msg for t in triggers):
+        return True
+    return any(q in msg for q in question_markers)
 
     # Common short form: "ne yapayım?" / "ne yapcam" etc.
     if bool(re.search(r"\b(ne\s+yap(ay[ıi]m|maliyim|acag[ıi]m|mam\s+lazim))\b", msg)):
@@ -2911,6 +2931,19 @@ def normalize_category_input(message: str) -> Optional[str]:
     return None
 
 
+def normalize_title_input(message: str) -> str:
+    """Strip common label prefixes like 'Başlık:' from user title input."""
+    raw = (message or "").strip()
+    if not raw:
+        return ""
+    return re.sub(
+        r"^(başlık|baslik|title)\s*[:\-–—]\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
 def parse_price_input(message: str) -> Optional[float]:
     """Best-effort price parser for direct user input (e.g. '250000', '250.000', '250k')."""
     msg = (message or "").strip().lower()
@@ -3418,7 +3451,7 @@ async def process_webchat_message(
                 session_dirty = True
 
         # Deterministic platform info: respond from guide without routing to create/search flows.
-        if is_platform_info_query(message_body):
+        if is_platform_info_query(message_body) and not is_create_listing_command(message_body):
             guide_result = await read_site_guide_tool.execute(query=message_body)
             sections = guide_result.get("data", {}).get("sections", []) if isinstance(guide_result, dict) else []
             if sections:
@@ -5398,7 +5431,7 @@ async def process_webchat_message(
                             "data": {"type": "slot_prompt", "slot": "title", "draft_id": draft_id},
                             "intent": intent,
                         })
-                    trimmed_title = (message_body or "").strip()
+                    trimmed_title = normalize_title_input(message_body)
                     if len(trimmed_title) >= 3:
                         if violates_listing_content_guard(trimmed_title):
                             logger.info("Title guard suppressed action command payload for draft %s", draft_id)

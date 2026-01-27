@@ -49,6 +49,11 @@ def _rank_sections(sections: List[Dict[str, str]], query: str) -> List[Dict[str,
         return sections[:2]
 
     q = query.lower()
+    # Force support section for contact/email queries
+    if any(tok in q for tok in ["destek", "iletisim", "iletişim", "mail", "e-posta", "eposta"]):
+        for sec in sections:
+            if "destek" in (sec.get("title") or "").lower():
+                return [sec]
     scored = []
     for sec in sections:
         hay = f"{sec.get('title', '')}\n{sec.get('content', '')}".lower()
