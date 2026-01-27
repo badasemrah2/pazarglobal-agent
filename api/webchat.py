@@ -3487,6 +3487,17 @@ async def process_webchat_message(
             and not is_create_listing_command(message_body)
             and not is_edit_command(message_body)
         ):
+            msg_norm = normalize_for_match(message_body)
+            if msg_norm and any(t in msg_norm for t in ["burasi nedir", "burası nedir", "burasi neresi", "burası neresi"]):
+                return await finalize_response({
+                    "success": True,
+                    "message": (
+                        "Burası PazarGlobal. WhatsApp veya WebChat üzerinden ilan oluşturabilir, "
+                        "ilan arayabilir ve ilanlarını yönetebilirsin."
+                    ),
+                    "data": {"type": "platform_info"},
+                    "intent": "small_talk",
+                })
             guide_result = await read_site_guide_tool.execute(query=message_body)
             sections = guide_result.get("data", {}).get("sections", []) if isinstance(guide_result, dict) else []
             if sections:
