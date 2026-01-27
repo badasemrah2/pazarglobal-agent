@@ -1554,7 +1554,13 @@ async def handle_publish_or_delete_flow(
         
         # === LLM OVERRIDE MECHANISM ===
         # If FSM parsing failed, check if LLM override should kick in
-        if not edit_request and not is_cancel_command(message_body) and not is_confirm_command(message_body):
+        if (
+            not edit_request
+            and not is_cancel_command(message_body)
+            and not is_confirm_command(message_body)
+            and not is_publish_command(message_body)
+            and is_explicit_edit_message(message_body)
+        ):
             # Record FSM failure
             _record_fsm_edit_failure(session, draft_id, None, message_body)
             session_dirty = True
@@ -1623,7 +1629,7 @@ async def handle_publish_or_delete_flow(
                 "_session_dirty": session_dirty
             }
 
-        if is_confirm_command(message_body):
+        if is_confirm_command(message_body) or is_publish_command(message_body):
             cost = int(pending.get("cost") or settings.listing_credit_cost)
             result = await publish_listing_tool.execute(draft_id=draft_id, user_id=user_id, credit_cost=cost)
             if result.get("success"):
@@ -2070,6 +2076,23 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     if is_publish_command(lowered) or is_cancel_command(lowered) or is_show_draft_command(lowered):
         return {}
 
+    # Build raw_content buffer from leftover text after stripping structured fields
+    raw_candidate = text
+    raw_candidate = re.sub(r"\b(başlık|baslik|title|açıklama|aciklama|description|fiyat|price|durum|kondisyon|condition|lokasyon|konum|location|şehir|sehir|kategori|category)\b\s*[:=]?\s*", " ", raw_candidate, flags=re.IGNORECASE)
+    raw_candidate = re.sub(r"\b\d{1,3}(?:[\.,]\d{3})+\b", " ", raw_candidate)
+    raw_candidate = re.sub(r"\b\d{3,6}\b\s*(tl|₺)\b", " ", raw_candidate, flags=re.IGNORECASE)
+    raw_candidate = re.sub(r"\b(tl|₺)\b", " ", raw_candidate, flags=re.IGNORECASE)
+    raw_candidate = re.sub(
+        r"\b(2\s*\.?\s*el|ikinci\s*el|sıfır|sifir|yeni|az\s*kullanılmış|az\s*kullanilmis|yeni\s*gibi|like\s*new)\b",
+        " ",
+        raw_candidate,
+        flags=re.IGNORECASE,
+    )
+    if location:
+        raw_candidate = re.sub(re.escape(location), " ", raw_candidate, flags=re.IGNORECASE)
+    raw_candidate = re.sub(r"\b(acil|satılık|satilik|satmak|satıyorum|satiyorum|satmak\s*istiyorum|satmak\s*istiyoruz|ozaman|o\s*zaman|tamam|anladim|anladım)\b", " ", raw_candidate, flags=re.IGNORECASE)
+    raw_candidate = " ".join(raw_candidate.split()).strip()
+
     fields: Dict[str, Any] = {}
     if has_structured and not explicit_title:
         title_candidate = ""
@@ -2091,6 +2114,8 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
         fields["condition"] = condition
     if category:
         fields["category"] = category
+    if raw_candidate and len(raw_candidate) >= 3:
+        fields["_raw_content"] = raw_candidate
     return fields
 
 
@@ -4972,6 +4997,35 @@ async def process_webchat_message(
             # Checks if user is commenting/complaining instead of providing data
             if existing_draft and message_body and len(message_body) > 3:
                 missing_slot_chk = next_missing_slot(existing_draft)
+                explicit_edit = extract_preview_edit(message_body)
+                if explicit_edit and isinstance(explicit_edit, dict):
+                    field = explicit_edit.get("field")
+                    value = explicit_edit.get("value")
+                    if field and value is not None:
+                        try:
+                            updater_map = {
+                                "title": supabase_client.update_draft_title,
+                                "description": supabase_client.update_draft_description,
+                                "price": supabase_client.update_draft_price,
+                                "category": supabase_client.update_draft_category,
+                                "condition": supabase_client.update_draft_condition,
+                                "location": supabase_client.update_draft_location,
+                            }
+                            updater = updater_map.get(field)
+                            if updater:
+                                await updater(draft_id, value)
+                                refreshed = await supabase_client.get_draft(draft_id)
+                                if refreshed:
+                                    existing_draft = refreshed
+                                    missing_slot_chk = next_missing_slot(existing_draft)
+                                return await finalize_response({
+                                    "success": True,
+                                    "message": build_next_step_message(existing_draft),
+                                    "data": {"type": "slot_prompt", "slot": missing_slot_chk, "draft_id": draft_id},
+                                    "intent": "create_listing",
+                                })
+                        except Exception:
+                            pass
                 try:
                     supervisor_dec = await consult_supervisor(message_body, "create_listing", missing_slot_chk)
                      
@@ -5305,27 +5359,20 @@ async def process_webchat_message(
                         and not is_command_only_message(message_body)
                         and not looks_like_greeting(message_body)
                         and not is_publish_command(message_body)
+                        and is_explicit_edit_message(message_body)
                     ):
-                        # Check if message looks like an edit attempt (contains field keywords)
-                        msg_lower = message_body.lower()
-                        edit_keywords = {"başlık", "baslik", "title", "açıklama", "aciklama", "description", 
-                                        "fiyat", "price", "konum", "lokasyon", "location", "kategori", "category",
-                                        "durum", "condition", "olsun", "yap", "değiştir", "degistir"}
-                        looks_like_edit = any(kw in msg_lower for kw in edit_keywords)
+                        # Record FSM failure
+                        _record_fsm_edit_failure(session, draft_id, None, message_body)
+                        session_dirty = True
                         
-                        if looks_like_edit:
-                            # Record FSM failure
-                            _record_fsm_edit_failure(session, draft_id, None, message_body)
-                            session_dirty = True
-                            
-                            # Check if we should trigger LLM override
-                            if _should_trigger_llm_override(session, draft_id):
-                                logger.info(f"Triggering LLM override for draft {draft_id} in create_listing flow")
-                                llm_result = await _llm_extract_edit_intent(message_body, existing_draft)
-                                if llm_result and llm_result.get("field") and llm_result.get("value") is not None:
-                                    edit_request = llm_result
-                                    _increment_llm_override_count(session)
-                                    logger.info(f"LLM override successful in create_listing: {llm_result}")
+                        # Check if we should trigger LLM override
+                        if _should_trigger_llm_override(session, draft_id):
+                            logger.info(f"Triggering LLM override for draft {draft_id} in create_listing flow")
+                            llm_result = await _llm_extract_edit_intent(message_body, existing_draft)
+                            if llm_result and llm_result.get("field") and llm_result.get("value") is not None:
+                                edit_request = llm_result
+                                _increment_llm_override_count(session)
+                                logger.info(f"LLM override successful in create_listing: {llm_result}")
                     
                     if edit_request:
                         edit_result = await apply_preview_edit(draft_id, edit_request["field"], edit_request["value"], user_id)
@@ -5394,6 +5441,47 @@ async def process_webchat_message(
                         if refreshed:
                             existing_draft = refreshed
                             slot = next_missing_slot(existing_draft)
+
+                        # Persist raw_content buffer for agent copy generation.
+                        raw_content = extracted.get("_raw_content") if isinstance(extracted, dict) else None
+                        if raw_content:
+                            try:
+                                await supabase_client.set_draft_listing_data_flag(draft_id, "_raw_content", raw_content)
+                                refreshed = await supabase_client.get_draft(draft_id)
+                                if refreshed:
+                                    existing_draft = refreshed
+                                    slot = next_missing_slot(existing_draft)
+                            except Exception:
+                                pass
+
+                # If title/description missing but raw_content exists, let agents generate them.
+                listing_for_raw = (existing_draft or {}).get("listing_data") or {}
+                if isinstance(listing_for_raw, dict):
+                    raw_content_value = listing_for_raw.get("_raw_content")
+                    raw_used = bool(listing_for_raw.get("_raw_content_enriched"))
+                    missing_title = not str(listing_for_raw.get("title") or "").strip()
+                    missing_desc = not str(listing_for_raw.get("description") or "").strip()
+                    if raw_content_value and not raw_used and (missing_title or missing_desc):
+                        target = "both" if (missing_title and missing_desc) else ("title" if missing_title else "description")
+                        enriched = await maybe_enrich_title_description(
+                            draft_id,
+                            existing_draft,
+                            str(raw_content_value),
+                            target=target,
+                        )
+                        if enriched:
+                            try:
+                                if enriched.get("title") and missing_title:
+                                    await supabase_client.update_draft_title(draft_id, enriched["title"])
+                                if enriched.get("description") and missing_desc:
+                                    await supabase_client.update_draft_description(draft_id, enriched["description"])
+                                await supabase_client.set_draft_listing_data_flag(draft_id, "_raw_content_enriched", True)
+                                refreshed = await supabase_client.get_draft(draft_id)
+                                if refreshed:
+                                    existing_draft = refreshed
+                                    slot = next_missing_slot(existing_draft)
+                            except Exception:
+                                pass
 
                 # If we have the minimum set, optionally enrich and show a "wow" preview.
                 if draft_ready_for_preview(existing_draft):
