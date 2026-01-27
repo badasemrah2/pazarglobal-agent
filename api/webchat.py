@@ -3445,13 +3445,21 @@ async def process_webchat_message(
 
         # If create_listing is locked but user asks platform/help questions, unlock.
         if session.get("locked_intent") == "create_listing":
-            if is_help_or_next_step_query(message_body) or is_platform_info_query(message_body):
+            if (
+                is_help_or_next_step_query(message_body)
+                or (is_platform_info_query(message_body) and not is_edit_command(message_body))
+            ):
                 session["locked_intent"] = None
                 session["intent"] = None
                 session_dirty = True
 
         # Deterministic platform info: respond from guide without routing to create/search flows.
-        if is_platform_info_query(message_body) and not is_create_listing_command(message_body):
+        # Avoid hijacking explicit edit commands during preview.
+        if (
+            is_platform_info_query(message_body)
+            and not is_create_listing_command(message_body)
+            and not is_edit_command(message_body)
+        ):
             guide_result = await read_site_guide_tool.execute(query=message_body)
             sections = guide_result.get("data", {}).get("sections", []) if isinstance(guide_result, dict) else []
             if sections:
