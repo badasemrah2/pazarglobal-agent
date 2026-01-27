@@ -6656,7 +6656,11 @@ async def process_webchat_message(
             def _strip_search_cache_block(text: str) -> str:
                 if not text:
                     return text
-                return re.sub(r"\[SEARCH_CACHE\](\[.*?\]|\{.*?\})", "", text, flags=re.DOTALL).strip()
+                marker = "[SEARCH_CACHE]"
+                idx = text.find(marker)
+                if idx == -1:
+                    return text.strip()
+                return text[:idx].rstrip()
 
             # Cache full results for follow-up detail requests
             # Store both in-memory cache AND session for Redis-less environments
