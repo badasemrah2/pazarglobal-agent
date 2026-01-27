@@ -629,12 +629,43 @@ def is_edit_command(message: str) -> bool:
     
     # Edit keywords
     edit_keywords = [
-        "duzenle", "düzenle", "degistir", "değiştir", "edit", 
+        "duzenle", "düzenle", "degistir", "değiştir", "edit",
         "aciklama", "açıklama", "baslik", "başlık",
+        "fiyat", "price", "durum", "kondisyon",
+        "konum", "lokasyon", "location", "kategori", "category",
         "ekle", "cikar", "çıkar", "sil", "kaldir", "kaldır"
     ]
     
     return any(kw in msg for kw in edit_keywords)
+
+
+def detect_explicit_field_label(message: str) -> Optional[str]:
+    if not message:
+        return None
+    text = message.strip()
+    if not text:
+        return None
+    patterns = {
+        "title": r"\b(başlık|baslik|title)\b\s*[:=]?\s*(.+)$",
+        "description": r"\b(açıklama|aciklama|description)\b\s*[:=]?\s*(.+)$",
+        "price": r"\b(fiyat|price)\b\s*[:=]?\s*(.+)$",
+        "location": r"\b(konum|lokasyon|location|şehir|sehir)\b\s*[:=]?\s*(.+)$",
+        "category": r"\b(kategori|category)\b\s*[:=]?\s*(.+)$",
+        "condition": r"\b(durum|kondisyon|condition)\b\s*[:=]?\s*(.+)$",
+    }
+    for field, pat in patterns.items():
+        if re.search(pat, text, flags=re.IGNORECASE):
+            return field
+    return None
+
+
+def is_explicit_edit_message(message: str) -> bool:
+    if detect_explicit_field_label(message):
+        return True
+    # Also accept colon-based preview edits
+    if extract_preview_edit(message):
+        return True
+    return False
 
 
 def parse_edit_command(message: str, draft: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -1867,8 +1898,13 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
     
     title_line = ""
     description_lines: list[str] = []
+    explicit_title = False
+    explicit_description = False
+    inferred_title = False
 
     label_patterns = {
+        "title": re.compile(r"\b(başlık|baslik|title)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
+        "description": re.compile(r"\b(açıklama|aciklama|description)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
         "price": re.compile(r"\b(fiyat|price)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
         "condition": re.compile(r"\b(durum|kondisyon|condition)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
         "location": re.compile(r"\b(lokasyon|konum|location|şehir|sehir)\b\s*[:=]?\s*(.+)$", re.IGNORECASE),
@@ -1907,9 +1943,10 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
                     condition = parsed_cond
                     continue
             
-            # First part is likely title
+            # First part is likely title (inferred)
             if i == 0:
                 title_line = part
+                inferred_title = True
             else:
                 # Rest are description
                 description_lines.append(part)
@@ -1922,7 +1959,15 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
                 if not match:
                     continue
                 value = (match.group(2) or "").strip()
-                if key == "price":
+                if key == "title":
+                    if value:
+                        title_line = value
+                        explicit_title = True
+                elif key == "description":
+                    if value:
+                        description_lines = [value]
+                        explicit_description = True
+                elif key == "price":
                     parsed_price = parse_price_input(value)
                     if parsed_price is None:
                         parsed_price = parse_price_input(line)
@@ -1954,6 +1999,7 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
 
             if not title_line:
                 title_line = line
+                inferred_title = True
             else:
                 description_lines.append(line)
 
@@ -2025,6 +2071,11 @@ def extract_listing_fields_from_freeform(message: str) -> Dict[str, Any]:
         return {}
 
     fields: Dict[str, Any] = {}
+    if has_structured and not explicit_title:
+        title_candidate = ""
+    if has_structured and not explicit_description:
+        description = ""
+
     if title_candidate and len(title_candidate) >= 3:
         if has_structured:
             if len(title_candidate.split()) > 8:
