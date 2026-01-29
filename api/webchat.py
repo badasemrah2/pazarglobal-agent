@@ -1793,7 +1793,7 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
     options = [
         "📦 İlan vermek → 'ilan' yazın",
         "🔍 Benzer ilanları aramak → 'ara' yazın",
-        "💰 Fiyat araştırması yapmak → 'fiyat' yazın",
+        "💰 Fiyat araştırması yapmak → 'fiyat öner' yazın",
     ]
     
     # If user was already creating a listing, offer to add image to listing
@@ -1804,7 +1804,7 @@ def format_media_analysis_message(analyses: List[Dict[str, Any]]) -> str:
         "\n".join(summary_lines),
         prompt_line,
         "\n".join(options),
-        "(Cevap olarak: 'ilan', 'ara' veya 'fiyat' yazabilirsiniz.)" + add_to_listing_note,
+        "(Cevap olarak: 'ilan', 'ara' veya 'fiyat öner' yazabilirsiniz.)" + add_to_listing_note,
     ])
 
 
@@ -2899,7 +2899,7 @@ def build_next_step_message(draft: Dict[str, Any]) -> str:
     if slot == "description":
         return "Kısa bir açıklama yazar mısınız? (durum, çizik/hasar, kutu/fatura, takas vb.)"
     if slot == "price":
-        return "Fiyat nedir? İsterseniz 'kaç para eder' yazın, piyasa verisine göre tahmin söyleyeyim."
+        return "Fiyat nedir? İsterseniz 'fiyat öner' yazın, piyasa verisine göre tahmin söyleyeyim."
     if slot == "condition":
         return "Durum nedir? (Sıfır / 2. El / Az Kullanılmış)"
     if slot == "location":
@@ -2914,7 +2914,7 @@ def build_next_step_message(draft: Dict[str, Any]) -> str:
 
 
 def user_asks_market_price(message: str) -> bool:
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return False
     return any(phrase in msg for phrase in [
@@ -4733,6 +4733,12 @@ async def process_webchat_message(
         elif is_show_more_command(message_body):
             # "Daha fazla" - show next page of search results
             override_intent = "show_more_results"
+        elif user_asks_market_price(message_body) and (
+            session.get("pending_media_urls")
+            or session.get("pending_media_analysis")
+            or session.get("active_draft_id")
+        ):
+            override_intent = "price_research"
         elif session.get("context_mode") == "search" and user_asks_market_price(message_body):
             search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
             query = (search_ctx or {}).get("query")
@@ -6420,11 +6426,30 @@ async def process_webchat_message(
 
             # 1. Media Analysis (if needed)
             media_urls = session.get("pending_media_urls") or []
+            vision_analyses = session.get("pending_media_analysis") or []
             vision_data = {}
+
+            if not media_urls and user_id:
+                draft = None
+                draft_id = session.get("active_draft_id")
+                if isinstance(draft_id, str) and draft_id:
+                    draft = await supabase_client.get_draft(draft_id)
+                if not draft:
+                    draft = await supabase_client.get_latest_draft_for_user(user_id)
+                    draft_id = (draft or {}).get("id")
+                if draft:
+                    buffered_urls, buffered_analyses = _extract_buffered_media_from_draft(draft)
+                    if buffered_urls:
+                        media_urls = buffered_urls
+                        session["pending_media_urls"] = buffered_urls
+                        session["pending_media_analysis"] = buffered_analyses
+                        session["pending_media_created_at"] = _utc_now_iso()
+                        vision_analyses = buffered_analyses
+                        session_dirty = True
+
             if media_urls:
-                vision_analyses = session.get("pending_media_analysis")
                 if not vision_analyses:
-                    vision_analyses = await analyze_media_with_vision(media_urls) 
+                    vision_analyses = await analyze_media_with_vision(media_urls)
                     session["pending_media_analysis"] = vision_analyses
                     session_dirty = True
                 if vision_analyses and isinstance(vision_analyses, list):
@@ -6444,11 +6469,18 @@ async def process_webchat_message(
                     return None
                 cleaned = str(raw_title).strip()
                 cleaned = re.sub(
-                    r"\s+(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|fiyat|nedir|ne|kaca|kaça|eder|ederi|piyasası|piyasasi)(\s+|$)",
+                    r"^(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|fiyat|nedir|ne|kaca|kaça|eder|ederi|piyasası|piyasasi)\b",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                ).strip()
+                cleaned = re.sub(
+                    r"\b(ne kadar|nekadar|kaç para|kac para|fiyatı|fiyati|fiyatları|fiyatlari|fiyat|nedir|ne|kaca|kaça|eder|ederi|piyasası|piyasasi)\b",
                     " ",
                     cleaned,
                     flags=re.IGNORECASE,
                 ).strip()
+                cleaned = re.sub(r"\b(sıfır|sifir|yeni|2\s*\.?\s*el|ikinci\s+el|az\s+kullanılmış|az\s+kullanilmis|temiz)\b", " ", cleaned, flags=re.IGNORECASE).strip()
                 if not cleaned or cleaned.lower() in ["fiyat", "ücret", "değer", "ürün", "urun"]:
                     return None
                 return cleaned
@@ -6497,6 +6529,8 @@ async def process_webchat_message(
             # Clean generic titles
             if title:
                 title = _clean_price_title(title)
+                if user_asks_market_price(message_body) and title is not None:
+                    title = None
 
             # Fallback to vision
             if not title and vision_data:
