@@ -1023,28 +1023,27 @@ def is_show_more_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
         return False
-    return msg in {
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", msg)
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return False
+    return cleaned in {
         "daha fazla",
-        "daha fazla göster",
         "daha fazla goster",
+        "daha fazlagoster",
         "devam",
-        "devamı",
         "devami",
         "show more",
         "more",
         "sonraki",
-        "diğerleri",
         "digerleri",
         "next",
         "devam et",
-        "devam göster",
         "devam goster",
         "kalan",
-        "kalanları göster",
         "kalanlari goster",
-        "diğer ilanlar",
         "diger ilanlar",
-    }
+    } or cleaned.startswith("devam")
 
 
 def is_confirm_command(message: str) -> bool:
@@ -6563,7 +6562,7 @@ async def process_webchat_message(
             showing_to = min(next_offset, total_count)
             
             if next_offset < total_count:
-                footer = f"\n\n📄 {showing_from}-{showing_to} / {total_count} sonuç. Daha fazla için: **'devamı'** yaz"
+                footer = f"\n\n📄 {showing_from}-{showing_to} / {total_count} sonuç. Daha fazla için: **'devamı'** veya **'daha fazla göster'** yaz"
             else:
                 footer = f"\n\n📄 {showing_from}-{showing_to} / {total_count} sonuç (tümü gösterildi) ✅"
             
@@ -6763,7 +6762,7 @@ async def process_webchat_message(
                     
                     # Add pagination footer
                     if total_count > page_size:
-                        footer = f"\n\n📄 1-{len(first_page)} / {total_count} sonuç. Daha fazla için: **'devamı'** yaz"
+                        footer = f"\n\n📄 1-{len(first_page)} / {total_count} sonuç. Daha fazla için: **'devamı'** veya **'daha fazla göster'** yaz"
                     else:
                         footer = f"\n\n📄 {total_count} sonuç gösterildi ✅"
                     
