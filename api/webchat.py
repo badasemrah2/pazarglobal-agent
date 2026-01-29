@@ -4108,26 +4108,33 @@ async def process_webchat_message(
         # IMAGE-FIRST MANDATORY CHOICE:
         # If we previously received images without a locked intent, we must ask what the user
         # wants to do, and then branch based on that choice.
-        if session.get("awaiting_media_action"):
-            choice = classify_media_action_choice(message_body)
-            # If we can't classify yet, re-ask (do not route intent).
-            if not choice:
-                return await finalize_response({
-                    "success": True,
-                    "message": format_media_analysis_message(session.get("pending_media_analysis") or []),
-                    "data": {
-                        "type": "media_action_required",
-                        "media_urls": session.get("pending_media_urls") or [],
-                        "media_analysis": session.get("pending_media_analysis") or [],
-                    },
-                    "intent": None,
-                })
+        explicit_choice = None
+        if is_add_image_to_listing_command(message_body) and has_media_context:
+            explicit_choice = "create_listing"
+        elif session.get("awaiting_media_action"):
+            explicit_choice = classify_media_action_choice(message_body)
+        elif has_media_context and not session.get("locked_intent"):
+            explicit_choice = classify_media_action_choice(message_body)
 
+        if session.get("awaiting_media_action") and not explicit_choice:
+            # If we can't classify yet, re-ask (do not route intent).
+            return await finalize_response({
+                "success": True,
+                "message": format_media_analysis_message(session.get("pending_media_analysis") or []),
+                "data": {
+                    "type": "media_action_required",
+                    "media_urls": session.get("pending_media_urls") or [],
+                    "media_analysis": session.get("pending_media_analysis") or [],
+                },
+                "intent": None,
+            })
+
+        if explicit_choice:
             # Clear the flag now; the next handler will set appropriate locked intent.
             session["awaiting_media_action"] = False
             session_dirty = True
 
-            if choice == "create_listing":
+            if explicit_choice == "create_listing":
                 # Lock create_listing intent.
                 session["intent"] = "create_listing"
                 session["locked_intent"] = "create_listing"
@@ -4210,7 +4217,7 @@ async def process_webchat_message(
                     "intent": "create_listing",
                 })
 
-            if choice == "search_listings":
+            if explicit_choice == "search_listings":
                 session["intent"] = "search_listings"
                 session["locked_intent"] = "search_listings"
                 session_dirty = True
