@@ -6308,6 +6308,116 @@ async def process_webchat_message(
             # STANDALONE Price Research Flow
             log_fsm_event("flow_enter_price_research", session_id, session)
 
+            # PRICE → LISTING BRIDGE: allow users to start listing from price flow
+            if is_add_image_to_listing_command(message_body):
+                pending_urls = session.get("pending_media_urls") or []
+                if pending_urls:
+                    session["intent"] = "create_listing"
+                    session["locked_intent"] = "create_listing"
+                    session_dirty = True
+
+                    draft = None
+                    draft_id = session.get("active_draft_id")
+                    if isinstance(draft_id, str) and draft_id:
+                        draft = await supabase_client.get_draft(draft_id)
+                    if not draft:
+                        draft = await supabase_client.get_latest_draft_for_user(user_id)
+                        draft_id = (draft or {}).get("id")
+                    if not draft:
+                        draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                        draft_id = (draft or {}).get("id")
+
+                    if draft_id:
+                        session["active_draft_id"] = draft_id
+                        session_dirty = True
+
+                        analyses = session.get("pending_media_analysis") or []
+                        analysis_by_url: Dict[str, Any] = {}
+                        if isinstance(analyses, list):
+                            for entry in analyses:
+                                if isinstance(entry, dict) and entry.get("image_url"):
+                                    analysis_by_url[str(entry["image_url"])] = entry.get("analysis")
+
+                        existing = await supabase_client.get_draft(draft_id)
+                        existing_images = (existing or {}).get("images") or []
+                        current_count = len(existing_images) if isinstance(existing_images, list) else 0
+
+                        for url in pending_urls:
+                            if not url or current_count >= 5:
+                                continue
+                            meta = {}
+                            analysis = analysis_by_url.get(url)
+                            if analysis is not None:
+                                meta = {"analysis": analysis}
+                            ok = await supabase_client.add_listing_image(draft_id, url, metadata=meta or None)
+                            if ok:
+                                current_count += 1
+
+                        try:
+                            await supabase_client.clear_buffered_media(draft_id)
+                        except Exception:
+                            pass
+                        session["pending_media_urls"] = []
+                        session["pending_media_analysis"] = []
+                        session.pop("pending_media_created_at", None)
+                        session_dirty = True
+
+                    intro_draft = None
+                    try:
+                        intro_draft = await supabase_client.get_draft(draft_id) if draft_id else draft
+                    except Exception:
+                        intro_draft = draft
+
+                    return await finalize_response({
+                        "success": True,
+                        "message": format_create_listing_intro_message(intro_draft),
+                        "data": {"type": "create_listing_intro", "draft_id": draft_id},
+                        "intent": "create_listing",
+                    })
+
+                return await finalize_response({
+                    "success": True,
+                    "message": "Önce fotoğraf gönderebilir ya da ilan oluşturmak için ürününü kısaca yazabilirsin.",
+                    "data": {"type": "slot_prompt"},
+                    "intent": "create_listing",
+                })
+
+            if is_create_listing_command(message_body):
+                last_price_ctx = session.get("last_price_research") if isinstance(session.get("last_price_research"), dict) else {}
+                title_hint = (last_price_ctx or {}).get("title")
+                category_hint = (last_price_ctx or {}).get("category")
+                condition_hint = (last_price_ctx or {}).get("condition")
+
+                session["intent"] = "create_listing"
+                session["locked_intent"] = "create_listing"
+                session_dirty = True
+
+                draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                draft_id = (draft or {}).get("id")
+                if draft_id:
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+                    fields: Dict[str, Any] = {}
+                    if title_hint:
+                        fields["title"] = title_hint
+                    if category_hint:
+                        fields["category"] = category_hint
+                    if condition_hint:
+                        fields["condition"] = condition_hint
+                    if fields:
+                        try:
+                            await supabase_client.update_draft_fields(draft_id, fields)
+                        except Exception:
+                            pass
+                    draft = await supabase_client.get_draft(draft_id)
+
+                return await finalize_response({
+                    "success": True,
+                    "message": build_next_step_message(draft or {}),
+                    "data": {"type": "create_listing_intro", "draft_id": draft_id},
+                    "intent": "create_listing",
+                })
+
             # 1. Media Analysis (if needed)
             media_urls = session.get("pending_media_urls") or []
             vision_data = {}
@@ -6448,6 +6558,7 @@ async def process_webchat_message(
             session["last_price_research"] = {
                 "title": title,
                 "category": category,
+                "condition": condition,
             }
             session_dirty = True
 
