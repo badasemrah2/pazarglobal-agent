@@ -1023,6 +1023,7 @@ def is_show_more_command(message: str) -> bool:
     msg = normalize_for_match(message)
     if not msg:
         return False
+    msg = msg.lower()
     cleaned = re.sub(r"[^a-z0-9\s]", " ", msg)
     cleaned = " ".join(cleaned.split())
     if not cleaned:
@@ -1222,7 +1223,7 @@ def sanitize_classified_intent(message: str, router_result: str | dict | None) -
     if not classified_intent:
         return {"intent": "small_talk", "detected_intents": []}
 
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
 
     # Never enter publish unless the user explicitly requested it.
     if classified_intent == "publish_or_delete" and not is_publish_command(msg):
@@ -1812,7 +1813,7 @@ def classify_media_action_choice(message: str) -> Optional[str]:
 
     Returns one of: 'create_listing', 'search_listings', 'price_research', or None.
     """
-    msg = (message or "").strip().lower()
+    msg = normalize_for_match(message)
     if not msg:
         return None
 
