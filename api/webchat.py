@@ -4500,7 +4500,12 @@ async def process_webchat_message(
         # Users may say "satmaktan vazgeçtim" / "iptal" while in any flow.
         # Clear the locked intent so routing can start fresh. Do not interfere with
         # publish/delete deterministic flow, which already has its own cancel semantics.
-        if is_cancel_command(message_body) and not user_refuses_images(message_body) and session.get("locked_intent") != "publish_or_delete":
+        if (
+            is_cancel_command(message_body)
+            and not user_refuses_images(message_body)
+            and session.get("locked_intent") != "publish_or_delete"
+            and not user_asks_market_price(message_body)
+        ):
             # Best-effort: reset the underlying draft in DB so old fields don't leak
             # into the next listing flow (single-draft-per-user model).
             try:
@@ -6481,7 +6486,10 @@ async def process_webchat_message(
                     flags=re.IGNORECASE,
                 ).strip()
                 cleaned = re.sub(r"\b(sıfır|sifir|yeni|2\s*\.?\s*el|ikinci\s+el|az\s+kullanılmış|az\s+kullanilmis|temiz)\b", " ", cleaned, flags=re.IGNORECASE).strip()
+                cleaned = re.sub(r"\b(var\s*m[ıi]|varm[ıi])\b", " ", cleaned, flags=re.IGNORECASE).strip()
                 if not cleaned or cleaned.lower() in ["fiyat", "ücret", "değer", "ürün", "urun"]:
+                    return None
+                if re.search(r"\bvar\s*m[ıi]\b", cleaned, flags=re.IGNORECASE):
                     return None
                 return cleaned
 
@@ -6559,18 +6567,21 @@ async def process_webchat_message(
                         if not category and last_category:
                             category = last_category
 
-                price_ctx = session.get("price_research_context")
-                if isinstance(price_ctx, dict):
-                    ctx_query = (price_ctx or {}).get("query")
-                    if ctx_query:
-                        title = _clean_price_title(ctx_query)
-                        session.pop("price_research_context", None)
-                        session_dirty = True
-                if not title:
-                    search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
-                    ctx_query = (search_ctx or {}).get("query")
-                    if ctx_query:
-                        title = _clean_price_title(ctx_query)
+                if not title and not media_urls and not vision_data:
+                    price_ctx = session.get("price_research_context")
+                    if isinstance(price_ctx, dict):
+                        ctx_query = (price_ctx or {}).get("query")
+                        if ctx_query:
+                            if not re.search(r"\b(var\s*m[ıi]|varm[ıi])\b", ctx_query, flags=re.IGNORECASE):
+                                title = _clean_price_title(ctx_query)
+                            session.pop("price_research_context", None)
+                            session_dirty = True
+                    if not title:
+                        search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
+                        ctx_query = (search_ctx or {}).get("query")
+                        if ctx_query:
+                            if not re.search(r"\b(var\s*m[ıi]|varm[ıi])\b", ctx_query, flags=re.IGNORECASE):
+                                title = _clean_price_title(ctx_query)
 
             # 3. Validation
             if not title:
