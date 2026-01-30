@@ -152,6 +152,7 @@ MEDIA_ANALYSIS_USER_PROMPT = (
 FSM_PARK_TIMEOUT_SECONDS = 10 * 60  # 10 minutes of user silence → parked
 FSM_COMPOSER_TIMEOUT_SECONDS = 45   # ComposerAgent hard timeout
 MEDIA_ACTION_TTL_SECONDS = 10 * 60  # image-first choice timeout
+DRAFT_ABANDON_TTL_SECONDS = 10 * 60  # abandoned draft cleanup timeout
 PARKED_INTENT_TTL_SECONDS = 10 * 60  # parked intent max retention
 RESUME_KEYWORDS = {"devam", "kaldığımız yerden", "kaldigimiz yerden", "resume", "continue"}
 
@@ -1526,7 +1527,7 @@ async def handle_publish_or_delete_flow(
                 draft_id = (latest or {}).get("id")
             if isinstance(draft_id, str) and draft_id:
                 await supabase_client.clear_pending_publish_state(draft_id)
-                await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                await supabase_client.mark_draft_abandoned(draft_id, source="publish_cancel")
                 session["active_draft_id"] = None
         except Exception:
             pass
@@ -1668,7 +1669,7 @@ async def handle_publish_or_delete_flow(
             session.pop("pending_publish", None)
             await supabase_client.clear_pending_publish_state(draft_id)
             try:
-                await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                await supabase_client.mark_draft_abandoned(draft_id, source="publish_cancel")
             except Exception:
                 pass
             session["active_draft_id"] = None
@@ -4687,7 +4688,7 @@ async def process_webchat_message(
                     draft_id = (latest or {}).get("id")
                 if isinstance(draft_id, str) and draft_id:
                     await supabase_client.clear_pending_publish_state(draft_id)
-                    await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                    await supabase_client.mark_draft_abandoned(draft_id, source="global_cancel")
             except Exception:
                 pass
 
@@ -5206,6 +5207,101 @@ async def process_webchat_message(
                 existing_draft = await supabase_client.get_latest_draft_for_user(user_id)
                 if existing_draft and existing_draft.get("id"):
                     draft_id = existing_draft.get("id")
+
+            # Pending cleanup decision for an abandoned draft
+            pending_cleanup = session.get("pending_draft_cleanup")
+            if isinstance(pending_cleanup, dict):
+                pending_id = pending_cleanup.get("draft_id")
+                if is_confirm_command(message_body):
+                    try:
+                        if pending_id:
+                            await supabase_client.delete_draft(pending_id)
+                    except Exception:
+                        pass
+                    session.pop("pending_draft_cleanup", None)
+                    session["active_draft_id"] = None
+                    session_dirty = True
+
+                    new_draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                    new_id = (new_draft or {}).get("id")
+                    if new_id:
+                        session["active_draft_id"] = new_id
+                        session_dirty = True
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Tamam, eski taslak silindi. Yeni ilan için ürün adı nedir?",
+                        "data": {"type": "draft_reset", "draft_id": new_id},
+                        "intent": "create_listing",
+                    })
+
+                if is_short_no(message_body) or is_cancel_command(message_body):
+                    session.pop("pending_draft_cleanup", None)
+                    session_dirty = True
+                    if pending_id:
+                        existing_draft = await supabase_client.get_draft(pending_id)
+                        if existing_draft and existing_draft.get("id"):
+                            try:
+                                await supabase_client.clear_draft_abandoned(existing_draft.get("id"))
+                            except Exception:
+                                pass
+                            session["active_draft_id"] = existing_draft.get("id")
+                            session_dirty = True
+                            return await finalize_response({
+                                "success": True,
+                                "message": build_next_step_message(existing_draft),
+                                "data": {"type": "slot_prompt", "slot": next_missing_slot(existing_draft), "draft_id": existing_draft.get("id")},
+                                "intent": "create_listing",
+                            })
+
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Mevcut bir taslak bulamadım. Yeni ilan için ürün adı nedir?",
+                        "data": {"type": "slot_prompt", "slot": "title"},
+                        "intent": "create_listing",
+                    })
+
+                return await finalize_response({
+                    "success": True,
+                    "message": "Mevcut bir taslağınız var. Yeni ilana başlamadan önce eski taslağı silmek ister misiniz? (evet/hayır)",
+                    "data": {"type": "draft_cleanup_prompt", "draft_id": pending_id},
+                    "intent": "create_listing",
+                })
+
+            # If user explicitly starts a new listing and we have an abandoned draft, prompt cleanup.
+            if (is_create_listing_command(message_body) or is_command_only_message(message_body)) and existing_draft and draft_id:
+                listing_data = existing_draft.get("listing_data") if isinstance(existing_draft, dict) else {}
+                if isinstance(listing_data, dict):
+                    abandoned_at = listing_data.get("_abandoned_at")
+                    if abandoned_at:
+                        age = _seconds_since(str(abandoned_at))
+                        if age is not None and age > DRAFT_ABANDON_TTL_SECONDS:
+                            try:
+                                await supabase_client.delete_draft(draft_id)
+                            except Exception:
+                                pass
+                            session["active_draft_id"] = None
+                            session_dirty = True
+
+                            new_draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
+                            new_id = (new_draft or {}).get("id")
+                            if new_id:
+                                session["active_draft_id"] = new_id
+                                session_dirty = True
+                            return await finalize_response({
+                                "success": True,
+                                "message": "Önceki taslağınızın süresi dolduğu için otomatik silindi. Yeni ilan için ürün adı nedir?",
+                                "data": {"type": "draft_expired", "draft_id": new_id},
+                                "intent": "create_listing",
+                            })
+
+                        session["pending_draft_cleanup"] = {"draft_id": draft_id}
+                        session_dirty = True
+                        return await finalize_response({
+                            "success": True,
+                            "message": "Yarıda bırakılmış bir taslağınız var. Yeni ilana başlamadan önce eski taslağı silmek ister misiniz? (evet/hayır)",
+                            "data": {"type": "draft_cleanup_prompt", "draft_id": draft_id},
+                            "intent": "create_listing",
+                        })
             
             # --- SUPERVISOR CHECK (Sprint 4: Operator Logic) ---
             # Checks if user is commenting/complaining instead of providing data
@@ -5413,6 +5509,7 @@ async def process_webchat_message(
             if existing_draft and draft_id and is_cancel_command(message_body) and not user_refuses_images(message_body):
                 # User wants to stop this flow.
                 try:
+                    await supabase_client.mark_draft_abandoned(draft_id, source="create_listing_cancel")
                     session.pop("locked_intent", None)
                     session.pop("intent", None)
                     session.pop("pending_price_suggestion", None)

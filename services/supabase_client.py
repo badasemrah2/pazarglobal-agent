@@ -4,6 +4,7 @@ Supabase client for database operations
 from supabase import create_client, Client
 from config import settings
 from typing import Optional, Dict, List, Any, cast
+from datetime import datetime, timezone
 from loguru import logger
 import httpx
 import re
@@ -438,6 +439,84 @@ class SupabaseClient:
                 raise
         except Exception as e:
             logger.error(f"Error resetting draft: {e}")
+            return False
+
+    async def mark_draft_abandoned(
+        self,
+        draft_id: str,
+        source: Optional[str] = None,
+        reason: Optional[str] = None
+    ) -> bool:
+        """Mark an in-progress draft as abandoned (keeps data for potential resume/cleanup)."""
+        if not draft_id:
+            return False
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data["_abandoned_at"] = datetime.now(timezone.utc).isoformat()
+            if source:
+                listing_data["_abandoned_source"] = source
+            if reason:
+                listing_data["_abandoned_reason"] = reason
+
+            payload = {
+                "state": "abandoned",
+                "listing_data": listing_data,
+            }
+            updated = (
+                self.client.table("active_drafts")
+                .update(payload)
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Failed to mark draft abandoned: {e}")
+            return False
+
+    async def delete_draft(self, draft_id: str) -> bool:
+        """Hard-delete a draft from active_drafts."""
+        if not draft_id:
+            return False
+        try:
+            result = self.client.table("active_drafts").delete().eq("id", draft_id).execute()
+            return bool(result.data)
+        except Exception as e:
+            logger.warning(f"Failed to delete draft {draft_id}: {e}")
+            return False
+
+    async def clear_draft_abandoned(self, draft_id: str) -> bool:
+        """Clear abandoned flags and mark draft back in progress."""
+        if not draft_id:
+            return False
+        try:
+            draft = await self.get_draft(draft_id)
+            if not draft:
+                return False
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            listing_data.pop("_abandoned_at", None)
+            listing_data.pop("_abandoned_source", None)
+            listing_data.pop("_abandoned_reason", None)
+
+            payload = {
+                "state": "in_progress",
+                "listing_data": listing_data,
+            }
+            updated = (
+                self.client.table("active_drafts")
+                .update(payload)
+                .eq("id", draft_id)
+                .execute()
+            )
+            return bool(updated.data)
+        except Exception as e:
+            logger.warning(f"Failed to clear abandoned flags for draft {draft_id}: {e}")
             return False
     
     async def get_draft(self, draft_id: str) -> Optional[Dict[str, Any]]:
