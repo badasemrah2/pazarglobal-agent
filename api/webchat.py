@@ -431,9 +431,7 @@ async def _handle_ambiguous_intent(
             "detected_intents": detected_intents,
             "message_preview": message_body[:100]
         }
-                    session.get("pending_media_urls")
-                    or session.get("pending_media_analysis")
-                ):
+    )
     
     # TTL: expire after 2 minutes to avoid ghost state
     import time

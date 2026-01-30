@@ -3,7 +3,7 @@ Supabase client for database operations
 """
 from supabase import create_client, Client
 from config import settings
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, cast
 from loguru import logger
 import httpx
 import re
@@ -40,6 +40,28 @@ class SupabaseClient:
         self._rpc_update_listing_field_invalid_fields: set[str] = set()
         self._wallet_transactions_disabled: bool = False
         self._wallet_transactions_disabled_logged: bool = False
+
+    def _coerce_str(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return ""
+
+    def _first_dict(self, data: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                return cast(Dict[str, Any], first)
+        return None
+
+    def _list_of_dicts(self, data: Any) -> List[Dict[str, Any]]:
+        if isinstance(data, list):
+            return [cast(Dict[str, Any], row) for row in data if isinstance(row, dict)]
+        return []
 
     def _rpc_update_listing_field_is_missing(self, exc: Exception) -> bool:
         msg = str(exc) if exc is not None else ""
@@ -277,10 +299,10 @@ class SupabaseClient:
                 .limit(1)
                 .execute()
             )
-            row = (result.data or [None])[0]
-            if not isinstance(row, dict):
+            row = self._first_dict(result.data)
+            if not row:
                 return None
-            name = (row.get("display_name") or row.get("full_name") or "").strip()
+            name = self._coerce_str(row.get("display_name") or row.get("full_name")).strip()
             return name or None
         except Exception as e:
             logger.warning(f"Failed to resolve user display name: {e}")
@@ -298,10 +320,10 @@ class SupabaseClient:
                 .limit(1)
                 .execute()
             )
-            row = (result.data or [None])[0]
-            if not isinstance(row, dict):
+            row = self._first_dict(result.data)
+            if not row:
                 return None
-            phone = (row.get("phone") or "").strip()
+            phone = self._coerce_str(row.get("phone")).strip()
             return phone or None
         except Exception as e:
             logger.warning(f"Failed to resolve user phone: {e}")
@@ -319,19 +341,21 @@ class SupabaseClient:
                         .limit(1)
                         .execute())
             if existing.data:
-                draft = existing.data[0]
-                if draft.get("state") != "in_progress":
-                    try:
-                        self.client.table("active_drafts").update({
-                            "state": "in_progress"
-                        }).eq("id", draft["id"]).execute()
-                        draft["state"] = "in_progress"
-                    except Exception as state_err:
-                        logger.warning(f"Failed to refresh draft state for {draft['id']}: {state_err}")
-                logger.info(f"Reusing existing draft {draft['id']} for user {user_id}")
-                return draft
+                draft = self._first_dict(existing.data)
+                if draft:
+                    draft_id = self._coerce_str(draft.get("id"))
+                    if draft.get("state") != "in_progress" and draft_id:
+                        try:
+                            self.client.table("active_drafts").update({
+                                "state": "in_progress"
+                            }).eq("id", draft_id).execute()
+                            draft["state"] = "in_progress"
+                        except Exception as state_err:
+                            logger.warning(f"Failed to refresh draft state for {draft_id}: {state_err}")
+                    logger.info(f"Reusing existing draft {draft_id or 'unknown'} for user {user_id}")
+                    return draft
 
-            listing_data = {
+            listing_data: Dict[str, Any] = {
                 "title": None,
                 "description": None,
                 "price": None,
@@ -346,9 +370,10 @@ class SupabaseClient:
                 "vision_product": {}
             }).execute()
             
-            if result.data:
-                logger.info(f"Created draft: {result.data[0]['id']}")
-                return result.data[0]
+            created = self._first_dict(result.data)
+            if created:
+                logger.info(f"Created draft: {self._coerce_str(created.get('id'))}")
+                return created
             
             raise Exception("Failed to create draft")
         except Exception as e:
@@ -363,7 +388,9 @@ class SupabaseClient:
                             .limit(1)
                             .execute())
                 if fallback.data:
-                    return fallback.data[0]
+                    fallback_row = self._first_dict(fallback.data)
+                    if fallback_row:
+                        return fallback_row
             logger.error(f"Error creating draft: {e}")
             raise
 
@@ -380,7 +407,7 @@ class SupabaseClient:
         - metadata (buffered_media temizleniyor)
         """
         try:
-            listing_data = {
+            listing_data: Dict[str, Any] = {
                 "title": None,
                 "description": None,
                 "price": None,
@@ -417,7 +444,7 @@ class SupabaseClient:
         """Get draft by ID"""
         try:
             result = self.client.table("active_drafts").select("*").eq("id", draft_id).execute()
-            return result.data[0] if result.data else None
+            return self._first_dict(result.data)
         except Exception as e:
             logger.error(f"Error getting draft: {e}")
             return None
@@ -433,7 +460,7 @@ class SupabaseClient:
                 .limit(1)
                 .execute()
             )
-            return result.data[0] if result.data else None
+            return self._first_dict(result.data)
         except Exception as e:
             logger.error(f"Error getting latest draft for user: {e}")
             return None
@@ -706,7 +733,7 @@ class SupabaseClient:
             logger.error(f"Error updating price: {e}")
             return False
     
-    async def update_draft_category(self, draft_id: str, category: str, vision_product: Dict[str, Any] = None, user_id: Optional[str] = None) -> bool:
+    async def update_draft_category(self, draft_id: str, category: str, vision_product: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None) -> bool:
         """Update draft category inside listing_data and optionally vision_product"""
         # Security: Verify draft ownership before update
         if user_id:
@@ -1027,7 +1054,7 @@ class SupabaseClient:
                 for row in product_rows.data:
                     if not isinstance(row, dict):
                         continue
-                    url = (row.get("public_url") or row.get("storage_path") or "").strip() if isinstance(row.get("public_url") or row.get("storage_path"), str) else ""
+                    url = self._coerce_str(row.get("public_url") or row.get("storage_path")).strip()
                     if not url:
                         continue
 
@@ -1187,7 +1214,7 @@ class SupabaseClient:
                 user_phone = None
 
             if not user_phone and isinstance(listing_data, dict):
-                user_phone = (listing_data.get("contact_phone") or "").strip() or None
+                user_phone = self._coerce_str(listing_data.get("contact_phone")).strip() or None
 
             # Metadata already initialized with standard format above
             
@@ -1208,8 +1235,12 @@ class SupabaseClient:
                 "metadata": listing_metadata
             }).execute()
             
-            if result.data:
-                listing_id = result.data[0]["id"]
+            result_row = self._first_dict(result.data)
+            if result_row:
+                listing_id = self._coerce_str(result_row.get("id"))
+                if not listing_id:
+                    logger.error("Publish listing succeeded but returned empty id")
+                    return None
 
                 if cost > 0:
                     try:
@@ -1256,7 +1287,7 @@ class SupabaseClient:
                     user_id=user_id
                 )
                 
-                return result.data[0]
+                return result_row
             
             return None
         except InsufficientCreditsError:
@@ -1272,11 +1303,12 @@ class SupabaseClient:
             if user_id:
                 # First, fetch the listing to verify ownership
                 listing = self.client.table("listings").select("user_id").eq("id", listing_id).execute()
-                if not listing.data:
+                listing_row = self._first_dict(listing.data)
+                if not listing_row:
                     logger.warning(f"Listing {listing_id} not found for deletion")
                     return False
                 
-                listing_owner = listing.data[0].get("user_id")
+                listing_owner = listing_row.get("user_id")
                 if str(listing_owner) != str(user_id):
                     logger.warning(f"User {user_id} attempted to delete listing {listing_id} owned by {listing_owner}")
                     return False
@@ -1371,7 +1403,7 @@ class SupabaseClient:
                     query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
             
             result = query.limit(limit).execute()
-            rows = result.data or []
+            rows = self._list_of_dicts(result.data)
 
             # Normalize image_url/images for frontend + chat rendering.
             # - Ensure image_url is a usable public URL
@@ -1446,7 +1478,16 @@ class SupabaseClient:
         """Get user wallet balance"""
         try:
             result = self.client.table("wallets").select("balance_bigint").eq("user_id", user_id).execute()
-            return result.data[0]["balance_bigint"] if result.data else None
+            row = self._first_dict(result.data)
+            if not row:
+                return None
+            balance_value = row.get("balance_bigint")
+            if balance_value is None:
+                return None
+            try:
+                return float(balance_value)
+            except Exception:
+                return None
         except Exception as e:
             logger.error(f"Error getting wallet balance: {e}")
             return None
@@ -1462,7 +1503,7 @@ class SupabaseClient:
                 .limit(max(1, min(limit, 50)))
                 .execute()
             )
-            return result.data or []
+            return self._list_of_dicts(result.data)
         except Exception as e:
             # Some deployments may not have wallet_transactions table; fail-soft.
             logger.warning(f"Wallet transactions unavailable: {e}")
@@ -1579,7 +1620,7 @@ class SupabaseClient:
             if category:
                 query = query.eq("category", category)
             result = query.limit(limit).execute()
-            return result.data or []
+            return self._list_of_dicts(result.data)
         except Exception as e:
             logger.error(f"Error fetching market price data: {e}")
             return []
