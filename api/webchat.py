@@ -431,10 +431,9 @@ async def _handle_ambiguous_intent(
             "detected_intents": detected_intents,
             "message_preview": message_body[:100]
         }
-    )
-    # CRITICAL: This is NOT small_talk, it's "decision pending"
-    session["intent"] = "clarify_intent"
-    session["locked_intent"] = None  # Explicitly unlock
+                    session.get("pending_media_urls")
+                    or session.get("pending_media_analysis")
+                ):
     
     # TTL: expire after 2 minutes to avoid ghost state
     import time
@@ -4647,11 +4646,12 @@ async def process_webchat_message(
         # Clear the locked intent so routing can start fresh. Do not interfere with
         # publish/delete deterministic flow, which already has its own cancel semantics.
         if (
-            is_cancel_command(message_body)
-            and not user_refuses_images(message_body)
-            and session.get("locked_intent") != "publish_or_delete"
-            and not user_asks_market_price(message_body)
-        ):
+                is_cancel_command(message_body)
+                and not user_refuses_images(message_body)
+                and session.get("locked_intent") != "publish_or_delete"
+                and not user_asks_market_price(message_body)
+                and parse_price_input(message_body) is None
+            ):
             # Best-effort: reset the underlying draft in DB so old fields don't leak
             # into the next listing flow (single-draft-per-user model).
             try:
@@ -4909,9 +4909,11 @@ async def process_webchat_message(
         elif user_asks_market_price(message_body) and (
             session.get("pending_media_urls")
             or session.get("pending_media_analysis")
-            or session.get("active_draft_id")
         ):
-            override_intent = "price_research"
+            # If there's an active draft (create_listing), keep intent there so
+            # the price suggestion flow can run deterministically.
+            if not session.get("active_draft_id") and session.get("locked_intent") != "create_listing":
+                override_intent = "price_research"
         elif session.get("context_mode") == "search" and user_asks_market_price(message_body):
             search_ctx = session.get("search_context") if isinstance(session.get("search_context"), dict) else {}
             query = (search_ctx or {}).get("query")
@@ -6486,6 +6488,39 @@ async def process_webchat_message(
         elif intent == "price_research":
             # STANDALONE Price Research Flow
             log_fsm_event("flow_enter_price_research", session_id, session)
+
+            # PRICE SET WHILE IN PRICE FLOW: if user provides a numeric price and
+            # we already have an active draft, treat this as setting the listing price
+            # and return to create_listing.
+            price_val = parse_price_input(message_body)
+            if price_val is not None and user_id:
+                draft = None
+                draft_id = session.get("active_draft_id")
+                if isinstance(draft_id, str) and draft_id:
+                    draft = await supabase_client.get_draft(draft_id)
+                if not draft:
+                    draft = await supabase_client.get_latest_draft_for_user(user_id)
+                    draft_id = (draft or {}).get("id")
+
+                if isinstance(draft_id, str) and draft_id:
+                    ok = await supabase_client.update_draft_price(draft_id, float(price_val))
+                    updated = await supabase_client.get_draft(draft_id)
+                    session["intent"] = "create_listing"
+                    session["locked_intent"] = "create_listing"
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+                    if ok:
+                        return await finalize_response({
+                            "success": True,
+                            "message": build_next_step_message(updated or {}),
+                            "data": {
+                                "type": "draft_update",
+                                "draft_id": draft_id,
+                                "draft": updated,
+                                "price": float(price_val),
+                            },
+                            "intent": "create_listing",
+                        })
 
             # PRICE → LISTING BRIDGE: allow users to start listing from price flow
             if is_add_image_to_listing_command(message_body):
