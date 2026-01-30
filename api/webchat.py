@@ -84,6 +84,7 @@ def switch_intent(session: Dict[str, Any], new_intent: Optional[str], preserve_d
     session.pop("pending_action", None)
     session.pop("pending_copy_enrichment", None)
     session.pop("copy_enrichment_offered", None)
+    session["awaiting_image_confirm"] = False
     
     # Clean up draft/media context unless explicitly preserved
     if not preserve_draft:
@@ -3424,6 +3425,7 @@ async def process_webchat_message(
                 "active_draft_id": None,
                 "pending_media_urls": [],
                 "pending_media_analysis": [],
+                "awaiting_image_confirm": False,
                 "search_context": {},
                 "active_listing_context": None,
                 "pending_listing_delete": None,
@@ -3445,6 +3447,9 @@ async def process_webchat_message(
                 session_dirty = True
             if "pending_media_analysis" not in session:
                 session["pending_media_analysis"] = []
+                session_dirty = True
+            if "awaiting_image_confirm" not in session:
+                session["awaiting_image_confirm"] = False
                 session_dirty = True
             if "search_context" not in session:
                 session["search_context"] = {}
@@ -4042,6 +4047,32 @@ async def process_webchat_message(
             if not redis_disabled:
                 await redis_client.set_intent(session_id, "create_listing")
 
+        # IMAGE CONFIRM (WHATSAPP):
+        # If a user sends an image while listing is already publishable, ask before attaching.
+        if session.get("awaiting_image_confirm"):
+            if is_add_image_to_listing_command(message_body):
+                incoming_media_urls = list(session.get("pending_media_urls") or [])
+                session["awaiting_image_confirm"] = False
+                session_dirty = True
+            elif is_cancel_command(message_body):
+                session["pending_media_urls"] = []
+                session["pending_media_analysis"] = []
+                session["awaiting_image_confirm"] = False
+                session_dirty = True
+                return await finalize_response({
+                    "success": True,
+                    "message": "Tamam, resmi eklemedim. İlanına devam edebiliriz.",
+                    "data": {"type": "image_add_cancelled"},
+                    "intent": "create_listing",
+                })
+            else:
+                return await finalize_response({
+                    "success": True,
+                    "message": "Bu resmi mevcut ilana ekleyeyim mi? 'ilana ekle' ya da 'iptal' yazabilirsin.",
+                    "data": {"type": "image_add_confirm"},
+                    "intent": "create_listing",
+                })
+
         # IMAGE ADD (POST-INTENT):
         # When locked in create_listing, any incoming images are treated as "add images" only.
         # Do NOT re-route intent, do NOT change title/description/category; only safety check + append + counter.
@@ -4063,6 +4094,18 @@ async def process_webchat_message(
                         "success": True,
                         "message": "Henüz başlattığın bir ilan yok. 'İlan oluştur' yazarak başlayabilirsin 🆕",
                         "data": {"type": "slot_prompt"},
+                        "intent": "create_listing",
+                    })
+
+                # WhatsApp safeguard: if draft is already publishable, ask before adding images
+                is_whatsapp_session = _looks_like_phone_session(session_id)
+                if is_whatsapp_session and draft_is_publishable(draft) and not is_add_image_to_listing_command(message_body):
+                    session["awaiting_image_confirm"] = True
+                    session_dirty = True
+                    return await finalize_response({
+                        "success": True,
+                        "message": "Bu resmi mevcut ilana ekleyeyim mi? 'ilana ekle' ya da 'iptal' yazabilirsin.",
+                        "data": {"type": "image_add_confirm"},
                         "intent": "create_listing",
                     })
 
