@@ -90,6 +90,14 @@ def switch_intent(session: Dict[str, Any], new_intent: Optional[str], preserve_d
         session["active_draft_id"] = None
         session.get("pending_media_urls", []).clear()
         session.get("pending_media_analysis", []).clear()
+
+    # Clear search context when leaving search to avoid stale listing detail leakage
+    if new_intent != "search_listings":
+        session["search_context"] = {}
+        session["active_listing_context"] = None
+        session["context_mode"] = None
+        session.pop("search_pagination_offset", None)
+        session.pop("search_total_count", None)
         
     session["intent_switched_at"] = time.time()
     get_logger().info(
@@ -112,6 +120,13 @@ def _looks_like_phone_session(value: Optional[str]) -> bool:
         return False
     digits = re.sub(r"\D+", "", value)
     return 9 <= len(digits) <= 15
+
+
+def _has_search_context(session: Dict[str, Any]) -> bool:
+    try:
+        return bool(_get_search_context_results(session))
+    except Exception:
+        return False
 
 
 # In-memory caches are managed in api.webchat_store
@@ -1090,6 +1105,8 @@ def is_resume_listing_command(message: str) -> bool:
     if not msg:
         return False
     return any(phrase in msg for phrase in [
+        "devam",
+        "devam et",
         "ilana devam",
         "ilana dön",
         "ilana don",
@@ -2664,6 +2681,16 @@ def extract_preview_edit(message: str) -> Optional[Dict[str, str]]:
             if key_norm in keywords_norm:
                 return {"field": field, "value": raw_value}
 
+    # Support space-based edits like: "Fiyat 83000" / "Başlık iPhone 17"
+    for field, keywords in _PREVIEW_EDIT_KEYWORDS.items():
+        for keyword in keywords:
+            pattern = rf"^\s*{re.escape(keyword)}\s+(.+)$"
+            match = re.match(pattern, text, flags=re.IGNORECASE)
+            if match:
+                raw_value = (match.group(1) or "").strip()
+                if raw_value:
+                    return {"field": field, "value": raw_value}
+
     return None
 
 
@@ -4005,6 +4032,16 @@ async def process_webchat_message(
             except Exception:
                 pass
 
+        # MEDIA OVERRIDE: If user sends photos while search is locked (common in WhatsApp),
+        # force create_listing unless they explicitly asked to search.
+        if incoming_media_urls and session.get("locked_intent") == "search_listings" and not _looks_like_search_query(message_body):
+            switch_intent(session, "create_listing", preserve_draft=True)
+            session["locked_intent"] = "create_listing"
+            session["intent"] = "create_listing"
+            session_dirty = True
+            if not redis_disabled:
+                await redis_client.set_intent(session_id, "create_listing")
+
         # IMAGE ADD (POST-INTENT):
         # When locked in create_listing, any incoming images are treated as "add images" only.
         # Do NOT re-route intent, do NOT change title/description/category; only safety check + append + counter.
@@ -4618,6 +4655,27 @@ async def process_webchat_message(
                         "intent": "create_listing",
                     })
 
+        # Resume without paused_context: if user says "devam" and has an existing draft
+        if not paused_ctx and is_resume_listing_command(message_body) and user_id:
+            try:
+                latest = await supabase_client.get_latest_draft_for_user(user_id)
+                if latest and draft_has_any_content(latest):
+                    draft_id = latest.get("id")
+                    session["intent"] = "create_listing"
+                    session["locked_intent"] = "create_listing"
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+                    prompt = build_next_step_message(latest)
+                    slot = next_missing_slot(latest)
+                    return await finalize_response({
+                        "success": True,
+                        "message": f"Tamam, ilan oluşturmaya devam ediyoruz! 📝\n\n{prompt}",
+                        "data": {"type": "slot_prompt", "slot": slot, "draft_id": draft_id},
+                        "intent": "create_listing",
+                    })
+            except Exception:
+                pass
+
         # Get or determine intent
         intent = session.get("intent")
         locked_intent = session.get("locked_intent")
@@ -4802,8 +4860,9 @@ async def process_webchat_message(
         elif is_small_talk_query(message_body):
             override_intent = "small_talk"
         elif is_show_more_command(message_body):
-            # "Daha fazla" - show next page of search results
-            override_intent = "show_more_results"
+            # "Daha fazla" - show next page of search results only when search context exists
+            if _has_search_context(session) and (session.get("context_mode") == "search" or locked_intent == "search_listings"):
+                override_intent = "show_more_results"
         elif user_asks_market_price(message_body) and (
             session.get("pending_media_urls")
             or session.get("pending_media_analysis")
