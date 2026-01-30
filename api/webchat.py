@@ -4353,10 +4353,38 @@ async def process_webchat_message(
                 except Exception:
                     intro_draft = draft
 
+                # Image-first: auto-seed title/description/category from vision and ask only missing fields.
+                try:
+                    seeded = intro_draft or draft
+                    listing = (seeded or {}).get("listing_data") or {}
+                    vision = _unwrap_vision_product((seeded or {}).get("vision_product"))
+
+                    if isinstance(vision, dict) and vision:
+                        if not (str(listing.get("title") or "").strip()):
+                            seeded_title = generate_title_from_vision(vision)
+                            if seeded_title:
+                                await supabase_client.update_draft_title(draft_id, seeded_title)
+                        if not (str(listing.get("description") or "").strip()):
+                            seeded_desc = generate_description_from_vision(vision)
+                            if seeded_desc:
+                                await supabase_client.update_draft_description(draft_id, seeded_desc)
+                        if not (str(listing.get("category") or "").strip()):
+                            inferred = infer_category_from_draft({
+                                **(seeded or {}),
+                                "listing_data": listing,
+                                "vision_product": vision,
+                            })
+                            if inferred:
+                                await supabase_client.update_draft_category(draft_id, inferred, vision_product=vision)
+
+                    intro_draft = await supabase_client.get_draft(draft_id) if draft_id else seeded
+                except Exception:
+                    pass
+
                 return await finalize_response({
                     "success": True,
-                    "message": format_create_listing_intro_message(intro_draft),
-                    "data": {"type": "create_listing_intro", "draft_id": draft_id},
+                    "message": build_next_step_message(intro_draft or {}),
+                    "data": {"type": "draft_update", "draft_id": draft_id, "draft": intro_draft},
                     "intent": "create_listing",
                 })
 
