@@ -2853,8 +2853,25 @@ def get_improve_target(message: str) -> Optional[str]:
     if "aciklama" in msg_n and any(tok in msg_n for tok in ["iyilestir", "guzellestir", "daha guzel", "vitrinlik", "zenginlestir", "detaylandir", "genislet"]):
         return "description"
 
-    # Generic improve commands
-    if msg_n in {"iyilestir", "vitrinlik yap", "daha guzel yaz", "zenginlestir"}:
+    # Generic improve commands (includes "ilanı iyileştir")
+    generic_improve_cmds = {
+        "iyilestir",
+        "vitrinlik yap",
+        "daha guzel yaz",
+        "zenginlestir",
+        "ilani iyilestir",
+        "ilan iyilestir",
+        "ilanimi iyilestir",
+        "ilani guzellestir",
+        "ilan guzellestir",
+        "ilani zenginlestir",
+        "ilan zenginlestir",
+        "ilani vitrinlik yap",
+        "ilan vitrinlik yap",
+        "ilani daha guzel yaz",
+        "ilan daha guzel yaz",
+    }
+    if msg_n in generic_improve_cmds:
         return "both"
     if msg_n.startswith("iyilestir "):
         rest = msg_n[len("iyilestir "):].strip()
@@ -2968,7 +2985,7 @@ def next_missing_slot(draft: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_next_step_message(draft: Dict[str, Any]) -> str:
+def build_next_step_message(draft: Dict[str, Any], show_preview_on_complete: bool = True) -> str:
     slot = next_missing_slot(draft)
     vision = (draft or {}).get("vision_product") or {}
     suggested_category = ""
@@ -2992,8 +3009,40 @@ def build_next_step_message(draft: Dict[str, Any]) -> str:
             return f"Kategori nedir? (İsterseniz önerim: {suggested_category}; bilmiyorsanız 'otomatik' yazın)"
         return "Kategori nedir? (Örn: Elektronik, Otomotiv...; bilmiyorsanız 'otomatik' yazın)"
 
-    # Completed
+    # Completed - Show preview with iyileştir hint
+    if show_preview_on_complete:
+        return build_complete_preview_message(draft)
     return "Tüm temel bilgiler tamam. Hazırsanız 'yayınla' yazarak ilanı yayınlayabilirsiniz."
+
+
+def build_complete_preview_message(draft: Dict[str, Any]) -> str:
+    """Build a complete preview message when all slots are filled."""
+    preview = build_draft_preview_payload(draft)
+    price = preview.get("price")
+    if isinstance(price, (int, float)):
+        price_text = f"{int(price):,} ₺".replace(",", ".")
+    else:
+        price_text = str(price) if price else "—"
+
+    image_count = int(preview.get("image_count") or 0)
+    lines: List[str] = [
+        "✅ Tüm temel bilgiler tamam! İşte ilan önizlemen:",
+        "",
+        f"📌 **Başlık:** {preview.get('title') or '—'}",
+        f"📝 **Açıklama:** {preview.get('description') or '—'}",
+        f"💰 **Fiyat:** {price_text}",
+        f"📦 **Durum:** {preview.get('condition') or '—'}",
+        f"📁 **Kategori:** {preview.get('category') or '—'}",
+        f"📍 **Lokasyon:** {preview.get('location') or '—'}",
+        f"📷 **Fotoğraflar:** {image_count} / 5",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "🚀 **Yayınlamak için:** 'yayınla' yaz",
+        "✨ **İyileştirmek için:** 'ilanı iyileştir' yaz",
+        "✏️ **Düzenlemek için:** 'başlık: ...', 'fiyat: ...' vb. yaz",
+        "📷 **Fotoğraf eklemek için:** Yeni fotoğraf gönder",
+    ]
+    return "\n".join(lines)
 
 
 def user_asks_market_price(message: str) -> bool:
