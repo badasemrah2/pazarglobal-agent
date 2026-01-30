@@ -97,6 +97,23 @@ def switch_intent(session: Dict[str, Any], new_intent: Optional[str], preserve_d
     )
 
 
+def _is_valid_uuid(value: Optional[str]) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    try:
+        uuid.UUID(value)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_phone_session(value: Optional[str]) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    digits = re.sub(r"\D+", "", value)
+    return 9 <= len(digits) <= 15
+
+
 # In-memory caches are managed in api.webchat_store
 
 MEDIA_ANALYSIS_SYSTEM_PROMPT = (
@@ -1463,6 +1480,19 @@ async def handle_publish_or_delete_flow(
 ) -> Dict[str, Any]:
     """Deterministic publish flow (no LLM): avoids looping confirmations and fake costs."""
 
+    if not user_id:
+        session.pop("locked_intent", None)
+        session["intent"] = None
+        session["pending_publish"] = None
+        session_dirty = True
+        return {
+            "success": True,
+            "message": "Güvenlik için PIN doğrulaması gerekiyor. Lütfen PIN kodunuzu tekrar girin.",
+            "data": {"type": "auth_required"},
+            "intent": "small_talk",
+            "_session_dirty": session_dirty,
+        }
+
     if is_delete_command(message_body):
         return {
             "success": True,
@@ -1481,6 +1511,8 @@ async def handle_publish_or_delete_flow(
                 draft_id = (latest or {}).get("id")
             if isinstance(draft_id, str) and draft_id:
                 await supabase_client.clear_pending_publish_state(draft_id)
+                await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                session["active_draft_id"] = None
         except Exception:
             pass
 
@@ -1620,12 +1652,19 @@ async def handle_publish_or_delete_flow(
         if is_cancel_command(message_body):
             session.pop("pending_publish", None)
             await supabase_client.clear_pending_publish_state(draft_id)
+            try:
+                await supabase_client.reset_draft(draft_id, phone_number=session_id)
+            except Exception:
+                pass
+            session["active_draft_id"] = None
+            session.pop("locked_intent", None)
+            session["intent"] = None
             session_dirty = True
             return {
                 "success": True,
                 "message": "Yayınlama işlemi iptal edildi.",
-                "data": {"type": "publish_delete"},
-                "intent": "publish_or_delete",
+                "data": {"type": "conversation"},
+                "intent": "small_talk",
                 "_session_dirty": session_dirty
             }
 
@@ -3395,6 +3434,33 @@ async def process_webchat_message(
             if "locked_intent" not in session:
                 session["locked_intent"] = None
                 session_dirty = True
+
+        # Stabilize user identity: only trust real UUIDs for ownership-sensitive actions
+        provided_user_id = user_id if _is_valid_uuid(user_id) else None
+        cached_user_id = session.get("user_id") if _is_valid_uuid(session.get("user_id")) else None
+        effective_user_id = provided_user_id or cached_user_id
+        if provided_user_id and session.get("user_id") != provided_user_id:
+            session["user_id"] = provided_user_id
+            session_dirty = True
+        user_id = effective_user_id
+
+        # WhatsApp safety: require user_id for create/edit/publish; phone-only sessions are transient
+        if (
+            not user_id
+            and _looks_like_phone_session(session_id)
+            and (
+                is_publish_command(message_body)
+                or is_confirm_command(message_body)
+                or is_create_listing_command(message_body)
+                or is_edit_command(message_body)
+            )
+        ):
+            return await finalize_response({
+                "success": True,
+                "message": "Güvenlik için PIN doğrulaması gerekiyor. Lütfen PIN kodunuzu tekrar girin.",
+                "data": {"type": "auth_required"},
+                "intent": "small_talk",
+            })
             if "fsm_state" not in session:
                 session["fsm_state"] = "active"
                 session_dirty = True

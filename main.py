@@ -65,10 +65,13 @@ async def agent_run(request: Request):
         from api.webchat import process_webchat_message
         
         # Convert Edge Function format to webchat format
+        user_id = data.get("user_id")
+        session_id = data.get("session_token") or data.get("phone") or user_id
+
         result = await process_webchat_message(
             message_body=data.get("message", ""),
-            session_id=data.get("session_token") or data.get("user_id"),  # Use session_token or user_id as session
-            user_id=data.get("user_id"),
+            session_id=session_id,
+            user_id=user_id,
             media_url=data.get("media_paths", [None])[0] if data.get("media_paths") else None,
             media_urls=data.get("media_paths")
         )

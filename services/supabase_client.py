@@ -391,14 +391,24 @@ class SupabaseClient:
             if phone_number:
                 listing_data["contact_phone"] = phone_number
 
-            result = self.client.table("active_drafts").update({
+            payload = {
                 "state": "in_progress",
                 "listing_data": listing_data,
                 "images": [],
                 "vision_product": {},
                 "metadata": {}  # FIX: Metadata temizleniyor (buffered_media vb.)
-            }).eq("id", draft_id).execute()
-            return bool(result.data)
+            }
+
+            try:
+                result = self.client.table("active_drafts").update(payload).eq("id", draft_id).execute()
+                return bool(result.data)
+            except Exception as e:
+                error_text = str(e)
+                if "metadata" in error_text and "PGRST204" in error_text:
+                    payload.pop("metadata", None)
+                    result = self.client.table("active_drafts").update(payload).eq("id", draft_id).execute()
+                    return bool(result.data)
+                raise
         except Exception as e:
             logger.error(f"Error resetting draft: {e}")
             return False
