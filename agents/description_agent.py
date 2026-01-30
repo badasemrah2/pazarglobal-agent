@@ -13,5 +13,6 @@ class DescriptionAgent(BaseAgent):
         super().__init__(
             name="DescriptionAgent",
             system_prompt=DESCRIPTION_AGENT_PROMPT,
-            tools=[read_draft_tool, update_description_tool]
+            tools=[read_draft_tool, update_description_tool],
+            tool_choice={"type": "function", "function": {"name": "update_description"}},
         )

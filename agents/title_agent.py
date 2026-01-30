@@ -13,5 +13,6 @@ class TitleAgent(BaseAgent):
         super().__init__(
             name="TitleAgent",
             system_prompt=TITLE_AGENT_PROMPT,
-            tools=[read_draft_tool, update_title_tool]
+            tools=[read_draft_tool, update_title_tool],
+            tool_choice={"type": "function", "function": {"name": "update_title"}},
         )

@@ -1,12 +1,15 @@
 """
 PazarGlobal Agent API - Main Application
 FastAPI application with WhatsApp and WebChat integration
+
+v2.0 - Clean architecture with modular handlers
 """
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from config import settings
 from api import whatsapp, webchat
+from routers import gateway_router
 from services.logger import get_logger
 from services.monitoring import monitoring_router
 from services.alerting import get_alerting_service
@@ -33,8 +36,9 @@ app.add_middleware(
 
 
 # Include routers
-app.include_router(whatsapp.router)
-app.include_router(webchat.router)
+app.include_router(gateway_router)  # New v2 gateway (recommended)
+app.include_router(whatsapp.router)  # Legacy whatsapp (for bridge compatibility)
+app.include_router(webchat.router)  # Legacy webchat (for frontend compatibility)
 app.include_router(monitoring_router)
 
 
@@ -100,6 +104,11 @@ async def root():
         "version": "2.0.0",
         "status": "active",
         "endpoints": {
+            # v2 API (recommended)
+            "message": "/api/v1/message",
+            "media_analyze": "/api/v1/media/analyze",
+            "health": "/api/v1/health",
+            # Legacy (for compatibility)
             "whatsapp": "/whatsapp/webhook",
             "webchat": "/webchat/message",
             "websocket": "/webchat/ws/{session_id}",

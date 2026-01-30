@@ -1322,6 +1322,21 @@ def draft_has_non_media_content(draft: Dict[str, Any]) -> bool:
     return False
 
 
+def draft_is_stale(draft: Dict[str, Any], ttl_seconds: int) -> bool:
+    """Return True if draft appears inactive for longer than ttl_seconds."""
+    if not isinstance(draft, dict):
+        return False
+    listing = (draft or {}).get("listing_data") or {}
+    if not isinstance(listing, dict):
+        listing = {}
+    abandoned_at = listing.get("_abandoned_at")
+    ts = abandoned_at or draft.get("updated_at") or draft.get("created_at")
+    if not ts:
+        return False
+    age = _seconds_since(str(ts))
+    return age is not None and age > float(ttl_seconds)
+
+
 def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> bool:
     """Heuristic: if user explicitly starts a new listing, reset the single in-progress draft.
 
@@ -1341,7 +1356,10 @@ def should_reset_draft_for_new_listing(message: str, draft: Dict[str, Any]) -> b
         return False
     # Reset only when we have non-media listing fields that indicate an older draft.
     # Do NOT reset drafts that only have images; otherwise we wipe newly uploaded photos and loop.
-    return draft_has_non_media_content(draft)
+    if draft_has_non_media_content(draft):
+        return True
+    # If the draft is stale, reset even if it only had images.
+    return draft_is_stale(draft, DRAFT_ABANDON_TTL_SECONDS)
 
 
 def detects_product_change(message: str, current_draft: Dict[str, Any]) -> Optional[str]:
@@ -2273,8 +2291,8 @@ async def maybe_enrich_title_description(
             title_agent = TitleAgent()
             if title:
                 title_msg = (
-                    "Aşağıdaki bilgilerle TASLAK başlığını minimal şekilde iyileştir.\n"
-                    "Kullanıcı beyanını koru; sadece netleştir ve vitrinde güçlü hale getir.\n\n"
+                    "Aşağıdaki bilgilerle TASLAK başlığını belirgin şekilde iyileştir.\n"
+                    "Kullanıcı beyanını koru; tekrarları at, netleştir ve vitrinde güçlü hale getir.\n\n"
                     + json.dumps(known, ensure_ascii=False)
                 )
             else:
@@ -2298,14 +2316,14 @@ async def maybe_enrich_title_description(
             if description:
                 desc_msg = (
                     "Aşağıdaki bilgilerle TASLAK açıklamasını mutlaka iyileştir.\n"
-                    "Kullanıcı beyanına sadık kal; varsa görsel izlenimi temkinli şekilde ekle.\n\n"
+                    "Kullanıcı beyanına sadık kal; uydurma yapma, varsa görsel izlenimi temkinli şekilde ekle.\n\n"
                     + json.dumps(known, ensure_ascii=False)
                 )
             else:
                 desc_msg = (
                     "Aşağıdaki bilgilerle ürün için YARARLı bir AÇIKLAMA oluştur.\n"
                     "Kullanıcı mesajı ve varsa görsel analizinden yararlan.\n"
-                    "Açıklama detaylı ama konkret olmalı (durum, hatalar, kutu/fatura vb.).\n\n"
+                    "Açıklama detaylı ama somut olmalı (durum, kullanım alanı, önemli notlar).\n\n"
                     + json.dumps(known, ensure_ascii=False)
                 )
 
@@ -4296,6 +4314,15 @@ async def process_webchat_message(
                     draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
                     draft_id = (draft or {}).get("id")
 
+                # If the recovered draft is stale, reset it to avoid mixing old item data/images.
+                if draft and draft_id and draft_is_stale(draft, DRAFT_ABANDON_TTL_SECONDS) and draft_has_any_content(draft):
+                    try:
+                        ok = await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                        if ok:
+                            draft = await supabase_client.get_draft(draft_id)
+                    except Exception:
+                        pass
+
                 if draft_id:
                     session["active_draft_id"] = draft_id
                     session_dirty = True
@@ -4444,6 +4471,13 @@ async def process_webchat_message(
                         if not draft:
                             draft = await supabase_client.create_draft(user_id=user_id, phone_number=session_id)
                             draft_id = (draft or {}).get("id")
+                        if draft and draft_id and draft_is_stale(draft, DRAFT_ABANDON_TTL_SECONDS) and draft_has_any_content(draft):
+                            try:
+                                ok = await supabase_client.reset_draft(draft_id, phone_number=session_id)
+                                if ok:
+                                    draft = await supabase_client.get_draft(draft_id)
+                            except Exception:
+                                pass
                         if draft_id:
                             session["active_draft_id"] = draft_id
                             session_dirty = True
