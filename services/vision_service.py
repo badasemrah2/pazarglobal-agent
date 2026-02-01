@@ -5,6 +5,7 @@ Components:
 1. Safety Gate - OpenAI Moderation API for content policy
 2. Product Analyzer - GPT-4 Vision for product recognition
 """
+import json
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
@@ -184,9 +185,6 @@ Sadece JSON döndür, açıklama ekleme."""
             )
             
             content = response.choices[0].message.content
-            
-            # Parse JSON response
-            import json
             
             # Clean markdown code blocks if present
             if "```json" in content:
