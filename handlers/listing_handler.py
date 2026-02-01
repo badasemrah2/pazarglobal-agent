@@ -429,9 +429,17 @@ class ListingHandler:
                 "status": "active",
             }
             
+            logger.info(f"Publishing listing: {listing_data}")
+            
             # 2. Insert into listings
             result = self.supabase.client.table("listings").insert(listing_data).execute()
-            listing_id = result.data[0].get("id") if result.data else None
+            
+            if not result.data:
+                logger.error(f"Empty result from listings insert")
+                return self.response_builder.build("error_generic")
+            
+            listing_id = result.data[0].get("id")
+            logger.info(f"Published listing {listing_id}")
             
             # 3. Delete draft
             await self._reset_context(context)
@@ -446,8 +454,10 @@ class ListingHandler:
             return response
         
         except Exception as e:
-            logger.error(f"Error publishing listing: {e}")
-            return self.response_builder.build("error_generic")
+            logger.error(f"Error publishing listing: {e}", exc_info=True)
+            response = self.response_builder.build("error_generic")
+            response.metadata["error_detail"] = str(e)
+            return response
     
     async def _handle_price_suggestion(self, context: ListingContext) -> Response:
         """Handle price suggestion request within listing flow"""
