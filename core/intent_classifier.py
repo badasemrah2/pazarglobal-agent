@@ -1,10 +1,11 @@
 """
 Intent Classifier - Rule-based + LLM fallback
 
-4 Intent:
+5 Intent:
     CREATE  - İlan oluşturma
     SEARCH  - İlan arama
     PUBLISH - İlan yayınlama
+    PRICE   - Fiyat araştırması (standalone)
     CHAT    - Genel sohbet
 """
 from enum import Enum
@@ -18,6 +19,7 @@ class Intent(Enum):
     CREATE = "create"
     SEARCH = "search"
     PUBLISH = "publish"
+    PRICE = "price"  # Standalone price research
     CHAT = "chat"
 
 
@@ -108,12 +110,24 @@ class IntentClassifier:
         r"(?:yardım|help)",
     ]
     
+    # Price research patterns (standalone - not part of create/search)
+    PRICE_PATTERNS = [
+        r"(?:kaç|ne\s*kadar)\s*(?:para|tl|lira|eder|ederi)",
+        r"fiyat\s*(?:öner|oner|araştır|arastir|nedir|ne)",
+        r"piyasa\s*(?:değeri|degeri|fiyat)",
+        r"\bne\s*kadar\s*eder\b",
+        r"\bkaça\s*(?:satılır|satilir|gider)\b",
+        r"\bfiyatı\s*(?:nedir|ne)\b",
+        r"\bederi\s*(?:nedir|ne)\b",
+    ]
+    
     def __init__(self):
         # Compile patterns for efficiency
         self._create_re = [re.compile(p, re.IGNORECASE) for p in self.CREATE_PATTERNS]
         self._search_re = [re.compile(p, re.IGNORECASE) for p in self.SEARCH_PATTERNS]
         self._publish_re = [re.compile(p, re.IGNORECASE) for p in self.PUBLISH_PATTERNS]
         self._chat_re = [re.compile(p, re.IGNORECASE) for p in self.CHAT_PATTERNS]
+        self._price_re = [re.compile(p, re.IGNORECASE) for p in self.PRICE_PATTERNS]
     
     def classify(
         self,
@@ -189,6 +203,7 @@ class IntentClassifier:
             Intent.CREATE: self._score_patterns(msg, self._create_re),
             Intent.SEARCH: self._score_patterns(msg, self._search_re),
             Intent.PUBLISH: self._score_patterns(msg, self._publish_re),
+            Intent.PRICE: self._score_patterns(msg, self._price_re),
             Intent.CHAT: self._score_patterns(msg, self._chat_re),
         }
         

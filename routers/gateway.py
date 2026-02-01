@@ -30,6 +30,7 @@ from handlers.listing_handler import listing_handler
 from handlers.search_handler import search_handler
 from handlers.publish_handler import publish_handler
 from handlers.chat_handler import chat_handler
+from handlers.price_handler import price_handler
 
 from services.vision_service import vision_service
 from services.redis_client import redis_client
@@ -267,6 +268,14 @@ async def _route_to_handler(
     
     elif intent == Intent.SEARCH:
         return await search_handler.handle(
+            user_id=request.user_id,
+            message=request.message,
+            channel=request.channel,
+        )
+    
+    elif intent == Intent.PRICE:
+        # Standalone price research
+        return await price_handler.handle(
             user_id=request.user_id,
             message=request.message,
             channel=request.channel,
