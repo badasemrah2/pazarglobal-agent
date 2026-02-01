@@ -169,39 +169,40 @@ def _is_cancel_command(message: str) -> bool:
 
 
 def _is_flow_switch_command(message: str) -> bool:
-    """Check if user explicitly wants to switch flows"""
+    """
+    Check if user explicitly wants to switch flows.
+    
+    NOTE: Only include patterns that ALWAYS indicate flow switch.
+    Contextual commands like "fiyat öner" should be handled by current handler.
+    """
     msg_lower = message.lower().strip()
     
-    # Explicit listing intent
+    # Explicit listing intent - user wants to CREATE a listing
     listing_patterns = [
         "ilan vermek istiyorum",
         "satmak istiyorum",
         "ilan ver",
-        "sat",
     ]
     
-    # Explicit search intent
+    # Explicit search intent - user wants to SEARCH listings
     search_patterns = [
         "var mı",
-        "var mi",
+        "var mi", 
         "aramak istiyorum",
-        "ara",
-        "bul",
         "ilanlarım",
         "ilanlarim",
+        "ara ",  # "ara" followed by space to avoid matching "araştır"
     ]
     
-    # Price research intent
-    price_patterns = [
-        "fiyat araştır",
-        "fiyat arastir",
-        "fiyat öner",
-        "fiyat oner",
-        "ne kadar eder",
-    ]
+    # Check listing patterns
+    if any(pattern in msg_lower for pattern in listing_patterns):
+        return True
     
-    all_patterns = listing_patterns + search_patterns + price_patterns
-    return any(pattern in msg_lower for pattern in all_patterns)
+    # Check search patterns
+    if any(pattern in msg_lower for pattern in search_patterns):
+        return True
+    
+    return False
 
 
 def _extract_session_updates(metadata: Dict[str, Any], intent: Intent) -> Optional[Dict[str, Any]]:

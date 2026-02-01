@@ -11,6 +11,7 @@ Flow:
 State is stored in Supabase (single source of truth)
 """
 import asyncio
+import re
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
@@ -232,6 +233,32 @@ class ListingHandler:
         cancel_words = ["iptal", "vazgeç", "vazgec", "cancel", "sil", "bırak", "birak"]
         return message.lower().strip() in cancel_words
     
+    def _parse_bare_price(self, message: str) -> Optional[float]:
+        """
+        Parse a bare number as price (when user just sends "2500" or "1.500")
+        Returns None if message is not a bare number.
+        """
+        # Clean message
+        clean = message.strip()
+        
+        # Check if it's mostly numeric (allow dots, commas, spaces as thousand separators)
+        # Also allow "k" suffix (50k = 50000)
+        if re.match(r"^[\d\.\,\s]+(?:k|K)?$", clean):
+            try:
+                # Handle "k" suffix
+                if clean.lower().endswith("k"):
+                    num_part = re.sub(r"[^\d]", "", clean[:-1])
+                    return float(num_part) * 1000
+                
+                # Remove thousand separators and convert
+                num_part = re.sub(r"[\.\s]", "", clean)  # Remove dots and spaces (thousand sep)
+                num_part = num_part.replace(",", ".")   # Convert comma to decimal point
+                return float(num_part)
+            except (ValueError, TypeError):
+                return None
+        
+        return None
+    
     async def _handle_cancel(self, context: ListingContext) -> Response:
         """Handle cancel command"""
         await self._reset_context(context)
@@ -295,6 +322,31 @@ class ListingHandler:
     
     async def _handle_drafting(self, context: ListingContext, message: str) -> Response:
         """Handle message in DRAFTING state"""
+        message_lower = message.lower().strip()
+        
+        # Check for price suggestion request
+        if any(p in message_lower for p in ["fiyat öner", "fiyat oner", "fiyat araştır", "fiyat arastir", "ne kadar eder"]):
+            return await self._handle_price_suggestion(context)
+        
+        # Check if message is just a number (likely price)
+        if "price" not in context.slots or context.slots.get("price") is None:
+            price_value = self._parse_bare_price(message)
+            if price_value is not None:
+                context.slots["price"] = price_value
+                await self._save_context(context)
+                
+                # Check if ready for preview
+                if self._has_required_slots(context):
+                    context.state = ListingState.PREVIEW
+                    await self._save_context(context)
+                    response = self.response_builder.build_preview(self._build_draft_dict(context))
+                    response.metadata["continue_flow"] = True
+                    response.metadata["waiting_for"] = "confirmation"
+                    response.metadata["draft_id"] = context.draft_id
+                    return response
+                
+                return await self._build_slot_request(context)
+        
         # Extract slots from message
         extraction = slot_filler.extract(message)
         self._merge_slots(context, extraction)
@@ -380,6 +432,54 @@ class ListingHandler:
         except Exception as e:
             logger.error(f"Error publishing listing: {e}")
             return self.response_builder.build("error_generic")
+    
+    async def _handle_price_suggestion(self, context: ListingContext) -> Response:
+        """Handle price suggestion request within listing flow"""
+        title = context.slots.get("title")
+        
+        if not title:
+            response = Response(
+                text="💡 Fiyat önerisi için önce ürün adını belirtin.",
+                metadata={"continue_flow": True, "waiting_for": "title", "draft_id": context.draft_id},
+            )
+            return response
+        
+        try:
+            from services.price_service import price_service
+            
+            result = await price_service.get_market_price(
+                product_name=title,
+                category=context.slots.get("category"),
+                condition=context.slots.get("condition"),
+            )
+            
+            if result and result.get("suggested_price"):
+                suggested = result["suggested_price"]
+                response = Response(
+                    text=f"💰 **{title}** için önerilen fiyat: **{int(suggested):,} TL**\n\n"
+                         f"Bu fiyatı kullanmak ister misiniz? (evet/hayır veya kendi fiyatınızı yazın)",
+                    metadata={
+                        "suggested_price": suggested,
+                        "continue_flow": True,
+                        "waiting_for": "price",
+                        "draft_id": context.draft_id,
+                    },
+                )
+                return response
+            else:
+                response = Response(
+                    text="😕 Bu ürün için fiyat önerisi bulunamadı. Lütfen fiyatı kendiniz belirleyin.",
+                    metadata={"continue_flow": True, "waiting_for": "price", "draft_id": context.draft_id},
+                )
+                return response
+                
+        except Exception as e:
+            logger.error(f"Price suggestion error: {e}")
+            response = Response(
+                text="😕 Fiyat önerisi alınamadı. Lütfen fiyatı kendiniz belirleyin.",
+                metadata={"continue_flow": True, "waiting_for": "price", "draft_id": context.draft_id},
+            )
+            return response
     
     def _merge_slots(self, context: ListingContext, extraction: ExtractionResult):
         """Merge extracted slots into context (don't overwrite existing)"""
