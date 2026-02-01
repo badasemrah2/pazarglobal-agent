@@ -253,15 +253,17 @@ class SlotFiller:
         text_lower = text.lower()
         
         for city in self.CITIES:
-            if city in text_lower:
+            # Use word boundary to prevent partial matches (e.g., "samsun" in "Samsung")
+            pattern = re.compile(r'\b' + re.escape(city) + r'\b', re.IGNORECASE)
+            match = pattern.search(text_lower)
+            if match:
                 # Capitalize properly
                 location = city.title()
                 # Handle Turkish İ
                 location = location.replace("Istanbul", "İstanbul")
                 location = location.replace("Izmir", "İzmir")
                 
-                # Remove from text
-                pattern = re.compile(re.escape(city), re.IGNORECASE)
+                # Remove from text using the same pattern
                 remaining = pattern.sub("", text, count=1)
                 
                 return location, remaining

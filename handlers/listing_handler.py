@@ -344,6 +344,26 @@ class ListingHandler:
         if any(p in message_lower for p in ["fiyat öner", "fiyat oner", "fiyat araştır", "fiyat arastir", "ne kadar eder"]):
             return await self._handle_price_suggestion(context)
         
+        # Check for "evet" to accept suggested price (if we just showed a suggestion)
+        if message_lower in ["evet", "tamam", "kabul", "olur", "ok"]:
+            # Check if there's a suggested price in session context
+            if hasattr(self, '_last_suggested_price') and self._last_suggested_price:
+                context.slots["price"] = self._last_suggested_price
+                self._last_suggested_price = None  # Clear after use
+                await self._save_context(context)
+                
+                # Check if ready for preview
+                if self._has_required_slots(context):
+                    context.state = ListingState.PREVIEW
+                    await self._save_context(context)
+                    response = self.response_builder.build_preview(self._build_draft_dict(context))
+                    response.metadata["continue_flow"] = True
+                    response.metadata["waiting_for"] = "confirmation"
+                    response.metadata["draft_id"] = context.draft_id
+                    return response
+                
+                return await self._build_slot_request(context)
+        
         # Check if message is just a number (likely price)
         if "price" not in context.slots or context.slots.get("price") is None:
             price_value = self._parse_bare_price(message)
@@ -519,6 +539,8 @@ class ListingHandler:
             
             if result and result.get("suggested_price"):
                 suggested = result["suggested_price"]
+                # Store for potential "evet" acceptance
+                self._last_suggested_price = suggested
                 response = Response(
                     text=f"💰 **{title}** için önerilen fiyat: **{int(suggested):,} TL**\n\n"
                          f"Bu fiyatı kullanmak ister misiniz? (evet/hayır veya kendi fiyatınızı yazın)",
