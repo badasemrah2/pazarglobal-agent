@@ -1199,6 +1199,53 @@ class SupabaseClient:
                     image_urls.append(url.strip())
             primary_image_url = image_urls[0] if image_urls else None
 
+            # Normalize condition and try to capture market price snapshot for publish-time context.
+            condition_raw = str(listing_data.get("condition") or "").strip() if isinstance(listing_data, dict) else ""
+            try:
+                from services.text_normalization import normalize_for_match, canonicalize_condition
+            except Exception:
+                normalize_for_match = None
+                canonicalize_condition = None
+
+            condition_canonical = None
+            if callable(canonicalize_condition):
+                condition_canonical = canonicalize_condition(condition_raw)
+            if condition_canonical is None:
+                condition_canonical = condition_raw or None
+
+            listing_title = str(listing_data.get("title") or "").strip() if isinstance(listing_data, dict) else ""
+            category_for_price = str(listing_data.get("category") or "").strip() if isinstance(listing_data, dict) else ""
+
+            market_price_at_publish = None
+            product_key = ""
+            if callable(normalize_for_match):
+                product_key = normalize_for_match(" ".join([listing_title, category_for_price, condition_canonical or ""]).strip())
+            elif listing_title:
+                product_key = listing_title.lower().strip()
+
+            if product_key or listing_title:
+                try:
+                    price_query = self.client.table("market_price_snapshots").select(
+                        "avg_price,min_price,max_price,product_key,category,last_updated_at,created_at"
+                    )
+                    if product_key:
+                        price_query = price_query.ilike("product_key", f"%{product_key}%")
+                    else:
+                        price_query = price_query.ilike("product_key", f"%{listing_title}%")
+                    if category_for_price:
+                        price_query = price_query.eq("category", category_for_price)
+                    price_query = price_query.order("last_updated_at", desc=True).limit(1)
+                    price_result = price_query.execute()
+                    price_row = self._first_dict(price_result.data)
+                    if price_row:
+                        market_price_at_publish = (
+                            price_row.get("avg_price")
+                            or price_row.get("min_price")
+                            or price_row.get("max_price")
+                        )
+                except Exception as price_err:
+                    logger.warning(f"Failed to read market_price_snapshots for publish: {price_err}")
+
             if cost > 0:
                 balance = await self.get_wallet_balance(user_id)
                 balance_int = int(balance) if balance is not None else None
@@ -1305,13 +1352,15 @@ class SupabaseClient:
                 "description": listing_data.get("description"),
                 "price": listing_data.get("price"),
                 "category": listing_data.get("category"),
+                "condition": condition_canonical,
                 "location": listing_data.get("location") if isinstance(listing_data, dict) else None,
                 "user_name": user_name,
                 "user_phone": user_phone,
                 "status": "active",
                 "image_url": primary_image_url,
                 "images": image_urls,
-                "metadata": listing_metadata
+                "metadata": listing_metadata,
+                "market_price_at_publish": market_price_at_publish,
             }).execute()
             
             result_row = self._first_dict(result.data)

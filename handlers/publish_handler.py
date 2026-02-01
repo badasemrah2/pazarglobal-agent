@@ -65,15 +65,19 @@ class PublishHandler:
                 )
             
             draft = draft_result.data[0]
+            listing_data = draft.get("listing_data") or {}
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+            images = draft.get("images") or []
             
             # 2. Validate required fields
-            if not draft.get("title") or not draft.get("price") or not draft.get("images"):
+            if not listing_data.get("title") or not listing_data.get("price") or not images:
                 missing = []
-                if not draft.get("title"):
+                if not listing_data.get("title"):
                     missing.append("başlık")
-                if not draft.get("price"):
+                if not listing_data.get("price"):
                     missing.append("fiyat")
-                if not draft.get("images"):
+                if not images:
                     missing.append("görsel")
                 
                 return self.response_builder.build_custom(
@@ -85,24 +89,9 @@ class PublishHandler:
             # if not wallet_ok:
             #     return self.response_builder.build_custom("⚠️ Yetersiz kredi.")
             
-            # 4. Insert into listings
-            listing_data = {
-                "user_id": user_id,
-                "title": draft.get("title"),
-                "description": draft.get("description"),
-                "price": draft.get("price"),
-                "category": draft.get("category", "Diğer"),
-                "condition": draft.get("condition"),
-                "location": draft.get("location"),
-                "images": draft.get("images"),
-                "status": "active",
-            }
-            
-            result = await self.supabase.table("listings").insert(listing_data).execute()
-            listing_id = result.data[0].get("id") if result.data else None
-            
-            # 5. Delete draft
-            await self.supabase.table("active_drafts").delete().eq("id", draft_id).execute()
+            # 4. Publish via shared flow (handles market_price_at_publish, product_images, audit)
+            result_row = await self.supabase.publish_listing(draft_id, user_id, cost=0)
+            listing_id = result_row.get("id") if isinstance(result_row, dict) else None
             
             # 6. Build response
             url = f"https://pazarglobal.com/listing/{listing_id}" if listing_id else ""
