@@ -522,26 +522,32 @@ class ListingHandler:
                 response = Response(
                     text=f"💰 **{title}** için önerilen fiyat: **{int(suggested):,} TL**\n\n"
                          f"Bu fiyatı kullanmak ister misiniz? (evet/hayır veya kendi fiyatınızı yazın)",
+                    buttons=[Button(f"{int(suggested):,} TL", str(suggested))],
                     metadata={
                         "suggested_price": suggested,
                         "continue_flow": True,
                         "waiting_for": "price",
                         "draft_id": context.draft_id,
                     },
+                    channel=self.response_builder.channel,
                 )
                 return response
             else:
                 response = Response(
                     text="😕 Bu ürün için fiyat önerisi bulunamadı. Lütfen fiyatı kendiniz belirleyin.",
+                    buttons=[],
                     metadata={"continue_flow": True, "waiting_for": "price", "draft_id": context.draft_id},
+                    channel=self.response_builder.channel,
                 )
                 return response
                 
         except Exception as e:
-            logger.error(f"Price suggestion error: {e}")
+            logger.error(f"Price suggestion error: {e}", exc_info=True)
             response = Response(
-                text="😕 Fiyat önerisi alınamadı. Lütfen fiyatı kendiniz belirleyin.",
+                text=f"😕 Fiyat önerisi alınamadı: {str(e)[:100]}. Lütfen fiyatı kendiniz belirleyin.",
+                buttons=[],
                 metadata={"continue_flow": True, "waiting_for": "price", "draft_id": context.draft_id},
+                channel=self.response_builder.channel,
             )
             return response
     

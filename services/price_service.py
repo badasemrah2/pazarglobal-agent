@@ -178,7 +178,7 @@ class PriceService:
                 self.CACHED_ENDPOINT,
                 json={"query": query},
                 headers={
-                    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_KEY}",
+                    "Authorization": f"Bearer {settings.supabase_service_key}",
                     "Content-Type": "application/json",
                 },
             )
