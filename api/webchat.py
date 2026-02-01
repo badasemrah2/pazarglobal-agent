@@ -6695,6 +6695,36 @@ async def process_webchat_message(
             # STANDALONE Price Research Flow
             log_fsm_event("flow_enter_price_research", session_id, session)
 
+            # Resume listing creation instead of treating commands as price queries.
+            if is_resume_listing_command(message_body):
+                draft = None
+                draft_id = session.get("active_draft_id")
+                if isinstance(draft_id, str) and draft_id:
+                    draft = await supabase_client.get_draft(draft_id)
+                if not draft and user_id:
+                    draft = await supabase_client.get_latest_draft_for_user(user_id)
+                    draft_id = (draft or {}).get("id")
+                if draft and draft_id:
+                    session["intent"] = "create_listing"
+                    session["locked_intent"] = "create_listing"
+                    session["active_draft_id"] = draft_id
+                    session_dirty = True
+                    prompt = build_next_step_message(draft)
+                    slot = next_missing_slot(draft)
+                    return await finalize_response({
+                        "success": True,
+                        "message": f"Tamam, ilan oluşturmaya devam ediyoruz! 📝\n\n{prompt}",
+                        "data": {"type": "slot_prompt", "slot": slot, "draft_id": draft_id},
+                        "intent": "create_listing",
+                    })
+
+                return await finalize_response({
+                    "success": True,
+                    "message": "Devam edilecek bir ilan bulamadım. Ürün adını yazarak fiyat araştırmasına devam edebilirsin.",
+                    "data": {"type": "slot_prompt", "slot": "title"},
+                    "intent": "price_research",
+                })
+
             # PRICE SET WHILE IN PRICE FLOW: if user provides a numeric price and
             # we already have an active draft, treat this as setting the listing price
             # and return to create_listing.
@@ -6872,8 +6902,9 @@ async def process_webchat_message(
                         vision_data = first.get("analysis") or {}
 
             # 2. Extract Fields (Title, Condition, Category)
-            # Use heuristics first
-            extracted = extract_listing_fields_from_freeform(message_body)
+            # Use heuristics first (ignore command-only messages like "ilana devam et")
+            safe_message = "" if is_command_only_message(message_body) else message_body
+            extracted = extract_listing_fields_from_freeform(safe_message)
             title = extracted.get("title")
             user_condition = extracted.get("condition")
             category = extracted.get("category")
@@ -6958,7 +6989,7 @@ async def process_webchat_message(
 
             # Fallback: derive title/condition from freeform price query (even without explicit labels)
             if not title:
-                derived_title, derived_condition = _derive_title_from_price_query(message_body)
+                derived_title, derived_condition = _derive_title_from_price_query(safe_message)
                 if derived_title:
                     title = derived_title
                 if derived_condition and not user_condition:
