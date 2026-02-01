@@ -104,7 +104,19 @@ class ListingHandler:
         if media_urls:
             return await self._handle_media(context, media_urls, message)
         
-        # 4. Handle text based on state
+        # 4. Handle text based on state and waiting_for
+        # If we were waiting for image but user sent text, treat as product info
+        if context.state == ListingState.IDLE and waiting_for == "image" and message.strip():
+            # User sent text while we were waiting for image
+            # Start drafting with this as potential title/product
+            extraction = slot_filler.extract(message)
+            if extraction.raw_text:
+                context.slots["title"] = extraction.raw_text
+            self._merge_slots(context, extraction)
+            context.state = ListingState.DRAFTING
+            await self._save_context(context)
+            return await self._build_slot_request(context)
+        
         if context.state == ListingState.IDLE:
             return await self._handle_idle(context, message)
         
