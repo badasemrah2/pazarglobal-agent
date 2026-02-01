@@ -5,10 +5,19 @@ Single endpoint: POST /api/v1/message
 
 Flow:
 1. Validate request
-2. Safety check (if media)
-3. Classify intent
-4. Route to handler
-5. Build response
+2. Load minimal session state from Redis (only: locked_intent, waiting_for, draft_id)
+3. Safety check (if media)
+4. Classify intent OR use locked_intent if in active flow
+5. Route to handler
+6. Save minimal state updates
+7. Build response
+
+Redis State (MINIMAL - prevents state poisoning):
+- locked_intent: str | None  - Active flow (create/search)
+- waiting_for: str | None    - Expected slot (title/price/etc)
+- draft_id: str | None       - Supabase draft reference
+
+All other data (slots, images) stays in Supabase active_drafts
 """
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends
@@ -23,11 +32,16 @@ from handlers.publish_handler import publish_handler
 from handlers.chat_handler import chat_handler
 
 from services.vision_service import vision_service
+from services.redis_client import redis_client
 from services.logger import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["gateway"])
+
+
+# Minimal session state keys
+SESSION_KEYS = ["locked_intent", "waiting_for", "draft_id"]
 
 
 # Request/Response Models
@@ -64,11 +78,28 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
     Main message handler.
     
     Receives messages from any channel and routes to appropriate handler.
+    Uses minimal Redis state to maintain flow continuity.
     """
     logger.info(f"Gateway: user={request.user_id}, channel={request.channel}, media={bool(request.media_urls)}")
     
     try:
-        # 1. Safety check for media
+        # 1. Load minimal session state from Redis
+        session = await redis_client.get_session(request.user_id) or {}
+        locked_intent = session.get("locked_intent")  # Active flow
+        waiting_for = session.get("waiting_for")      # Expected slot
+        draft_id = session.get("draft_id")            # Supabase reference
+        
+        logger.debug(f"Session: locked_intent={locked_intent}, waiting_for={waiting_for}, draft_id={draft_id}")
+        
+        # 2. Check for cancel/reset command
+        if _is_cancel_command(request.message):
+            await redis_client.delete_session(request.user_id)
+            return MessageResponse(
+                success=True,
+                text="✅ İşlem iptal edildi. Nasıl yardımcı olabilirim?",
+            )
+        
+        # 3. Safety check for media
         if request.media_urls:
             safety_result = await vision_service.check_safety(request.media_urls[0])
             
@@ -80,22 +111,38 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
                     error="content_blocked",
                 )
         
-        # 2. Classify intent
-        classifier = IntentClassifier()
-        classification = classifier.classify(
-            message=request.message,
-            has_media=bool(request.media_urls),
-        )
+        # 4. Determine intent: use locked_intent if in active flow, else classify
+        if locked_intent and not _is_flow_switch_command(request.message):
+            # Continue existing flow
+            intent = Intent(locked_intent)
+            logger.info(f"Continuing locked flow: {intent.value}")
+        else:
+            # Classify new intent
+            classifier = IntentClassifier()
+            classification = classifier.classify(
+                message=request.message,
+                has_media=bool(request.media_urls),
+            )
+            intent = classification.intent
+            logger.info(f"Classified intent: {intent.value} (confidence={classification.confidence})")
         
-        logger.info(f"Intent: {classification.intent.value} (confidence={classification.confidence})")
-        
-        # 3. Route to handler
+        # 5. Route to handler with session context
         response = await _route_to_handler(
-            intent=classification.intent,
+            intent=intent,
             request=request,
+            session_context={
+                "locked_intent": locked_intent,
+                "waiting_for": waiting_for,
+                "draft_id": draft_id,
+            }
         )
         
-        # 4. Build response
+        # 6. Update minimal session state based on response metadata
+        new_session = _extract_session_updates(response.metadata, intent)
+        if new_session:
+            await redis_client.set_session(request.user_id, new_session)
+        
+        # 7. Build response
         return MessageResponse(
             success=True,
             text=response.text,
@@ -115,8 +162,66 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         )
 
 
-async def _route_to_handler(intent: Intent, request: MessageRequest):
-    """Route request to appropriate handler"""
+def _is_cancel_command(message: str) -> bool:
+    """Check if message is a cancel/reset command"""
+    cancel_words = ["iptal", "vazgeç", "vazgec", "cancel", "sıfırla", "sifirla", "reset"]
+    return message.lower().strip() in cancel_words
+
+
+def _is_flow_switch_command(message: str) -> bool:
+    """Check if user explicitly wants to switch flows"""
+    switch_patterns = [
+        "ilan vermek istiyorum",
+        "satmak istiyorum", 
+        "aramak istiyorum",
+        "ilanlarım",
+        "ilanlarim",
+    ]
+    msg_lower = message.lower().strip()
+    return any(pattern in msg_lower for pattern in switch_patterns)
+
+
+def _extract_session_updates(metadata: Dict[str, Any], intent: Intent) -> Optional[Dict[str, Any]]:
+    """
+    Extract minimal session state from handler response.
+    
+    ONLY these keys are stored in Redis:
+    - locked_intent: Active flow to continue
+    - waiting_for: Expected slot type
+    - draft_id: Supabase draft reference
+    
+    Returns None if session should be cleared (flow complete)
+    """
+    if not metadata:
+        return None
+    
+    # Check if flow is complete
+    if metadata.get("flow_complete"):
+        return None  # Clear session
+    
+    session = {}
+    
+    # Lock intent if handler indicates active flow
+    if metadata.get("continue_flow"):
+        session["locked_intent"] = intent.value
+    
+    # Track waiting slot
+    if metadata.get("waiting_for"):
+        session["waiting_for"] = metadata["waiting_for"]
+    
+    # Track draft reference
+    if metadata.get("draft_id"):
+        session["draft_id"] = metadata["draft_id"]
+    
+    return session if session else None
+
+
+async def _route_to_handler(
+    intent: Intent, 
+    request: MessageRequest,
+    session_context: Optional[Dict[str, Any]] = None,
+):
+    """Route request to appropriate handler with session context"""
     
     if intent == Intent.CREATE:
         return await listing_handler.handle(
@@ -124,6 +229,7 @@ async def _route_to_handler(intent: Intent, request: MessageRequest):
             message=request.message,
             media_urls=request.media_urls,
             channel=request.channel,
+            session_context=session_context,
         )
     
     elif intent == Intent.SEARCH:
@@ -162,8 +268,13 @@ async def _route_to_handler(intent: Intent, request: MessageRequest):
                 channel=request.channel,
             )
         
-        # Default: publish current draft
-        draft_id = request.metadata.get("draft_id") if request.metadata else None
+        # Default: publish current draft (check session_context first, then metadata)
+        draft_id = None
+        if session_context and session_context.get("draft_id"):
+            draft_id = session_context["draft_id"]
+        elif request.metadata:
+            draft_id = request.metadata.get("draft_id")
+            
         if draft_id:
             return await publish_handler.publish_draft(
                 user_id=request.user_id,

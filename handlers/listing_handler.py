@@ -72,6 +72,7 @@ class ListingHandler:
         message: str,
         media_urls: Optional[List[str]] = None,
         channel: str = "webchat",
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> Response:
         """
         Main entry point for listing flow.
@@ -81,15 +82,19 @@ class ListingHandler:
             message: User message
             media_urls: Attached media URLs
             channel: Communication channel
+            session_context: Minimal Redis state (locked_intent, waiting_for, draft_id)
         
         Returns:
             Response to send to user
         """
         await self.initialize(channel)
+        session_context = session_context or {}
         
-        # 1. Load context from Supabase
-        context = await self._load_context(user_id)
-        logger.info(f"Listing handler: user={user_id}, state={context.state}, draft={context.draft_id}")
+        # 1. Load context from Supabase (using draft_id hint from Redis)
+        context = await self._load_context(user_id, session_context.get("draft_id"))
+        waiting_for = session_context.get("waiting_for")
+        
+        logger.info(f"Listing handler: user={user_id}, state={context.state}, draft={context.draft_id}, waiting_for={waiting_for}")
         
         # 2. Check for cancel command
         if self._is_cancel_command(message):
@@ -114,13 +119,13 @@ class ListingHandler:
             await self._reset_context(context)
             return self.response_builder.build("error_generic")
     
-    async def _load_context(self, user_id: str) -> ListingContext:
-        """Load listing context from Supabase"""
+    async def _load_context(self, user_id: str, hint_draft_id: Optional[str] = None) -> ListingContext:
+        """Load listing context from Supabase, optionally using draft_id hint from Redis"""
         context = ListingContext(user_id=user_id)
         
         try:
-            # Check for active draft
-            draft = await self._get_active_draft(user_id)
+            # Check for active draft (use hint if available for faster lookup)
+            draft = await self._get_active_draft(user_id, hint_draft_id)
             
             if draft:
                 context.draft_id = draft.get("id")
@@ -187,9 +192,16 @@ class ListingHandler:
         except Exception as e:
             logger.error(f"Error resetting context: {e}")
     
-    async def _get_active_draft(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get active draft for user"""
+    async def _get_active_draft(self, user_id: str, hint_draft_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get active draft for user, optionally using draft_id hint"""
         try:
+            # Fast path: use hint_draft_id if provided
+            if hint_draft_id:
+                result = await self.supabase.table("active_drafts").select("*").eq("id", hint_draft_id).eq("user_id", user_id).limit(1).execute()
+                if result.data:
+                    return result.data[0]
+            
+            # Fallback: search by user_id
             result = await self.supabase.table("active_drafts").select("*").eq("user_id", user_id).limit(1).execute()
             return result.data[0] if result.data else None
         except Exception as e:
@@ -211,7 +223,10 @@ class ListingHandler:
     async def _handle_cancel(self, context: ListingContext) -> Response:
         """Handle cancel command"""
         await self._reset_context(context)
-        return self.response_builder.build("listing_cancelled")
+        response = self.response_builder.build("listing_cancelled")
+        # Signal flow complete to clear Redis session
+        response.metadata["flow_complete"] = True
+        return response
     
     async def _handle_media(
         self,
@@ -259,7 +274,11 @@ class ListingHandler:
             return await self._build_slot_request(context)
         
         # No slots, ask for image
-        return self.response_builder.build("listing_start")
+        response = self.response_builder.build("listing_start")
+        # Signal that we're in CREATE flow, waiting for image
+        response.metadata["continue_flow"] = True
+        response.metadata["waiting_for"] = "image"
+        return response
     
     async def _handle_drafting(self, context: ListingContext, message: str) -> Response:
         """Handle message in DRAFTING state"""
@@ -277,7 +296,12 @@ class ListingHandler:
         if self._has_required_slots(context):
             context.state = ListingState.PREVIEW
             await self._save_context(context)
-            return self.response_builder.build_preview(self._build_draft_dict(context))
+            response = self.response_builder.build_preview(self._build_draft_dict(context))
+            # Continue flow, waiting for confirmation
+            response.metadata["continue_flow"] = True
+            response.metadata["waiting_for"] = "confirmation"
+            response.metadata["draft_id"] = context.draft_id
+            return response
         
         # Ask for missing slots
         return await self._build_slot_request(context)
@@ -295,10 +319,18 @@ class ListingHandler:
         if extraction.slots:
             self._merge_slots(context, extraction)
             await self._save_context(context)
-            return self.response_builder.build_preview(self._build_draft_dict(context))
+            response = self.response_builder.build_preview(self._build_draft_dict(context))
+            response.metadata["continue_flow"] = True
+            response.metadata["waiting_for"] = "confirmation"
+            response.metadata["draft_id"] = context.draft_id
+            return response
         
         # Unknown, show preview again
-        return self.response_builder.build_preview(self._build_draft_dict(context))
+        response = self.response_builder.build_preview(self._build_draft_dict(context))
+        response.metadata["continue_flow"] = True
+        response.metadata["waiting_for"] = "confirmation"
+        response.metadata["draft_id"] = context.draft_id
+        return response
     
     async def _publish_listing(self, context: ListingContext) -> Response:
         """Publish listing to main table"""
@@ -323,13 +355,14 @@ class ListingHandler:
             # 3. Delete draft
             await self._reset_context(context)
             
-            # 4. Build response
+            # 4. Build response with flow_complete to clear Redis session
             url = f"https://pazarglobal.com/listing/{listing_id}" if listing_id else ""
-            return self.response_builder.build(
+            response = self.response_builder.build(
                 "listing_published",
                 format_args={"url": url},
-                metadata={"listing_id": listing_id},
+                metadata={"listing_id": listing_id, "flow_complete": True},
             )
+            return response
         
         except Exception as e:
             logger.error(f"Error publishing listing: {e}")
@@ -390,10 +423,16 @@ class ListingHandler:
                 hint = f"\n💡 Piyasa tahmini: {suggested_price:,.0f} TL"
         
         message_key = f"listing_need_{first_missing}"
-        return self.response_builder.build_custom(
+        response = self.response_builder.build_custom(
             self.response_builder.MESSAGES.get(message_key, f"Lütfen {first_missing} bilgisini girin.") + hint,
-            metadata={"missing_slots": missing, "draft_id": context.draft_id},
+            metadata={
+                "missing_slots": missing, 
+                "draft_id": context.draft_id,
+                "continue_flow": True,
+                "waiting_for": first_missing,
+            },
         )
+        return response
     
     def _build_draft_dict(self, context: ListingContext) -> Dict[str, Any]:
         """Build draft dict for preview"""
