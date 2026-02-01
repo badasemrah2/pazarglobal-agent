@@ -159,6 +159,15 @@ class OpenAIClient:
 # Global instance
 openai_client = OpenAIClient()
 
+
+async def get_openai_client() -> AsyncOpenAI:
+    """
+    Get the AsyncOpenAI client instance.
+    Used by services that need direct access to the client.
+    """
+    return openai_client.client
+
+
 async def analyze_with_llm(
     system_prompt: str,
     user_message: str,

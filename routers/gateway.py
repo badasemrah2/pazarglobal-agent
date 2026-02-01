@@ -82,10 +82,9 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         
         # 2. Classify intent
         classifier = IntentClassifier()
-        classification = await classifier.classify(
+        classification = classifier.classify(
             message=request.message,
             has_media=bool(request.media_urls),
-            user_id=request.user_id,
         )
         
         logger.info(f"Intent: {classification.intent.value} (confidence={classification.confidence})")
