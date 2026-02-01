@@ -122,36 +122,16 @@ class PriceService:
         }
     
     async def _check_cache(self, product_name: str) -> Optional[Dict[str, Any]]:
-        """Check Supabase cache for price"""
-        try:
-            supabase = await self._get_supabase()
-            
-            # Normalize product name for matching
-            normalized = product_name.lower().strip()
-            
-            result = supabase.client.table("perplexity_cache")\
-                .select("*")\
-                .ilike("query", f"%{normalized}%")\
-                .limit(1)\
-                .execute()
-            
-            if result.data:
-                cache_entry = result.data[0]
-                
-                # Check if cache is still valid (24h TTL)
-                from datetime import datetime, timedelta
-                created_at = cache_entry.get("created_at")
-                if created_at:
-                    # Parse ISO timestamp
-                    cache_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                    if datetime.now(cache_time.tzinfo) - cache_time < timedelta(hours=24):
-                        return cache_entry.get("response")
-            
-            return None
+        """
+        Check local cache.
         
-        except Exception as e:
-            logger.warning(f"Cache check error: {e}")
-            return None
+        Note: Edge Function (ai-assistant-cached) has its own cache in 
+        market_price_snapshots table. We skip local cache and let Edge 
+        Function handle caching.
+        """
+        # Edge Function handles caching internally via market_price_snapshots
+        # No need for duplicate cache check here
+        return None
     
     async def _call_edge_function(
         self,
@@ -163,38 +143,61 @@ class PriceService:
         try:
             client = await self._get_http_client()
             
-            # Build query
-            query = f"{product_name}"
-            if category:
-                query += f" {category}"
-            if condition:
-                query += f" {condition}"
-            query += " Türkiye ikinci el piyasa fiyatı"
-            
             # Get service key for auth
             from config.settings import settings
             
+            # Edge Function expects this payload format:
+            # { action: "suggest_price", title, category, condition, description? }
+            payload = {
+                "action": "suggest_price",
+                "title": product_name,
+                "category": category or "Genel",
+                "condition": condition or "İyi Durumda",
+            }
+            
+            logger.info(f"Calling Edge Function with payload: {payload}")
+            
             response = await client.post(
                 self.CACHED_ENDPOINT,
-                json={"query": query},
+                json=payload,
                 headers={
                     "Authorization": f"Bearer {settings.supabase_service_key}",
                     "Content-Type": "application/json",
                 },
             )
             
+            logger.info(f"Edge function response status: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"Edge function response: success={data.get('success')}, price={data.get('price')}")
                 
-                # Parse Perplexity response
-                return self._parse_perplexity_response(data)
+                # Edge Function returns structured response
+                return self._parse_edge_response(data)
             
-            logger.warning(f"Edge function returned {response.status_code}")
+            error_text = response.text[:200] if response.text else "No response body"
+            logger.warning(f"Edge function returned {response.status_code}: {error_text}")
             return None
         
         except Exception as e:
             logger.error(f"Edge function call error: {e}")
             return None
+    
+    def _parse_edge_response(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Parse Edge Function response (already structured)"""
+        if not data.get("success"):
+            logger.warning(f"Edge function returned error: {data.get('error')}")
+            return None
+        
+        # Edge Function returns: { success, price, min_price, max_price, avg_price, confidence, result }
+        return {
+            "suggested_price": data.get("price"),
+            "price_range": (data.get("min_price"), data.get("max_price")),
+            "market_info": data.get("result"),  # Full explanation text
+            "confidence": data.get("confidence", 0.7),
+            "source": "edge_function",
+            "cached": data.get("cached", False),
+        }
     
     def _parse_perplexity_response(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse Perplexity API response for price info"""
