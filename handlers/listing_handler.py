@@ -416,16 +416,54 @@ class ListingHandler:
     async def _publish_listing(self, context: ListingContext) -> Response:
         """Publish listing to main table"""
         try:
-            # 1. Build listing data
+            # Validate required fields
+            title = context.slots.get("title")
+            if not title:
+                return Response(
+                    text="❌ İlan başlığı gerekli. Lütfen başlık belirtin.",
+                    metadata={"continue_flow": True, "waiting_for": "title", "draft_id": context.draft_id},
+                )
+            
+            # Map condition to valid constraint values
+            condition_map = {
+                "sıfır": "Sıfır",
+                "sifir": "Sıfır",
+                "yeni": "Sıfır",
+                "new": "new",
+                "az kullanılmış": "Az Kullanılmış",
+                "az kullanilmis": "Az Kullanılmış",
+                "like-new": "like-new",
+                "2. el": "2. El",
+                "2.el": "2. El",
+                "ikinci el": "2. El",
+                "used": "used",
+            }
+            raw_condition = (context.slots.get("condition") or "").lower().strip()
+            condition = condition_map.get(raw_condition, "2. El")  # Default to 2. El
+            
+            # Ensure price is numeric
+            price = context.slots.get("price")
+            if price is not None:
+                if isinstance(price, str):
+                    price = float(price.replace(",", ".").replace(" ", ""))
+                else:
+                    price = float(price)
+            
+            # Generate UUID for id
+            import uuid
+            listing_id = str(uuid.uuid4())
+            
+            # Build listing data matching schema exactly
             listing_data = {
+                "id": listing_id,
                 "user_id": context.user_id,
-                "title": context.slots.get("title"),
+                "title": title,
                 "description": context.slots.get("description"),
-                "price": context.slots.get("price"),
-                "category": context.slots.get("category", "Diğer"),
-                "condition": context.slots.get("condition"),
+                "price": price,
+                "category": context.slots.get("category") or "Diğer",
+                "condition": condition,
                 "location": context.slots.get("location"),
-                "images": context.images,
+                "images": context.images or [],
                 "status": "active",
             }
             
