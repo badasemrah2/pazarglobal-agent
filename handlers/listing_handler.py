@@ -143,13 +143,16 @@ class ListingHandler:
             if draft:
                 context.draft_id = draft.get("id")
                 context.state = self._parse_state(draft.get("state", "IDLE"))
+                
+                # Extract slots from listing_data JSON
+                listing_data = draft.get("listing_data") or {}
                 context.slots = {
-                    "title": draft.get("title"),
-                    "description": draft.get("description"),
-                    "price": draft.get("price"),
-                    "category": draft.get("category"),
-                    "condition": draft.get("condition"),
-                    "location": draft.get("location"),
+                    "title": listing_data.get("title"),
+                    "description": listing_data.get("description"),
+                    "price": listing_data.get("price"),
+                    "category": listing_data.get("category"),
+                    "condition": listing_data.get("condition"),
+                    "location": listing_data.get("location"),
                 }
                 context.images = draft.get("images") or []
                 
@@ -164,15 +167,20 @@ class ListingHandler:
     async def _save_context(self, context: ListingContext) -> bool:
         """Save context to Supabase"""
         try:
-            data = {
-                "user_id": context.user_id,
-                "state": context.state.value,
+            # Build listing_data JSON for the active_drafts schema
+            listing_data = {
                 "title": context.slots.get("title"),
                 "description": context.slots.get("description"),
                 "price": context.slots.get("price"),
                 "category": context.slots.get("category"),
                 "condition": context.slots.get("condition"),
                 "location": context.slots.get("location"),
+            }
+            
+            data = {
+                "user_id": context.user_id,
+                "state": context.state.value.lower(),  # active_drafts uses lowercase state
+                "listing_data": listing_data,
                 "images": context.images,
             }
             
@@ -224,9 +232,17 @@ class ListingHandler:
     def _parse_state(self, state_str: str) -> ListingState:
         """Parse state string to enum"""
         try:
+            # Handle both uppercase and lowercase state values
             return ListingState(state_str.upper())
         except ValueError:
-            return ListingState.IDLE
+            # Map common state names
+            state_map = {
+                "in_progress": ListingState.DRAFTING,
+                "drafting": ListingState.DRAFTING,
+                "preview": ListingState.PREVIEW,
+                "idle": ListingState.IDLE,
+            }
+            return state_map.get(state_str.lower(), ListingState.IDLE)
     
     def _is_cancel_command(self, message: str) -> bool:
         """Check if message is a cancel command"""
