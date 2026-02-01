@@ -93,6 +93,15 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         
         # 2. Check for cancel/reset command
         if _is_cancel_command(request.message):
+            # Delete draft from Supabase if exists
+            if draft_id:
+                try:
+                    from services.supabase_client import supabase_client
+                    supabase_client.client.table("active_drafts").delete().eq("id", draft_id).execute()
+                    logger.info(f"Deleted draft {draft_id} on cancel")
+                except Exception as e:
+                    logger.error(f"Failed to delete draft on cancel: {e}")
+            
             await redis_client.delete_session(request.user_id)
             return MessageResponse(
                 success=True,
