@@ -50,8 +50,8 @@ class PriceService:
     async def _get_supabase(self):
         """Lazy load Supabase client"""
         if not self.supabase:
-            from services.supabase_client import get_supabase_client
-            self.supabase = await get_supabase_client()
+            from services.supabase_client import supabase_client
+            self.supabase = supabase_client
         return self.supabase
     
     async def _get_http_client(self):
@@ -129,7 +129,7 @@ class PriceService:
             # Normalize product name for matching
             normalized = product_name.lower().strip()
             
-            result = await supabase.table("perplexity_cache")\
+            result = supabase.client.table("perplexity_cache")\
                 .select("*")\
                 .ilike("query", f"%{normalized}%")\
                 .limit(1)\
