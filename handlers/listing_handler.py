@@ -235,31 +235,32 @@ class ListingHandler:
         message: str,
     ) -> Response:
         """Handle incoming media"""
-        from services.vision_service import VisionService
+        from services.vision_service import vision_service
         
-        # 1. Vision safety check
-        vision_service = VisionService()
-        safety_result = await vision_service.check_safety(media_urls[0])
-        
-        if not safety_result.get("safe", True):
-            return self.response_builder.build("error_vision_blocked")
-        
-        # 2. Analyze image for product info
-        analysis = await vision_service.analyze_product(media_urls[0])
-        
-        # 3. Add images to context
-        context.images.extend(media_urls)
-        
-        # 4. Extract slots from vision + message
-        extraction = slot_filler.extract(message, media_urls, analysis)
-        self._merge_slots(context, extraction)
-        
-        # 5. Transition to DRAFTING
-        context.state = ListingState.DRAFTING
-        await self._save_context(context)
-        
-        # 6. Build response
-        return await self._build_slot_request(context, analysis)
+        try:
+            # 1. Analyze image for product info (safety already checked in gateway)
+            analysis = await vision_service.analyze_product(media_urls[0])
+            logger.info(f"Vision analysis result: {analysis}")
+            
+            # 2. Add images to context
+            context.images.extend(media_urls)
+            
+            # 3. Extract slots from vision + message
+            extraction = slot_filler.extract(message, media_urls, analysis)
+            self._merge_slots(context, extraction)
+            
+            # 4. Transition to DRAFTING
+            context.state = ListingState.DRAFTING
+            await self._save_context(context)
+            
+            # 5. Build response
+            return await self._build_slot_request(context, analysis)
+            
+        except Exception as e:
+            logger.error(f"Media handling error: {e}", exc_info=True)
+            response = self.response_builder.build("error_generic")
+            response.metadata["error_detail"] = str(e)
+            return response
     
     async def _handle_idle(self, context: ListingContext, message: str) -> Response:
         """Handle message in IDLE state"""
