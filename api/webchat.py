@@ -2919,7 +2919,7 @@ def user_requests_auto_category(message: str) -> bool:
     msg = (message or "").strip().lower()
     if not msg:
         return False
-    if msg in {"otomatik", "otomatik belirle"}:
+    if msg in {"otomatik", "otomatik belirle", "bilmiyorum", "bilmiyorum belirle"}:
         return True
     if "otomatik" in msg and "kategori" in msg:
         return True
@@ -3006,8 +3006,8 @@ def build_next_step_message(draft: Dict[str, Any], show_preview_on_complete: boo
         return "Lokasyon nedir? (Örn: 'İstanbul' veya 'Ankara Çankaya')"
     if slot == "category":
         if suggested_category:
-            return f"Kategori nedir? (İsterseniz önerim: {suggested_category}; bilmiyorsanız 'otomatik' yazın)"
-        return "Kategori nedir? (Örn: Elektronik, Otomotiv...; bilmiyorsanız 'otomatik' yazın)"
+            return f"Kategori nedir? (İsterseniz önerim: {suggested_category}; bilmiyorsanız 'bilmiyorum' yazın)"
+        return "Kategori nedir? (Örn: Elektronik, Otomotiv...; bilmiyorsanız 'bilmiyorum' yazın)"
 
     # Completed - Show preview with iyileştir hint
     if show_preview_on_complete:
