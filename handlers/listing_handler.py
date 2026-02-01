@@ -178,10 +178,10 @@ class ListingHandler:
             
             if context.draft_id:
                 # Update existing draft
-                await self.supabase.table("active_drafts").update(data).eq("id", context.draft_id).execute()
+                self.supabase.client.table("active_drafts").update(data).eq("id", context.draft_id).execute()
             else:
                 # Create new draft
-                result = await self.supabase.table("active_drafts").insert(data).execute()
+                result = self.supabase.client.table("active_drafts").insert(data).execute()
                 if result.data:
                     context.draft_id = result.data[0].get("id")
             
@@ -195,7 +195,7 @@ class ListingHandler:
         """Delete draft and reset context"""
         try:
             if context.draft_id:
-                await self.supabase.table("active_drafts").delete().eq("id", context.draft_id).execute()
+                self.supabase.client.table("active_drafts").delete().eq("id", context.draft_id).execute()
             
             context.draft_id = None
             context.state = ListingState.IDLE
@@ -210,12 +210,12 @@ class ListingHandler:
         try:
             # Fast path: use hint_draft_id if provided
             if hint_draft_id:
-                result = await self.supabase.table("active_drafts").select("*").eq("id", hint_draft_id).eq("user_id", user_id).limit(1).execute()
+                result = self.supabase.client.table("active_drafts").select("*").eq("id", hint_draft_id).eq("user_id", user_id).limit(1).execute()
                 if result.data:
                     return result.data[0]
             
             # Fallback: search by user_id
-            result = await self.supabase.table("active_drafts").select("*").eq("user_id", user_id).limit(1).execute()
+            result = self.supabase.client.table("active_drafts").select("*").eq("user_id", user_id).limit(1).execute()
             return result.data[0] if result.data else None
         except Exception as e:
             logger.error(f"Error getting draft: {e}")
@@ -414,7 +414,7 @@ class ListingHandler:
             }
             
             # 2. Insert into listings
-            result = await self.supabase.table("listings").insert(listing_data).execute()
+            result = self.supabase.client.table("listings").insert(listing_data).execute()
             listing_id = result.data[0].get("id") if result.data else None
             
             # 3. Delete draft
