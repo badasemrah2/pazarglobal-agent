@@ -345,7 +345,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             idx = int(detail_match.group(1)) - 1
             search_cache = session.get("search_cache") or []
             if 0 <= idx < len(search_cache):
-                return _format_listing_detail_response(search_cache[idx])
+                return await _format_listing_detail_response(search_cache[idx])
         
         # 2. Calculate context for Brain
         current_listing = session.get("listing_data", {})
@@ -578,37 +578,72 @@ async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: 
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
-def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageResponse:
-    """Render detail response for a single listing from search cache."""
+async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageResponse:
+    """Render full detail response for a single listing from search cache.
+    
+    Fetches owner's phone from profiles table for contact info.
+    """
     title = listing.get("title") or "İlan"
     price = listing.get("price")
     category = listing.get("category") or "Belirtilmedi"
     description = listing.get("description") or "Açıklama eklenmemiş"
     condition = listing.get("condition") or "Belirtilmedi"
     location = listing.get("location") or "Belirtilmedi"
+    
+    # Get all images
     image_url = listing.get("image_url")
     images = listing.get("images") if isinstance(listing.get("images"), list) else []
-    first_image = image_url or (images[0] if images else None)
+    all_images = []
+    if image_url:
+        all_images.append(image_url)
+    all_images.extend([img for img in images if img and img not in all_images])
+    
+    # Get owner's phone from profiles
+    owner_id = listing.get("owner_id") or listing.get("user_id")
+    owner_phone = None
+    owner_name = None
+    if owner_id:
+        try:
+            owner_phone = await supabase_client.get_user_phone(owner_id)
+            owner_name = await supabase_client.get_user_display_name(owner_id)
+        except Exception as e:
+            logger.warning(f"Failed to fetch owner info: {e}")
 
     lines = [
         f"📋 **İlan Detayları**",
-        f"✅ Başlık: {title}",
+        f"",
+        f"✅ **Başlık:** {title}",
     ]
     if price is not None:
-        lines.append(f"✅ Fiyat: {float(price):,.0f} TL")
+        lines.append(f"💰 **Fiyat:** {float(price):,.0f} TL")
     lines.extend([
-        f"✅ Kategori: {category}",
-        f"✅ Açıklama: {description}",
-        f"✅ Durum: {condition}",
-        f"✅ Konum: {location}",
+        f"📁 **Kategori:** {category}",
+        f"📝 **Açıklama:** {description}",
+        f"🏷️ **Durum:** {condition}",
+        f"📍 **Konum:** {location}",
     ])
-    if first_image:
-        lines.append(f"✅ Görsel: {first_image}")
+    
+    # Contact info
+    lines.append(f"")
+    lines.append(f"📞 **İletişim Bilgileri:**")
+    if owner_name:
+        lines.append(f"   👤 Satıcı: {owner_name}")
+    if owner_phone:
+        lines.append(f"   📱 Telefon: {owner_phone}")
+    else:
+        lines.append(f"   📱 Telefon: İlan sahibiyle iletişime geçmek için giriş yapın")
+    
+    # Images
+    if all_images:
+        lines.append(f"")
+        lines.append(f"🖼️ **Görseller:** ({len(all_images)} adet)")
+        for i, img in enumerate(all_images[:5], 1):
+            lines.append(f"   {i}. {img}")
 
     return MessageResponse(
         success=True,
         text="\n".join(lines),
-        metadata={"intent": "SEARCH", "detail": True},
+        metadata={"intent": "SEARCH", "detail": True, "listing_id": listing.get("id")},
     )
 
 async def _call_perplexity(query: str) -> Optional[float]:
