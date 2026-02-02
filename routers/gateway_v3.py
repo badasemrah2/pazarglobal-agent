@@ -229,6 +229,8 @@ class FSMEngine:
             
             if not result.data or len(result.data) == 0:
                 logger.warning(f"No wallet found for user_id: {user_id}, creating one with 0 balance")
+                # First ensure profile exists (foreign key constraint)
+                await cls.ensure_profile_exists(user_id)
                 # Auto-create wallet with 0 balance
                 try:
                     supabase_client.client.table("wallets").insert({
@@ -277,6 +279,27 @@ class FSMEngine:
             return False
     
     @classmethod
+    async def ensure_profile_exists(cls, user_id: str) -> bool:
+        """Kullanıcı profili var mı kontrol et, yoksa oluştur"""
+        try:
+            # Check if profile exists
+            result = supabase_client.client.table("profiles").select("id").eq("id", user_id).limit(1).execute()
+            
+            if result.data and len(result.data) > 0:
+                return True
+            
+            # Create profile
+            logger.info(f"Creating profile for user_id: {user_id}")
+            supabase_client.client.table("profiles").insert({
+                "id": user_id,
+            }).execute()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Profile check/create error for {user_id}: {e}", exc_info=True)
+            return False
+    
+    @classmethod
     async def publish(cls, user_id: str, listing_data: Dict[str, Any]) -> tuple[bool, str, Optional[str]]:
         """
         İlan yayınla
@@ -285,6 +308,10 @@ class FSMEngine:
             (success, message, listing_id)
         """
         try:
+            # 0. Ensure profile exists (foreign key constraint)
+            if not await cls.ensure_profile_exists(user_id):
+                return False, "Kullanıcı profili oluşturulamadı. Lütfen tekrar deneyin.", None
+            
             # 1. Validate
             is_valid, missing = cls.validate(listing_data)
             if not is_valid:
