@@ -121,7 +121,8 @@ class PriceHandler:
         # Remove price query patterns to get product name
         patterns_to_remove = [
             r"\b(?:kaç|ne\s*kadar)\s*(?:para|tl|lira|eder|ederi)?\b",
-            r"\bfiyat\s*(?:öner|oner|araştır|arastir|nedir|ne)?\b",
+            r"\bfiyat\s+(?:öner|oner|araştır|arastir|nedir|ne)\b",  # "fiyat öner" etc
+            r"\bfiyat(?:ı|i)?\s*(?:nedir|ne)?\b",  # "fiyatı nedir", "fiyat"
             r"\bpiyasa\s*(?:değeri|degeri|fiyatı|fiyati)?\b",
             r"\bkaça\s*(?:satılır|satilir|gider)?\b",
             r"\bederi\s*(?:nedir|ne)?\b",
@@ -129,6 +130,7 @@ class PriceHandler:
             r"\b2\.?\s*el\b",
             r"\bsıfır\b",
             r"\baz\s*kullanılmış\b",
+            r"\b(?:öner|oner)\b",  # standalone "öner" or "oner"
         ]
         
         result = message
