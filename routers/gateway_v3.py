@@ -204,40 +204,55 @@ class FSMEngine:
             (has_enough, current_balance)
         """
         try:
+            logger.info(f"Checking wallet for user_id: {user_id}")
             result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
             
             if not result.data:
+                logger.warning(f"No wallet found for user_id: {user_id}, creating one with 0 balance")
+                # Auto-create wallet with 0 balance
+                try:
+                    supabase_client.client.table("wallets").insert({
+                        "user_id": user_id,
+                        "balance": 0
+                    }).execute()
+                except Exception as create_err:
+                    logger.error(f"Failed to create wallet: {create_err}")
                 return False, 0.0
             
             balance = float(result.data.get("balance", 0))
+            logger.info(f"Wallet balance for {user_id}: {balance} TL (required: {required_amount})")
             return balance >= required_amount, balance
             
         except Exception as e:
-            logger.error(f"Wallet check error: {e}")
+            logger.error(f"Wallet check error for {user_id}: {e}", exc_info=True)
             return False, 0.0
     
     @classmethod
     async def deduct_credit(cls, user_id: str, amount: float = 55.0) -> bool:
         """Wallet'tan kredi düş"""
         try:
+            logger.info(f"Deducting {amount} TL from user_id: {user_id}")
             # Get current balance
             result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
             
             if not result.data:
+                logger.error(f"No wallet found for deduction: {user_id}")
                 return False
             
             current = float(result.data.get("balance", 0))
             new_balance = current - amount
             
             if new_balance < 0:
+                logger.warning(f"Insufficient balance for {user_id}: {current} < {amount}")
                 return False
             
             # Update
             supabase_client.client.table("wallets").update({"balance": new_balance}).eq("user_id", user_id).execute()
+            logger.info(f"Deducted {amount} TL from {user_id}. New balance: {new_balance}")
             return True
             
         except Exception as e:
-            logger.error(f"Deduct credit error: {e}")
+            logger.error(f"Deduct credit error for {user_id}: {e}", exc_info=True)
             return False
     
     @classmethod
