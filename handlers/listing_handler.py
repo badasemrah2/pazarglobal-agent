@@ -33,6 +33,7 @@ class ListingContext:
     state: ListingState = ListingState.IDLE
     slots: Dict[str, Any] = None
     images: List[str] = None
+    suggested_price: Optional[float] = None  # For "evet" acceptance
     
     def __post_init__(self):
         self.slots = self.slots or {}
@@ -156,6 +157,9 @@ class ListingHandler:
                 }
                 context.images = draft.get("images") or []
                 
+                # Load suggested price for "evet" acceptance
+                context.suggested_price = listing_data.get("_suggested_price")
+                
                 # Clean up None values
                 context.slots = {k: v for k, v in context.slots.items() if v is not None}
         
@@ -175,6 +179,7 @@ class ListingHandler:
                 "category": context.slots.get("category"),
                 "condition": context.slots.get("condition"),
                 "location": context.slots.get("location"),
+                "_suggested_price": context.suggested_price,  # Temporary for "evet" acceptance
             }
             
             data = {
@@ -346,10 +351,10 @@ class ListingHandler:
         
         # Check for "evet" to accept suggested price (if we just showed a suggestion)
         if message_lower in ["evet", "tamam", "kabul", "olur", "ok"]:
-            # Check if there's a suggested price in session context
-            if hasattr(self, '_last_suggested_price') and self._last_suggested_price:
-                context.slots["price"] = self._last_suggested_price
-                self._last_suggested_price = None  # Clear after use
+            # Check if there's a suggested price in context
+            if hasattr(context, 'suggested_price') and context.suggested_price:
+                context.slots["price"] = context.suggested_price
+                context.suggested_price = None  # Clear after use
                 await self._save_context(context)
                 
                 # Check if ready for preview
@@ -539,8 +544,9 @@ class ListingHandler:
             
             if result and result.get("suggested_price"):
                 suggested = result["suggested_price"]
-                # Store for potential "evet" acceptance
-                self._last_suggested_price = suggested
+                # Store in context for potential "evet" acceptance
+                context.suggested_price = suggested
+                await self._save_context(context)
                 response = Response(
                     text=f"💰 **{title}** için önerilen fiyat: **{int(suggested):,} TL**\n\n"
                          f"Bu fiyatı kullanmak ister misiniz? (evet/hayır veya kendi fiyatınızı yazın)",
