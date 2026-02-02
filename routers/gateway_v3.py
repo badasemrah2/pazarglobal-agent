@@ -579,66 +579,84 @@ async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: 
 # ═══════════════════════════════════════════════════════════════════
 
 async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageResponse:
-    """Render full detail response for a single listing from search cache.
+    """Format listing detail like WhatsApp card style.
     
-    Fetches owner's phone from profiles table for contact info.
+    Clean, structured format with image, price, contact info.
     """
     title = listing.get("title") or "İlan"
     price = listing.get("price")
-    category = listing.get("category") or "Belirtilmedi"
-    description = listing.get("description") or "Açıklama eklenmemiş"
-    condition = listing.get("condition") or "Belirtilmedi"
-    location = listing.get("location") or "Belirtilmedi"
+    category = listing.get("category") or ""
+    description = listing.get("description") or ""
+    condition = listing.get("condition") or "2. El"
+    location = listing.get("location") or ""
     
-    # Get all images
+    # Get primary image
     image_url = listing.get("image_url")
     images = listing.get("images") if isinstance(listing.get("images"), list) else []
-    all_images = []
-    if image_url:
-        all_images.append(image_url)
-    all_images.extend([img for img in images if img and img not in all_images])
+    primary_image = image_url or (images[0] if images else None)
     
-    # Get owner's phone from profiles
-    owner_id = listing.get("owner_id") or listing.get("user_id")
-    owner_phone = None
-    owner_name = None
-    if owner_id:
-        try:
-            owner_phone = await supabase_client.get_user_phone(owner_id)
-            owner_name = await supabase_client.get_user_display_name(owner_id)
-        except Exception as e:
-            logger.warning(f"Failed to fetch owner info: {e}")
+    # Get owner info
+    owner_name = listing.get("user_name")
+    owner_phone = listing.get("user_phone")
+    
+    if not owner_name or not owner_phone:
+        owner_id = listing.get("owner_id") or listing.get("user_id")
+        if owner_id:
+            try:
+                if not owner_phone:
+                    owner_phone = await supabase_client.get_user_phone(owner_id)
+                if not owner_name:
+                    owner_name = await supabase_client.get_user_display_name(owner_id)
+            except Exception as e:
+                logger.warning(f"Failed to fetch owner info: {e}")
 
-    lines = [
-        f"📋 **İlan Detayları**",
-        f"",
-        f"✅ **Başlık:** {title}",
-    ]
-    if price is not None:
-        lines.append(f"💰 **Fiyat:** {float(price):,.0f} TL")
-    lines.extend([
-        f"📁 **Kategori:** {category}",
-        f"📝 **Açıklama:** {description}",
-        f"🏷️ **Durum:** {condition}",
-        f"📍 **Konum:** {location}",
-    ])
+    # Build WhatsApp-style card text
+    lines = []
     
-    # Contact info
-    lines.append(f"")
-    lines.append(f"📞 **İletişim Bilgileri:**")
+    # Image (markdown format for frontend to render)
+    if primary_image:
+        lines.append(f"![{title}]({primary_image})")
+        lines.append("")
+    
+    # Title bold
+    lines.append(f"*{title}*")
+    
+    # Price | Location | Category (one line)
+    meta_parts = []
+    if price:
+        meta_parts.append(f"{float(price):,.0f} ₺")
+    if location:
+        meta_parts.append(location)
+    if category:
+        meta_parts.append(category)
+    if meta_parts:
+        lines.append(" | ".join(meta_parts))
+    
+    # Seller info
+    seller_parts = []
     if owner_name:
-        lines.append(f"   👤 Satıcı: {owner_name}")
+        seller_parts.append(f"Satıcı: {owner_name}")
     if owner_phone:
-        lines.append(f"   📱 Telefon: {owner_phone}")
-    else:
-        lines.append(f"   📱 Telefon: İlan sahibiyle iletişime geçmek için giriş yapın")
+        seller_parts.append(f"Telefon: {owner_phone}")
+    if seller_parts:
+        lines.append(" | ".join(seller_parts))
     
-    # Images
-    if all_images:
-        lines.append(f"")
-        lines.append(f"🖼️ **Görseller:** ({len(all_images)} adet)")
-        for i, img in enumerate(all_images[:5], 1):
-            lines.append(f"   {i}. {img}")
+    # Description
+    if description:
+        lines.append("")
+        lines.append("Açıklama:")
+        lines.append(description)
+    
+    # Condition
+    if condition:
+        lines.append("")
+        lines.append(f"Durum: {condition}")
+
+    return MessageResponse(
+        success=True,
+        text="\n".join(lines),
+        metadata={"intent": "SEARCH", "detail": True, "listing_id": listing.get("id")},
+    )
 
     return MessageResponse(
         success=True,
