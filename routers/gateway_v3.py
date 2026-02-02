@@ -110,15 +110,17 @@ class FSMEngine:
     
     Görevler:
     - JSON validasyon (schema kontrolü)
-    - Otomatik kategori belirleme (category_library kullanarak)
+    - Otomatik kategori belirleme (category_library kullanarak) - LLM DEĞİL!
     - Keywords üretme
     - Wallet kontrolü
     - İlan yayınlama
     
     NOT: Resim zorunlu DEĞİL
+    NOT: Kategori FSM tarafından otomatik belirlenir!
     """
     
-    REQUIRED_FIELDS = ["title", "price", "category", "description"]
+    # Category FSM tarafından otomatik belirlenir - missing fields'a dahil değil!
+    REQUIRED_FIELDS = ["title", "price", "description"]
     
     # Import from category_library - single source of truth
     from services.category_library import SUPPORTED_CATEGORIES, classify_category, normalize_category_id
@@ -158,29 +160,33 @@ class FSMEngine:
             except (ValueError, TypeError):
                 missing.append("price")
         
-        # Category - otomatik belirleme dene
+        # Category - FSM OTOMATİK BELİRLER (LLM sorumluluğunda değil!)
         category = listing_data.get("category")
         
         # Önce normalize et (kullanıcı "Tarım&Gıda" yazmışsa "Tarım & Gıda" yap)
-        if category:
+        if category and category not in ["Sistem", "Otomatik", ""]:
             normalized = cls.normalize_category_id(category)
-            if normalized:
+            if normalized and normalized in cls.ALLOWED_CATEGORIES:
                 listing_data["category"] = normalized
                 category = normalized
         
-        # Kategori hala geçersizse, başlık ve açıklamadan otomatik belirle
-        if not category or category not in cls.ALLOWED_CATEGORIES:
+        # Kategori boş, "Sistem", "Otomatik" veya geçersizse → başlık/açıklamadan otomatik belirle
+        if not category or category in ["Sistem", "Otomatik"] or category not in cls.ALLOWED_CATEGORIES:
             title = listing_data.get("title", "")
             description = listing_data.get("description", "")
             auto_category = cls.classify_category(f"{title} {description}")
-            if auto_category:
+            if auto_category and auto_category in cls.ALLOWED_CATEGORIES:
                 listing_data["category"] = auto_category
                 category = auto_category
-                logger.info(f"Auto-classified category: {auto_category} from title/desc")
+                logger.info(f"FSM auto-classified category: {auto_category} from title/desc")
+            else:
+                # Hiç bulunamazsa → "Diğer" (asla boş bırakma!)
+                listing_data["category"] = "Diğer"
+                category = "Diğer"
+                logger.info(f"FSM defaulted category to 'Diğer' - no match found")
         
-        # Son kontrol
-        if not category or category not in cls.ALLOWED_CATEGORIES:
-            missing.append("category")
+        # Kategori artık kesinlikle dolu - missing'e ekleme (FSM her zaman doldurur)
+        # NOT: Kategori artık hiçbir zaman missing olmaz!
         
         is_valid = len(missing) == 0
         return is_valid, missing
@@ -413,6 +419,9 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
     """FSM: Show detailed confirmation preview with credit info"""
     listing = session.get("listing_data", {})
     
+    # FSM validate - kategori otomatik belirlensin!
+    FSMEngine.validate(listing)
+    
     # Get user balance
     try:
         result = await supabase_client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
@@ -421,6 +430,11 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
         balance = 0
     
     credit_cost = 55
+    
+    # Kategori gösterimi (FSM tarafından belirlendi)
+    category_display = listing.get('category', 'Diğer')
+    if category_display in ["Sistem", "Otomatik", ""]:
+        category_display = "Diğer"
     
     # Format detailed preview
     preview = f"""📋 **YAYIN ÖNCESİ KONTROL**
@@ -438,7 +452,7 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
 {listing.get('condition', '2. El')}
 
 **KATEGORİ:**
-{listing.get('category', '—')}
+{category_display} ✅ (Sistem tarafından belirlendi)
 
 **LOKASYON:**
 {listing.get('location', 'Belirtilmemiş')}
@@ -459,7 +473,8 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
 
 İlanınızı yayınlamak için **onayla** yazın."""
 
-    # Update session state
+    # Update session state with auto-categorized listing
+    session["listing_data"] = listing  # Save with auto-category
     session["fsm_state"] = FSM_STATE_PENDING_CONFIRMATION
     session["pending_publish_balance"] = balance
     session["pending_publish_cost"] = credit_cost

@@ -72,7 +72,8 @@ LISTING_SCHEMA = {
     "images": {"type": "array", "required": False},  # FSM zorunlu tutmaz
 }
 
-REQUIRED_FIELDS = ["title", "price", "category", "description"]
+# Category FSM tarafından otomatik belirlenir - LLM sorumlu değil!
+REQUIRED_FIELDS = ["title", "price", "description"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -332,7 +333,7 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
 {
   "title": "string, max 200 karakter, ZORUNLU",
   "description": "string, min 10 karakter, max 2000 karakter, ZORUNLU - ürün detayları ve görsel analizi buraya",
-  "category": "Emlak|Otomotiv|Elektronik|Ev & Yaşam|Moda & Aksesuar|Anne, Bebek & Oyuncak|Spor & Outdoor|Hobi, Koleksiyon & Sanat|Hayvanlar Alemi|Tarım & Gıda|İş Makineleri & Sanayi|Yedek Parça & Aksesuar|Hizmetler|Eğitim & Kurs|İş İlanları|Dijital Ürün & Hizmetler|Diğer, ZORUNLU",
+  "category": "Sistem (FSM otomatik belirler - SEN TAHMİN YAPMA!)",
   "price": "number, 1-100000000 arası TL, ZORUNLU",
   "condition": "Sıfır|Az Kullanılmış|2. El, default: 2. El",
   "location": "string, şehir, opsiyonel",
@@ -340,11 +341,11 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
 }
 ```
 
-**Kategori Örnekleri:**
-- Domates, meyve, sebze → "Tarım & Gıda"
-- iPhone, laptop, TV → "Elektronik"
-- Araba, motorsiklet → "Otomotiv"
-- Daire, ev, arsa → "Emlak"
+**KATEGORİ KURALI (ÇOK ÖNEMLİ!):**
+- KATEGORİYİ SEN BELİRLEME! Her zaman "Sistem" yaz.
+- FSM yayın anında başlık ve açıklamadan otomatik belirleyecek.
+- Önizlemede "Kategori: Sistem belirleyecek" göster.
+- Kullanıcıya "Kategori sistem tarafından otomatik belirlenecek" de.
 
 ## EKSTRA BİLGİ KURALI
 
