@@ -90,9 +90,7 @@ class IntentClassifier:
     SEARCH_PATTERNS = [
         r"(?:var\s*mı|varmı|varmi|mevcut)",
         r"(?:ara|bul|göster|listele)",
-        r"(?:kaç|ne\s*kadar)\s*(?:para|tl|lira)",
-        r"fiyat(?:ı|lar)",
-        r"piyasa(?:da|sı)",
+        # Removed price patterns - now handled by PRICE intent
         r"ilan(?:lar)?(?:a|ı)?\s*bak",
     ]
     
@@ -206,6 +204,11 @@ class IntentClassifier:
             Intent.PRICE: self._score_patterns(msg, self._price_re),
             Intent.CHAT: self._score_patterns(msg, self._chat_re),
         }
+        
+        # PRICE intent boost: price queries should prioritize PRICE over SEARCH
+        # "kaç para eder", "fiyatı nedir" etc. should go to price research
+        if scores[Intent.PRICE] > 0 and scores[Intent.PRICE] >= scores[Intent.SEARCH]:
+            scores[Intent.PRICE] += 0.3  # Boost price intent
         
         # Media without explicit intent → likely CREATE
         if has_media and scores[Intent.CREATE] < 0.5:
