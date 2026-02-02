@@ -345,8 +345,11 @@ class ListingHandler:
         """Handle message in DRAFTING state"""
         message_lower = message.lower().strip()
         
+        logger.info(f"_handle_drafting called: message='{message_lower}'")
+        
         # Check for price suggestion request
         if any(p in message_lower for p in ["fiyat öner", "fiyat oner", "fiyat araştır", "fiyat arastir", "ne kadar eder"]):
+            logger.info("Price suggestion request detected!")
             return await self._handle_price_suggestion(context)
         
         # Check for "evet" to accept suggested price (if we just showed a suggestion)
