@@ -2,8 +2,8 @@
 PazarGlobal Agent API - Main Application
 FastAPI application with WhatsApp and WebChat integration
 
-v2.0.2 - Clean architecture with modular handlers
-Updated: 2026-02-02 15:55
+v3.0.0 - Single LLM Brain architecture
+Updated: 2026-02-02 17:00
 """
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from api import whatsapp, webchat
 from routers import gateway_router
+from routers.gateway_v3 import router as gateway_v3_router
 from services.logger import get_logger
 from services.monitoring import monitoring_router
 from services.alerting import get_alerting_service
@@ -22,7 +23,7 @@ logger = get_logger(__name__)
 app = FastAPI(
     title="PazarGlobal Agent API",
     description="AI Agent system for PazarGlobal marketplace with WhatsApp and WebChat support",
-    version="2.0.0",
+    version="3.0.0",
     debug=settings.debug
 )
 
@@ -37,7 +38,8 @@ app.add_middleware(
 
 
 # Include routers
-app.include_router(gateway_router)  # New v2 gateway (recommended)
+app.include_router(gateway_v3_router)  # NEW v3 - Single LLM Brain (recommended)
+app.include_router(gateway_router)  # v2 gateway (legacy)
 app.include_router(whatsapp.router)  # Legacy whatsapp (for bridge compatibility)
 app.include_router(webchat.router)  # Legacy webchat (for frontend compatibility)
 app.include_router(monitoring_router)

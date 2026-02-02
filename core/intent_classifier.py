@@ -109,14 +109,16 @@ class IntentClassifier:
     ]
     
     # Price research patterns (standalone - not part of create/search)
+    # NOTE: Use normalized chars (ç→c, ş→s, ö→o, ü→u, ğ→g, ı→i)
     PRICE_PATTERNS = [
-        r"(?:kaç|ne\s*kadar)\s*(?:para|tl|lira|eder|ederi)",
-        r"fiyat\s*(?:öner|oner|araştır|arastir|nedir|ne)",
-        r"piyasa\s*(?:değeri|degeri|fiyat)",
+        r"(?:kac|ne\s*kadar)\s*(?:para|tl|lira|eder|ederi)",
+        r"fiyat\s*(?:oner|arastir|nedir|ne)",
+        r"piyasa\s*(?:degeri|fiyat)",
         r"\bne\s*kadar\s*eder\b",
-        r"\bkaça\s*(?:satılır|satilir|gider)\b",
-        r"\bfiyatı\s*(?:nedir|ne)\b",
+        r"\bkaca\s*(?:satilir|gider)\b",
+        r"\bfiyati\s*(?:nedir|ne)\b",
         r"\bederi\s*(?:nedir|ne)\b",
+        r"\bkac\s*para\b",
     ]
     
     def __init__(self):
