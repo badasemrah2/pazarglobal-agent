@@ -1,17 +1,28 @@
 """
-PazarGlobal Agent V3 - Unified Gateway
+PazarGlobal Agent V3 - Gateway + FSM Engine
 
 Tek giriş noktası: POST /api/v3/message
 
+Mimari:
+- LLM Brain: Serbest konuşma, intent belirleme, JSON üretme
+- FSM Engine: JSON validasyon, keywords üretme, wallet, publish
+
 Flow:
-1. Auth & Session load
-2. Brain (single LLM) → intent + listing_data
-3. Route to FSM (CREATE or SEARCH)
-4. Response
+1. Message → Brain (LLM)
+2. Brain → JSON + Intent
+3. Intent CANCEL → Reset (LLM override)
+4. Intent SEARCH → SearchComposerAgent
+5. Intent CREATE → FSM Engine
+   - FSM validates JSON
+   - Missing fields? → Brain'e geri döndür
+   - Ready + Confirmed? → Publish
 """
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+import re
+import uuid
+from datetime import datetime
 
 from core.brain import brain, BrainOutput, Intent
 from services.redis_client import redis_client
@@ -57,21 +68,228 @@ async def load_session(user_id: str) -> Dict[str, Any]:
     session = await redis_client.get_session(user_id) or {}
     return {
         "listing_data": session.get("listing_data", {}),
-        "draft_id": session.get("draft_id"),
-        "state": session.get("state", "IDLE"),  # IDLE, DRAFTING, PREVIEW
+        "state": session.get("state", "IDLE"),  # IDLE, DRAFTING, READY
         "conversation_history": session.get("conversation_history", []),
     }
 
 
 async def save_session(user_id: str, session: Dict[str, Any]):
     """Save session to Redis"""
-    # Keep conversation history short
     history = session.get("conversation_history", [])
     if len(history) > 20:
         history = history[-20:]
     session["conversation_history"] = history
-    
     await redis_client.set_session(user_id, session)
+
+
+async def clear_session(user_id: str):
+    """Clear session - reset"""
+    await redis_client.delete_session(user_id)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FSM ENGINE - Deterministic JSON Processing
+# ═══════════════════════════════════════════════════════════════════
+
+class FSMEngine:
+    """
+    FSM Engine - JSON validasyon ve publish
+    
+    Görevler:
+    - JSON validasyon (schema kontrolü)
+    - Keywords üretme
+    - Wallet kontrolü
+    - İlan yayınlama
+    
+    NOT: Resim zorunlu DEĞİL
+    """
+    
+    REQUIRED_FIELDS = ["title", "price", "category"]
+    
+    ALLOWED_CATEGORIES = {
+        "Elektronik", "Otomotiv", "Emlak", "Mobilya & Dekorasyon",
+        "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer"
+    }
+    
+    ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "2. El"}
+    
+    @classmethod
+    def validate(cls, listing_data: Dict[str, Any]) -> tuple[bool, List[str]]:
+        """
+        JSON validasyon - FSM'in beklediği formata uygun mu?
+        
+        Returns:
+            (is_valid, missing_fields)
+        """
+        missing = []
+        
+        # Title
+        if not listing_data.get("title"):
+            missing.append("title")
+        
+        # Price
+        price = listing_data.get("price")
+        if price is None:
+            missing.append("price")
+        else:
+            try:
+                price_val = float(price)
+                if not (1 <= price_val <= 100_000_000):
+                    missing.append("price")
+            except (ValueError, TypeError):
+                missing.append("price")
+        
+        # Category
+        category = listing_data.get("category")
+        if not category or category not in cls.ALLOWED_CATEGORIES:
+            missing.append("category")
+        
+        is_valid = len(missing) == 0
+        return is_valid, missing
+    
+    @classmethod
+    def generate_keywords(cls, listing_data: Dict[str, Any]) -> str:
+        """
+        Keywords üret - arama için metadata.keywords_text
+        """
+        parts = []
+        
+        # Title words
+        title = listing_data.get("title", "")
+        if title:
+            parts.extend(title.lower().split())
+        
+        # Description words (ilk 100 karakter)
+        desc = listing_data.get("description", "")
+        if desc:
+            parts.extend(desc[:100].lower().split())
+        
+        # Category
+        category = listing_data.get("category", "")
+        if category:
+            parts.append(category.lower())
+        
+        # Location
+        location = listing_data.get("location", "")
+        if location:
+            parts.append(location.lower())
+        
+        # Condition
+        condition = listing_data.get("condition", "")
+        if condition:
+            parts.append(condition.lower())
+        
+        # Dedupe and clean
+        keywords = list(set(parts))
+        return " ".join(keywords[:50])
+    
+    @classmethod
+    async def check_wallet(cls, user_id: str, required_amount: float = 55.0) -> tuple[bool, float]:
+        """
+        Wallet kontrolü
+        
+        Returns:
+            (has_enough, current_balance)
+        """
+        try:
+            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
+            
+            if not result.data:
+                return False, 0.0
+            
+            balance = float(result.data.get("balance", 0))
+            return balance >= required_amount, balance
+            
+        except Exception as e:
+            logger.error(f"Wallet check error: {e}")
+            return False, 0.0
+    
+    @classmethod
+    async def deduct_credit(cls, user_id: str, amount: float = 55.0) -> bool:
+        """Wallet'tan kredi düş"""
+        try:
+            # Get current balance
+            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
+            
+            if not result.data:
+                return False
+            
+            current = float(result.data.get("balance", 0))
+            new_balance = current - amount
+            
+            if new_balance < 0:
+                return False
+            
+            # Update
+            supabase_client.client.table("wallets").update({"balance": new_balance}).eq("user_id", user_id).execute()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Deduct credit error: {e}")
+            return False
+    
+    @classmethod
+    async def publish(cls, user_id: str, listing_data: Dict[str, Any]) -> tuple[bool, str, Optional[str]]:
+        """
+        İlan yayınla
+        
+        Returns:
+            (success, message, listing_id)
+        """
+        try:
+            # 1. Validate
+            is_valid, missing = cls.validate(listing_data)
+            if not is_valid:
+                return False, f"Eksik alanlar: {', '.join(missing)}", None
+            
+            # 2. Wallet check
+            has_enough, balance = await cls.check_wallet(user_id)
+            if not has_enough:
+                return False, f"💳 Bakiyeniz yetersiz (Mevcut: {balance:.0f} TL). İlan yayınlamak için 55 TL gerekiyor.", None
+            
+            # 3. Deduct credit
+            if not await cls.deduct_credit(user_id):
+                return False, "Kredi düşürülemedi. Lütfen tekrar deneyin.", None
+            
+            # 4. Prepare listing for Supabase
+            listing_id = str(uuid.uuid4())
+            
+            # Generate keywords
+            keywords_text = cls.generate_keywords(listing_data)
+            
+            # Build metadata
+            metadata = listing_data.get("metadata", {})
+            metadata["keywords_text"] = keywords_text
+            
+            # Build final listing object
+            final_listing = {
+                "id": listing_id,
+                "user_id": user_id,
+                "title": listing_data.get("title"),
+                "description": listing_data.get("description"),
+                "category": listing_data.get("category"),
+                "price": float(listing_data.get("price", 0)),
+                "condition": listing_data.get("condition", "2. El"),
+                "location": listing_data.get("location"),
+                "status": "active",
+                "images": listing_data.get("images", []),
+                "image_url": listing_data.get("images", [None])[0] if listing_data.get("images") else None,
+                "metadata": metadata,
+            }
+            
+            # 5. Insert to Supabase
+            result = supabase_client.client.table("listings").insert(final_listing).execute()
+            
+            if not result.data:
+                # Refund credit
+                await cls.deduct_credit(user_id, -55.0)
+                return False, "İlan kaydedilemedi. Lütfen tekrar deneyin.", None
+            
+            return True, "İlan başarıyla yayınlandı!", listing_id
+            
+        except Exception as e:
+            logger.error(f"Publish error: {e}", exc_info=True)
+            return False, f"Yayınlama hatası: {str(e)}", None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -81,27 +299,15 @@ async def save_session(user_id: str, session: Dict[str, Any]):
 @router.post("/message", response_model=MessageResponse)
 async def handle_message(request: MessageRequest) -> MessageResponse:
     """
-    V3 Gateway - Single LLM brain handles everything.
+    V3 Gateway - LLM Brain + FSM Engine
     """
-    logger.info(f"V3 Gateway: user={request.user_id}, msg={request.message[:50]}...")
+    logger.info(f"V3: user={request.user_id}, msg={request.message[:50]}...")
     
     try:
         # 1. Load session
         session = await load_session(request.user_id)
         
-        # 2. Check for cancel command
-        if _is_cancel(request.message):
-            await _handle_cancel(request.user_id, session)
-            return MessageResponse(
-                success=True,
-                text="✅ İşlem iptal edildi. Size nasıl yardımcı olabilirim?",
-                buttons=[
-                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
-                    ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
-                ],
-            )
-        
-        # 3. Call Brain (single LLM)
+        # 2. Call Brain
         brain_output = await brain.process(
             message=request.message,
             current_listing=session.get("listing_data"),
@@ -109,25 +315,31 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             conversation_history=session.get("conversation_history"),
         )
         
-        # 4. Handle Perplexity tool call if requested
-        if brain_output.tool_call and brain_output.tool_call.get("name") == "perplexity":
-            price_result = await _call_perplexity(brain_output.tool_call["query"])
-            if price_result:
-                # Add price to response
-                brain_output.response_text += f"\n\n💰 Piyasa araştırması: **{price_result:,.0f} TL** civarı"
-        
-        # 5. Route based on intent
-        if brain_output.intent == Intent.CREATE:
-            return await _handle_create(request.user_id, session, brain_output)
+        # 3. Handle by intent
+        if brain_output.intent == Intent.CANCEL:
+            # LLM override - reset
+            await clear_session(request.user_id)
+            return MessageResponse(
+                success=True,
+                text=brain_output.response_text,
+                buttons=[
+                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
+                    ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
+                ],
+                metadata={"intent": "CANCEL"},
+            )
         
         elif brain_output.intent == Intent.SEARCH:
-            return await _handle_search(request.user_id, request.message, brain_output)
+            return await _handle_search(request.message)
+        
+        elif brain_output.intent == Intent.CREATE:
+            return await _handle_create(request.user_id, session, brain_output, request.message)
         
         else:  # CHAT
             return await _handle_chat(request.user_id, session, brain_output)
     
     except Exception as e:
-        logger.error(f"V3 Gateway error: {e}", exc_info=True)
+        logger.error(f"V3 error: {e}", exc_info=True)
         return MessageResponse(
             success=False,
             text="⚠️ Bir hata oluştu. Lütfen tekrar deneyin.",
@@ -139,69 +351,102 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
 # INTENT HANDLERS
 # ═══════════════════════════════════════════════════════════════════
 
-async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput) -> MessageResponse:
-    """CREATE intent - İlan oluşturma FSM"""
-    
+async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput, user_message: str) -> MessageResponse:
+    """
+    CREATE intent - LLM'den JSON al, FSM'e gönder
+    """
     # Merge new data with existing
     current = session.get("listing_data", {})
     for key, value in brain_output.listing_data.items():
         if value is not None:
             current[key] = value
     
+    # FSM validates
+    is_valid, missing = FSMEngine.validate(current)
+    
     # Update session
     session["listing_data"] = current
-    session["state"] = "PREVIEW" if brain_output.ready_to_publish else "DRAFTING"
+    session["state"] = "READY" if is_valid else "DRAFTING"
     
-    # Add to conversation history
+    # Add to history
     session.setdefault("conversation_history", []).append({
-        "role": "assistant",
-        "content": brain_output.response_text,
+        "role": "user", "content": user_message
+    })
+    session["conversation_history"].append({
+        "role": "assistant", "content": brain_output.response_text
     })
     
     await save_session(user_id, session)
     
-    # Build buttons
+    # Handle Perplexity tool call
+    response_text = brain_output.response_text
+    if brain_output.tool_call and brain_output.tool_call.get("name") == "perplexity":
+        price_result = await _call_perplexity(brain_output.tool_call["query"])
+        if price_result:
+            response_text += f"\n\n💰 **Piyasa Araştırması:** {price_result:,.0f} TL civarı"
+    
+    # Check if user confirmed
+    if brain_output.user_confirmed and is_valid:
+        # FSM → Publish
+        success, message, listing_id = await FSMEngine.publish(user_id, current)
+        
+        if success:
+            await clear_session(user_id)
+            return MessageResponse(
+                success=True,
+                text=f"🎉 **İlanınız Yayınlandı!**\n\n📋 {current.get('title')}\n💰 {current.get('price', 0):,.0f} TL\n📍 {current.get('location', 'Belirtilmemiş')}\n\n🔗 pazarglobal.com/listing/{listing_id}",
+                buttons=[
+                    ButtonResponse(text="📸 Yeni İlan", payload="yeni ilan vermek istiyorum"),
+                    ButtonResponse(text="📋 İlanlarım", payload="ilanlarım"),
+                ],
+                metadata={"intent": "CREATE", "listing_id": listing_id, "published": True},
+            )
+        else:
+            # Publish failed - return error
+            return MessageResponse(
+                success=False,
+                text=message,
+                listing_preview=current,
+                buttons=[ButtonResponse(text="🔄 Tekrar Dene", payload="yayınla")],
+                metadata={"intent": "CREATE", "error": message},
+            )
+    
+    # Not ready or not confirmed - show preview
     buttons = []
-    if brain_output.ready_to_publish:
+    if is_valid:
         buttons = [
             ButtonResponse(text="✅ Yayınla", payload="yayınla"),
-            ButtonResponse(text="✏️ Düzenle", payload="düzenle"),
+            ButtonResponse(text="✏️ Düzenle", payload="düzenlemek istiyorum"),
+            ButtonResponse(text="❌ İptal", payload="iptal"),
+        ]
+    else:
+        buttons = [
             ButtonResponse(text="❌ İptal", payload="iptal"),
         ]
     
-    # Check for publish command
-    msg_lower = session.get("conversation_history", [{}])[-1].get("content", "").lower() if session.get("conversation_history") else ""
-    if "yayınla" in brain_output.response_text.lower() or brain_output.ready_to_publish:
-        if any(p in msg_lower for p in ["yayınla", "yayinla", "paylaş", "publish"]):
-            return await _publish_listing(user_id, session, current)
-    
     return MessageResponse(
         success=True,
-        text=brain_output.response_text,
+        text=response_text,
+        listing_preview=current,
         buttons=buttons,
-        listing_preview=current if current else None,
         metadata={
             "intent": "CREATE",
             "state": session["state"],
-            "missing_fields": brain_output.missing_fields,
+            "missing_fields": missing,
+            "ready_for_publish": is_valid,
+            "suggestions": brain_output.suggestions,
         },
     )
 
 
-async def _handle_search(user_id: str, query: str, brain_output: BrainOutput) -> MessageResponse:
+async def _handle_search(query: str) -> MessageResponse:
     """SEARCH intent - SearchComposerAgent'a delege et"""
-    
     try:
-        # Use the battle-tested SearchComposerAgent
         from agents.search_agents import SearchComposerAgent
         search_agent = SearchComposerAgent()
-        
-        # Call orchestrate_search (not run)
         result = await search_agent.orchestrate_search(user_message=query)
         
-        # Parse result
         if isinstance(result, dict):
-            # Get message from search agent (already formatted nicely)
             message = result.get("message", "")
             listings = result.get("listings", [])
             
@@ -212,7 +457,6 @@ async def _handle_search(user_id: str, query: str, brain_output: BrainOutput) ->
                     metadata={"intent": "SEARCH", "count": result.get("count", len(listings))},
                 )
             elif listings:
-                # Format results
                 results_text = f"🔍 **{len(listings)} sonuç bulundu:**\n\n"
                 for i, listing in enumerate(listings[:5], 1):
                     title = listing.get("title", "İsimsiz")
@@ -227,32 +471,28 @@ async def _handle_search(user_id: str, query: str, brain_output: BrainOutput) ->
             else:
                 return MessageResponse(
                     success=True,
-                    text=f"🔍 Aramanıza uygun ilan bulunamadı. Farklı kelimelerle deneyin.",
-                    buttons=[
-                        ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
-                    ],
+                    text="🔍 Aramanıza uygun ilan bulunamadı. Farklı kelimelerle deneyin.",
+                    buttons=[ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum")],
                     metadata={"intent": "SEARCH", "count": 0},
                 )
-        else:
-            # Agent returned string
-            return MessageResponse(
-                success=True,
-                text=str(result),
-                metadata={"intent": "SEARCH"},
-            )
+        
+        return MessageResponse(
+            success=True,
+            text=str(result),
+            metadata={"intent": "SEARCH"},
+        )
     
     except Exception as e:
         logger.error(f"Search error: {e}")
         return MessageResponse(
             success=True,
-            text="🔍 Arama yapılırken bir sorun oluştu. Lütfen tekrar deneyin.",
+            text="🔍 Arama yapılırken sorun oluştu. Tekrar deneyin.",
         )
 
 
 async def _handle_chat(user_id: str, session: Dict, brain_output: BrainOutput) -> MessageResponse:
     """CHAT intent - Genel sohbet"""
     
-    # Add to history
     session.setdefault("conversation_history", []).append({
         "role": "assistant",
         "content": brain_output.response_text,
@@ -265,38 +505,18 @@ async def _handle_chat(user_id: str, session: Dict, brain_output: BrainOutput) -
         buttons=[
             ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
             ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
-            ButtonResponse(text="📋 İlanlarım", payload="ilanlarım"),
         ],
         metadata={"intent": "CHAT"},
     )
 
 
 # ═══════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
-def _is_cancel(message: str) -> bool:
-    """Check if message is cancel command"""
-    cancel_words = ["iptal", "vazgeç", "vazgec", "cancel", "sıfırla", "reset"]
-    return message.lower().strip() in cancel_words
-
-
-async def _handle_cancel(user_id: str, session: Dict):
-    """Handle cancel - delete draft and reset session"""
-    draft_id = session.get("draft_id")
-    if draft_id:
-        try:
-            supabase_client.client.table("active_drafts").delete().eq("id", draft_id).execute()
-        except Exception as e:
-            logger.error(f"Failed to delete draft: {e}")
-    
-    await redis_client.delete_session(user_id)
-
-
 async def _call_perplexity(query: str) -> Optional[float]:
-    """Call Perplexity API for price research"""
+    """Perplexity API - fiyat araştırması"""
     try:
-        # Edge function call
         result = await supabase_client.client.functions.invoke(
             "ai-assistant-cached",
             invoke_options={
@@ -315,51 +535,3 @@ async def _call_perplexity(query: str) -> Optional[float]:
         logger.error(f"Perplexity error: {e}")
     
     return None
-
-
-async def _publish_listing(user_id: str, session: Dict, listing_data: Dict) -> MessageResponse:
-    """Publish listing - wallet check + DB insert"""
-    
-    try:
-        # 1. Wallet check
-        wallet = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
-        
-        if not wallet.data or wallet.data.get("balance", 0) < 55:
-            return MessageResponse(
-                success=False,
-                text="💳 Bakiyeniz yetersiz. Kredi yüklemek için pazarglobal.com/wallet adresini ziyaret edin.",
-                listing_preview=listing_data,
-                buttons=[ButtonResponse(text="✏️ Düzenle", payload="düzenle")],
-            )
-        
-        # 2. Deduct credit
-        new_balance = wallet.data["balance"] - 55
-        supabase_client.client.table("wallets").update({"balance": new_balance}).eq("user_id", user_id).execute()
-        
-        # 3. Insert listing
-        listing_data["user_id"] = user_id
-        listing_data["status"] = "active"
-        result = supabase_client.client.table("listings").insert(listing_data).execute()
-        
-        # 4. Clear session
-        await redis_client.delete_session(user_id)
-        
-        listing_id = result.data[0]["id"] if result.data else "unknown"
-        
-        return MessageResponse(
-            success=True,
-            text=f"🎉 İlanınız yayınlandı!\n\n📋 **{listing_data.get('title')}**\n💰 {listing_data.get('price', 0):,.0f} TL\n\n🔗 pazarglobal.com/listing/{listing_id}",
-            buttons=[
-                ButtonResponse(text="📸 Yeni İlan", payload="ilan vermek istiyorum"),
-                ButtonResponse(text="📋 İlanlarım", payload="ilanlarım"),
-            ],
-            metadata={"listing_id": listing_id},
-        )
-    
-    except Exception as e:
-        logger.error(f"Publish error: {e}")
-        return MessageResponse(
-            success=False,
-            text="⚠️ İlan yayınlanırken bir hata oluştu. Lütfen tekrar deneyin.",
-            listing_preview=listing_data,
-        )

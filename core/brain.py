@@ -1,13 +1,20 @@
 """
 PazarGlobal Agent V3 - Single LLM Brain
 
-Tek LLM, tek tool, iki FSM.
-Bu dosya tüm LLM etkileşimlerini yönetir.
+Ana Beyin:
+- Vision Security Guard
+- Serbest konuşma
+- Intent belirleme (CREATE, SEARCH, CHAT)
+- JSON üretme (Supabase listings schema)
+- Override yetkisi: SADECE iptal/reset
+- Tek tool: Perplexity (fiyat önerisi)
+
+FSM Engine JSON'u alır, validate eder, publish eder.
 """
 import json
 import re
 from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from openai import AsyncOpenAI
@@ -22,18 +29,48 @@ class Intent(Enum):
     CREATE = "CREATE"
     SEARCH = "SEARCH"
     CHAT = "CHAT"
+    CANCEL = "CANCEL"  # FSM override - işlemi iptal et
 
 
 @dataclass
 class BrainOutput:
-    """LLM çıktısı - sanitize edilmiş"""
+    """LLM çıktısı"""
     intent: Intent
     response_text: str
     listing_data: Dict[str, Any]
     missing_fields: List[str]
-    ready_to_publish: bool
-    tool_call: Optional[Dict[str, str]]  # {"name": "perplexity", "query": "..."}
-    raw_response: Dict[str, Any]  # Debug için
+    ready_for_fsm: bool  # FSM'e gönderilmeye hazır mı
+    user_confirmed: bool  # Kullanıcı onay verdi mi
+    tool_call: Optional[Dict[str, str]] = None  # {"name": "perplexity", "query": "..."}
+    suggestions: List[str] = field(default_factory=list)  # Başlık/açıklama tavsiyeleri
+    raw_response: Dict[str, Any] = field(default_factory=dict)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SUPABASE LISTINGS SCHEMA - FSM'in beklediği format
+# ═══════════════════════════════════════════════════════════════════
+
+LISTING_SCHEMA = {
+    "title": {"type": "string", "max_length": 200, "required": True},
+    "description": {"type": "string", "max_length": 2000, "required": False},
+    "category": {
+        "type": "enum",
+        "values": ["Elektronik", "Otomotiv", "Emlak", "Mobilya & Dekorasyon", 
+                   "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer"],
+        "required": True
+    },
+    "price": {"type": "number", "min": 1, "max": 100_000_000, "required": True},
+    "condition": {
+        "type": "enum",
+        "values": ["Sıfır", "Az Kullanılmış", "2. El"],
+        "required": False,
+        "default": "2. El"
+    },
+    "location": {"type": "string", "max_length": 100, "required": False},
+    "images": {"type": "array", "required": False},  # FSM zorunlu tutmaz
+}
+
+REQUIRED_FIELDS = ["title", "price", "category"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -41,100 +78,149 @@ class BrainOutput:
 # ═══════════════════════════════════════════════════════════════════
 
 class Guardrails:
-    """LLM çıktısını validate et - asla güvenme, her zaman doğrula"""
+    """LLM çıktısını validate et - deterministik, halüsinasyon yok"""
     
-    ALLOWED_FIELDS = {"title", "description", "price", "category", "condition", "location", "images"}
-    ALLOWED_INTENTS = {"CREATE", "SEARCH", "CHAT"}
     ALLOWED_CATEGORIES = {
-        "Elektronik", "Otomotiv", "Emlak", 
-        "Mobilya & Dekorasyon", "Giyim & Aksesuar", 
-        "Spor & Hobi", "Diğer"
+        "Elektronik", "Otomotiv", "Emlak", "Mobilya & Dekorasyon",
+        "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer"
     }
-    ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "İyi", "Yıpranmış"}
-    REQUIRED_FOR_PUBLISH = {"title", "price", "category"}
+    
+    ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "2. El"}
+    
+    CANCEL_PATTERNS = [
+        r"\b(iptal|vazgeç|vazgec|istemiyorum|bırak|birak|dur|durdur|reset|sıfırla|sifirla)\b",
+        r"^(hayır|yok|olmaz)$"
+    ]
     
     @classmethod
-    def sanitize(cls, llm_response: Dict[str, Any]) -> BrainOutput:
+    def detect_cancel(cls, message: str) -> bool:
+        """Kullanıcı işlemi iptal etmek istiyor mu?"""
+        msg_lower = message.lower().strip()
+        for pattern in cls.CANCEL_PATTERNS:
+            if re.search(pattern, msg_lower):
+                return True
+        return False
+    
+    @classmethod
+    def detect_confirmation(cls, message: str) -> bool:
+        """Kullanıcı onay veriyor mu?"""
+        msg_lower = message.lower().strip()
+        confirm_patterns = [
+            r"\b(yayınla|yayinla|onayla|tamam|evet|olur|yayına al|paylaş|paylas)\b",
+            r"^(evet|ok|olur|tamam)$"
+        ]
+        for pattern in confirm_patterns:
+            if re.search(pattern, msg_lower):
+                return True
+        return False
+    
+    @classmethod
+    def sanitize(cls, llm_response: Dict[str, Any], user_message: str) -> BrainOutput:
         """LLM çıktısını sanitize et"""
+        
+        # Önce iptal kontrolü
+        if cls.detect_cancel(user_message):
+            return BrainOutput(
+                intent=Intent.CANCEL,
+                response_text="✅ İşlem iptal edildi. Yeni bir işlem için hazırım.",
+                listing_data={},
+                missing_fields=[],
+                ready_for_fsm=False,
+                user_confirmed=False,
+                raw_response={"cancelled": True}
+            )
         
         # 1. Intent kontrolü
         intent_str = llm_response.get("intent", "CHAT").upper()
-        if intent_str not in cls.ALLOWED_INTENTS:
-            intent_str = "CHAT"
-        intent = Intent(intent_str)
+        if intent_str == "CANCEL":
+            intent = Intent.CANCEL
+        elif intent_str == "CREATE":
+            intent = Intent.CREATE
+        elif intent_str == "SEARCH":
+            intent = Intent.SEARCH
+        else:
+            intent = Intent.CHAT
         
-        # 2. Listing data kontrolü
+        # 2. Listing data kontrolü - FSM'in beklediği formata uygun
         listing_data = llm_response.get("listing_data") or {}
         sanitized_data = {}
         
-        for field in cls.ALLOWED_FIELDS:
-            if field in listing_data and listing_data[field] is not None:
-                sanitized_data[field] = cls._validate_field(field, listing_data[field])
+        # Title
+        if listing_data.get("title"):
+            sanitized_data["title"] = str(listing_data["title"])[:200]
+        
+        # Description - fazla bilgiler buraya eklenir
+        if listing_data.get("description"):
+            sanitized_data["description"] = str(listing_data["description"])[:2000]
+        
+        # Category - enum kontrolü
+        category = listing_data.get("category")
+        if category in cls.ALLOWED_CATEGORIES:
+            sanitized_data["category"] = category
+        
+        # Price - sayısal kontrol
+        price = listing_data.get("price")
+        if price is not None:
+            try:
+                price_val = float(price)
+                if 1 <= price_val <= 100_000_000:
+                    sanitized_data["price"] = price_val
+            except (ValueError, TypeError):
+                pass
+        
+        # Condition - enum kontrolü
+        condition = listing_data.get("condition")
+        if condition in cls.ALLOWED_CONDITIONS:
+            sanitized_data["condition"] = condition
+        else:
+            sanitized_data["condition"] = "2. El"  # Default
+        
+        # Location
+        if listing_data.get("location"):
+            sanitized_data["location"] = str(listing_data["location"])[:100]
+        
+        # Images
+        images = listing_data.get("images")
+        if isinstance(images, list):
+            sanitized_data["images"] = [str(url)[:500] for url in images[:10] if url]
         
         # 3. Missing fields
         missing = []
-        for field in cls.REQUIRED_FOR_PUBLISH:
-            if field not in sanitized_data or sanitized_data[field] is None:
-                missing.append(field)
+        for field_name in REQUIRED_FIELDS:
+            if field_name not in sanitized_data or sanitized_data[field_name] is None:
+                missing.append(field_name)
         
-        # 4. Ready to publish
-        ready = len(missing) == 0 and intent == Intent.CREATE
+        # 4. Ready for FSM - tüm zorunlu alanlar dolu
+        ready_for_fsm = len(missing) == 0 and intent == Intent.CREATE
         
-        # 5. Tool call validation
+        # 5. User confirmed
+        user_confirmed = cls.detect_confirmation(user_message) and ready_for_fsm
+        
+        # 6. Tool call - sadece perplexity
         tool_call = None
         raw_tool = llm_response.get("tool_call")
         if raw_tool and isinstance(raw_tool, dict):
             if raw_tool.get("name") == "perplexity" and raw_tool.get("query"):
                 tool_call = {"name": "perplexity", "query": str(raw_tool["query"])[:200]}
         
+        # 7. Suggestions
+        suggestions = llm_response.get("suggestions") or []
+        if isinstance(suggestions, list):
+            suggestions = [str(s)[:200] for s in suggestions[:3]]
+        else:
+            suggestions = []
+        
         return BrainOutput(
             intent=intent,
             response_text=str(llm_response.get("response_text", ""))[:2000],
             listing_data=sanitized_data,
             missing_fields=missing,
-            ready_to_publish=ready,
+            ready_for_fsm=ready_for_fsm,
+            user_confirmed=user_confirmed,
             tool_call=tool_call,
+            suggestions=suggestions,
             raw_response=llm_response,
         )
-    
-    @classmethod
-    def _validate_field(cls, field: str, value: Any) -> Any:
-        """Alan bazında validation"""
-        
-        if field == "title":
-            return str(value)[:100] if value else None
-        
-        elif field == "description":
-            return str(value)[:1000] if value else None
-        
-        elif field == "price":
-            try:
-                price = float(value)
-                if 1 <= price <= 100_000_000:
-                    return price
-            except (ValueError, TypeError):
-                pass
-            return None
-        
-        elif field == "category":
-            if value in cls.ALLOWED_CATEGORIES:
-                return value
-            return None
-        
-        elif field == "condition":
-            if value in cls.ALLOWED_CONDITIONS:
-                return value
-            return "İyi"  # Default
-        
-        elif field == "location":
-            return str(value)[:100] if value else None
-        
-        elif field == "images":
-            if isinstance(value, list):
-                return [str(url)[:500] for url in value[:10]]
-            return []
-        
-        return value
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -147,7 +233,6 @@ def sanitize_input(message: str) -> str:
     if not message:
         return ""
     
-    # Max length
     if len(message) > 2000:
         message = message[:2000]
     
@@ -160,82 +245,110 @@ def sanitize_input(message: str) -> str:
         r"<\|.*?\|>",
         r"\[INST\]",
         r"\[/INST\]",
-        r"<<SYS>>",
-        r"<</SYS>>",
     ]
     for pattern in injection_patterns:
         message = re.sub(pattern, "", message, flags=re.IGNORECASE)
-    
-    # Normalize whitespace
-    message = " ".join(message.split())
     
     return message.strip()
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT
+# SYSTEM PROMPT - LLM Brain Talimatları
 # ═══════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """# PazarGlobal İlan Asistanı
+SYSTEM_PROMPT = """# PazarGlobal İlan Asistanı - Ana Beyin
 
-Sen PazarGlobal'ın yapay zeka asistanısın. Görevin kullanıcıların ilan vermesine ve ürün aramasına yardımcı olmak.
+Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir şekilde sohbet edersin ama JSON üretiminde tamamen deterministiksin.
 
-## JSON Schema (DEĞİŞTİRİLEMEZ)
+## GÖREVLER
+
+1. **Vision Security Guard**: Gelen görselleri analiz et. Uygunsuz içerik tespit edersen reddet.
+
+2. **Intent Belirleme**:
+   - CREATE: "satmak istiyorum", "satıyorum", "ilan ver", "satılık"
+   - SEARCH: "var mı", "arıyorum", "bul", "ara"
+   - CHAT: merhaba, teşekkürler, yardım, diğer sohbet
+   - Not: İptal tespiti Guardrails tarafından yapılır
+
+3. **JSON Üretme**: Supabase listings tablosuna uygun JSON üret. ŞEMAYI DEĞİŞTİRME.
+
+4. **Preview Göster**: Her mesajda mevcut ilan durumunu göster:
+   ```
+   📋 İlan Önizleme:
+   ✅ Başlık: Samsung Galaxy S24
+   ✅ Fiyat: 45.000 TL
+   ✅ Kategori: Elektronik
+   ⏳ Açıklama: (eksik)
+   ```
+
+5. **Tavsiye Ver**: Başlık ve açıklama için iyileştirme öner.
+
+6. **Perplexity Tool**: SADECE "kaç para eder", "fiyat öner", "piyasa değeri" sorulduğunda çağır.
+
+## JSON SCHEMA (Supabase listings - DEĞİŞTİRİLEMEZ)
 
 ```json
 {
-  "title": "string (max 100 karakter, zorunlu)",
-  "description": "string (max 1000 karakter, opsiyonel)",
-  "price": "number (1-100000000 TL arası, zorunlu)",
-  "category": "enum: Elektronik|Otomotiv|Emlak|Mobilya & Dekorasyon|Giyim & Aksesuar|Spor & Hobi|Diğer (zorunlu)",
-  "condition": "enum: Sıfır|Az Kullanılmış|İyi|Yıpranmış (default: İyi)",
-  "location": "string (şehir, opsiyonel)",
-  "images": "array of URLs (opsiyonel)"
+  "title": "string, max 200 karakter, ZORUNLU",
+  "description": "string, max 2000 karakter, opsiyonel - ekstra bilgiler buraya",
+  "category": "Elektronik|Otomotiv|Emlak|Mobilya & Dekorasyon|Moda & Aksesuar|Spor & Hobi|Hobi, Koleksiyon & Sanat|Diğer, ZORUNLU",
+  "price": "number, 1-100000000 arası TL, ZORUNLU",
+  "condition": "Sıfır|Az Kullanılmış|2. El, default: 2. El",
+  "location": "string, şehir, opsiyonel",
+  "images": "array of URLs, opsiyonel (FSM resim zorunlu tutmaz)"
 }
 ```
 
-## KURALLAR
+## EKSTRA BİLGİ KURALI
 
-1. **Intent Belirleme**:
-   - CREATE: satmak, satıyorum, ilan vermek, satılık
-   - SEARCH: var mı, arıyorum, bul, ara, mevcut mu
-   - CHAT: merhaba, yardım, teşekkürler, diğer her şey
+Kullanıcı schema dışı bilgi verirse (örn: araba için tramer, km, motor hacmi, vs.) bunları description alanına ekle:
+- "2020 model, 45.000 km, tramersiz" → description: "2020 model araç. 45.000 km'de, tramersiz."
 
-2. **Fotoğraf Analizi**: Görsel geldiğinde ürünü tanı, category belirle, condition tahmin et. Fiyat TAHMİN ETME.
-
-3. **Preview Göster**: Her adımda mevcut listing_data'yı preview olarak göster. ✅ dolu alanlar, ⏳ eksik alanlar.
-
-4. **Perplexity Tool**: SADECE "kaç para eder", "fiyat öner", "piyasa değeri" sorulduğunda çağır.
-
-5. **Ekstra Bilgi**: Schema dışı bilgiler description alanına ekle.
-
-6. **ready_to_publish**: Ancak title + price + category doluysa true.
-
-## OUTPUT FORMAT (HER ZAMAN)
+## OUTPUT FORMAT (HER ZAMAN JSON)
 
 ```json
 {
   "intent": "CREATE|SEARCH|CHAT",
-  "response_text": "Türkçe kullanıcı mesajı",
-  "listing_data": {"title": "...", "price": 0, "category": "...", ...},
-  "missing_fields": ["field1"],
-  "ready_to_publish": false,
+  "response_text": "Türkçe, samimi kullanıcı mesajı",
+  "listing_data": {
+    "title": "...",
+    "description": "...",
+    "category": "...",
+    "price": 0,
+    "condition": "...",
+    "location": "...",
+    "images": []
+  },
+  "suggestions": ["Başlık önerisi: ...", "Açıklama önerisi: ..."],
   "tool_call": null
 }
 ```
 
 ## YASAKLAR
-- Schema dışı alan ekleme
-- Fiyat tahmini yapma
-- Eksik zorunlu alanlarla yayınlamaya izin verme"""
+- Schema'ya olmayan alan ekleme (örn: km, tramer alanı yok - description'a yaz)
+- Fiyat tahmini/uydurma (Perplexity kullan veya kullanıcıya sor)
+- Eksik alanlarla ready_for_fsm: true döndürme"""
 
 
 # ═══════════════════════════════════════════════════════════════════
-# BRAIN - Tek LLM Beyni
+# BRAIN - Ana LLM Beyni
 # ═══════════════════════════════════════════════════════════════════
 
 class Brain:
-    """Tek LLM brain - intent, vision, slot filling hepsi burada"""
+    """
+    Ana Beyin - Tek LLM
+    
+    Görevler:
+    - Vision security guard
+    - Serbest sohbet
+    - Intent belirleme
+    - JSON üretme (deterministik)
+    - Preview sunma
+    - Tavsiye verme
+    
+    Override yetkisi: SADECE iptal (Guardrails tarafından)
+    Tek tool: Perplexity (fiyat önerisi)
+    """
     
     def __init__(self):
         self.client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -250,10 +363,10 @@ class Brain:
         conversation_history: Optional[List[Dict]] = None,
     ) -> BrainOutput:
         """
-        Ana beyin fonksiyonu - her mesajı işle.
+        Ana beyin fonksiyonu.
         
         Args:
-            message: Kullanıcı mesajı (sanitized)
+            message: Kullanıcı mesajı
             current_listing: Mevcut listing_data (session'dan)
             images: Görsel URL'leri
             conversation_history: Geçmiş mesajlar
@@ -264,6 +377,18 @@ class Brain:
         try:
             # Input sanitization
             clean_message = sanitize_input(message)
+            
+            # Önce iptal kontrolü - LLM'e gitmeden
+            if Guardrails.detect_cancel(clean_message):
+                return BrainOutput(
+                    intent=Intent.CANCEL,
+                    response_text="✅ İşlem iptal edildi. Yeni bir işlem başlatmak için hazırım!",
+                    listing_data={},
+                    missing_fields=[],
+                    ready_for_fsm=False,
+                    user_confirmed=False,
+                    raw_response={"cancelled": True}
+                )
             
             # Build messages
             messages = self._build_messages(clean_message, current_listing, images, conversation_history)
@@ -276,8 +401,8 @@ class Brain:
                 model=model,
                 messages=messages,
                 response_format={"type": "json_object"},
-                max_tokens=1000,
-                temperature=0.3,  # Daha deterministik
+                max_tokens=1500,
+                temperature=0.3,  # Deterministik JSON için düşük
             )
             
             # Parse response
@@ -285,9 +410,9 @@ class Brain:
             llm_output = json.loads(content)
             
             # Guardrails - validate and sanitize
-            result = Guardrails.sanitize(llm_output)
+            result = Guardrails.sanitize(llm_output, clean_message)
             
-            logger.info(f"Brain output: intent={result.intent.value}, ready={result.ready_to_publish}, missing={result.missing_fields}")
+            logger.info(f"Brain: intent={result.intent.value}, ready_for_fsm={result.ready_for_fsm}, confirmed={result.user_confirmed}, missing={result.missing_fields}")
             return result
             
         except json.JSONDecodeError as e:
@@ -309,7 +434,7 @@ class Brain:
         
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         
-        # Add conversation history (last 10 messages)
+        # Conversation history (son 10 mesaj)
         if history:
             for msg in history[-10:]:
                 messages.append({
@@ -317,20 +442,25 @@ class Brain:
                     "content": msg.get("content", ""),
                 })
         
-        # Build user message content
+        # User message content
         user_content = []
         
-        # Current listing context
+        # Current listing context - LLM'in mevcut durumu bilmesi için
         if current_listing:
-            context = f"Mevcut ilan durumu: {json.dumps(current_listing, ensure_ascii=False)}\n\n"
+            context = f"""Mevcut ilan verisi (session'dan):
+```json
+{json.dumps(current_listing, ensure_ascii=False, indent=2)}
+```
+
+Bu veriyi koru ve üzerine ekle. Kullanıcı yeni bilgi verirse güncelle."""
             user_content.append({"type": "text", "text": context})
         
         # User message
         user_content.append({"type": "text", "text": f"Kullanıcı: {message}"})
         
-        # Images
+        # Images - Vision analysis
         if images:
-            for img_url in images[:3]:  # Max 3 görsel
+            for img_url in images[:3]:
                 user_content.append({
                     "type": "image_url",
                     "image_url": {"url": img_url, "detail": "low"}
@@ -341,15 +471,15 @@ class Brain:
         return messages
     
     def _fallback_response(self, error: str) -> BrainOutput:
-        """Hata durumunda fallback response"""
+        """Hata durumunda fallback"""
         return BrainOutput(
             intent=Intent.CHAT,
-            response_text="🔄 Bir saniye, tekrar deniyorum... Lütfen mesajınızı yeniden gönderin.",
+            response_text="🔄 Bir sorun oluştu. Lütfen tekrar deneyin.",
             listing_data={},
             missing_fields=[],
-            ready_to_publish=False,
-            tool_call=None,
-            raw_response={"error": error},
+            ready_for_fsm=False,
+            user_confirmed=False,
+            raw_response={"error": error}
         )
 
 
