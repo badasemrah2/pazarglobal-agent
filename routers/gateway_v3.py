@@ -63,28 +63,40 @@ class MessageResponse(BaseModel):
 # SESSION MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════
 
-async def load_session(user_id: str) -> Dict[str, Any]:
-    """Load session from Redis"""
-    session = await redis_client.get_session(user_id) or {}
+def _session_key(user_id: str, channel: str) -> str:
+    """Scope session by channel to avoid WhatsApp/Webchat overlap."""
+    safe_channel = (channel or "webchat").strip().lower()
+    return f"{user_id}:{safe_channel}"
+
+
+async def load_session(user_id: str, channel: str) -> Dict[str, Any]:
+    """Load session from Redis (scoped by channel)"""
+    session_id = _session_key(user_id, channel)
+    session = await redis_client.get_session(session_id) or {}
     return {
         "listing_data": session.get("listing_data", {}),
         "state": session.get("state", "IDLE"),  # IDLE, DRAFTING, READY
         "conversation_history": session.get("conversation_history", []),
+        "last_intent": session.get("last_intent"),
+        "draft_updated_at": session.get("draft_updated_at"),
+        "search_cache": session.get("search_cache", []),
     }
 
 
-async def save_session(user_id: str, session: Dict[str, Any]):
-    """Save session to Redis"""
+async def save_session(user_id: str, channel: str, session: Dict[str, Any]):
+    """Save session to Redis (scoped by channel)"""
+    session_id = _session_key(user_id, channel)
     history = session.get("conversation_history", [])
     if len(history) > 20:
         history = history[-20:]
     session["conversation_history"] = history
-    await redis_client.set_session(user_id, session)
+    await redis_client.set_session(session_id, session)
 
 
-async def clear_session(user_id: str):
-    """Clear session - reset"""
-    await redis_client.delete_session(user_id)
+async def clear_session(user_id: str, channel: str):
+    """Clear session - reset (scoped by channel)"""
+    session_id = _session_key(user_id, channel)
+    await redis_client.delete_session(session_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -304,8 +316,35 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
     logger.info(f"V3: user={request.user_id}, msg={request.message[:50]}...")
     
     try:
-        # 1. Load session
-        session = await load_session(request.user_id)
+        # 1. Load session (channel scoped)
+        session = await load_session(request.user_id, request.channel)
+
+        # 1.1 Draft TTL check (10 minutes)
+        draft_updated_at = session.get("draft_updated_at")
+        if draft_updated_at:
+            try:
+                last_ts = datetime.fromisoformat(draft_updated_at)
+                if (datetime.utcnow() - last_ts).total_seconds() > 600:
+                    session["listing_data"] = {}
+                    session["state"] = "IDLE"
+                    session["draft_updated_at"] = None
+                    session["last_intent"] = None
+                    await save_session(request.user_id, request.channel, session)
+            except Exception:
+                # If parsing fails, reset draft defensively
+                session["listing_data"] = {}
+                session["state"] = "IDLE"
+                session["draft_updated_at"] = None
+                session["last_intent"] = None
+                await save_session(request.user_id, request.channel, session)
+
+        # 1.2 Detail command handling (uses last search cache)
+        detail_match = re.search(r"(\d+)\s*nolu\s*ilan[ıi]?\s*detay", (request.message or "").lower())
+        if detail_match:
+            idx = int(detail_match.group(1)) - 1
+            search_cache = session.get("search_cache") or []
+            if 0 <= idx < len(search_cache):
+                return _format_listing_detail_response(search_cache[idx])
         
         # 2. Calculate context for Brain
         current_listing = session.get("listing_data", {})
@@ -330,7 +369,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         # 4. Handle by intent
         if brain_output.intent == Intent.CANCEL:
             # LLM override - reset
-            await clear_session(request.user_id)
+            await clear_session(request.user_id, request.channel)
             return MessageResponse(
                 success=True,
                 text=brain_output.response_text,
@@ -344,15 +383,15 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         elif brain_output.intent == Intent.SEARCH:
             # Save last intent
             session["last_intent"] = "SEARCH"
-            await save_session(request.user_id, session)
-            return await _handle_search(request.message)
+            await save_session(request.user_id, request.channel, session)
+            return await _handle_search(request.user_id, request.channel, session, request.message)
         
         elif brain_output.intent == Intent.CREATE:
-            return await _handle_create(request.user_id, session, brain_output, request.message)
+            return await _handle_create(request.user_id, request.channel, session, brain_output, request.message)
         
         else:  # CHAT
             session["last_intent"] = "CHAT"
-            return await _handle_chat(request.user_id, session, brain_output)
+            return await _handle_chat(request.user_id, request.channel, session, brain_output)
     
     except Exception as e:
         logger.error(f"V3 error: {e}", exc_info=True)
@@ -367,7 +406,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
 # INTENT HANDLERS
 # ═══════════════════════════════════════════════════════════════════
 
-async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput, user_message: str) -> MessageResponse:
+async def _handle_create(user_id: str, channel: str, session: Dict, brain_output: BrainOutput, user_message: str) -> MessageResponse:
     """
     CREATE intent - LLM'den JSON al, FSM'e gönder
     """
@@ -384,6 +423,7 @@ async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput,
     session["listing_data"] = current
     session["state"] = "READY" if is_valid else "DRAFTING"
     session["last_intent"] = "CREATE"  # Brain'in context için bilmesi lazım
+    session["draft_updated_at"] = datetime.utcnow().isoformat()
     
     # Add to history
     session.setdefault("conversation_history", []).append({
@@ -393,7 +433,7 @@ async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput,
         "role": "assistant", "content": brain_output.response_text
     })
     
-    await save_session(user_id, session)
+    await save_session(user_id, channel, session)
     
     # Handle Perplexity tool call
     response_text = brain_output.response_text
@@ -408,7 +448,7 @@ async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput,
         success, message, listing_id = await FSMEngine.publish(user_id, current)
         
         if success:
-            await clear_session(user_id)
+            await clear_session(user_id, channel)
             return MessageResponse(
                 success=True,
                 text=f"🎉 **İlanınız Yayınlandı!**\n\n📋 {current.get('title')}\n💰 {current.get('price', 0):,.0f} TL\n📍 {current.get('location', 'Belirtilmemiş')}\n\n🔗 pazarglobal.com/listing/{listing_id}",
@@ -456,7 +496,7 @@ async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput,
     )
 
 
-async def _handle_search(query: str) -> MessageResponse:
+async def _handle_search(user_id: str, channel: str, session: Dict, query: str) -> MessageResponse:
     """SEARCH intent - SearchComposerAgent'a delege et"""
     try:
         from agents.search_agents import SearchComposerAgent
@@ -468,12 +508,16 @@ async def _handle_search(query: str) -> MessageResponse:
             listings = result.get("listings", [])
             
             if message:
+                session["search_cache"] = listings or []
+                await save_session(user_id, channel, session)
                 return MessageResponse(
                     success=True,
                     text=message,
                     metadata={"intent": "SEARCH", "count": result.get("count", len(listings))},
                 )
             elif listings:
+                session["search_cache"] = listings
+                await save_session(user_id, channel, session)
                 results_text = f"🔍 **{len(listings)} sonuç bulundu:**\n\n"
                 for i, listing in enumerate(listings[:5], 1):
                     title = listing.get("title", "İsimsiz")
@@ -486,6 +530,8 @@ async def _handle_search(query: str) -> MessageResponse:
                     metadata={"intent": "SEARCH", "count": len(listings)},
                 )
             else:
+                session["search_cache"] = []
+                await save_session(user_id, channel, session)
                 return MessageResponse(
                     success=True,
                     text="🔍 Aramanıza uygun ilan bulunamadı. Farklı kelimelerle deneyin.",
@@ -507,14 +553,14 @@ async def _handle_search(query: str) -> MessageResponse:
         )
 
 
-async def _handle_chat(user_id: str, session: Dict, brain_output: BrainOutput) -> MessageResponse:
+async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: BrainOutput) -> MessageResponse:
     """CHAT intent - Genel sohbet"""
     
     session.setdefault("conversation_history", []).append({
         "role": "assistant",
         "content": brain_output.response_text,
     })
-    await save_session(user_id, session)
+    await save_session(user_id, channel, session)
     
     return MessageResponse(
         success=True,
@@ -530,6 +576,39 @@ async def _handle_chat(user_id: str, session: Dict, brain_output: BrainOutput) -
 # ═══════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
+
+def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageResponse:
+    """Render detail response for a single listing from search cache."""
+    title = listing.get("title") or "İlan"
+    price = listing.get("price")
+    category = listing.get("category") or "Belirtilmedi"
+    description = listing.get("description") or "Açıklama eklenmemiş"
+    condition = listing.get("condition") or "Belirtilmedi"
+    location = listing.get("location") or "Belirtilmedi"
+    image_url = listing.get("image_url")
+    images = listing.get("images") if isinstance(listing.get("images"), list) else []
+    first_image = image_url or (images[0] if images else None)
+
+    lines = [
+        f"📋 **İlan Detayları**",
+        f"✅ Başlık: {title}",
+    ]
+    if price is not None:
+        lines.append(f"✅ Fiyat: {float(price):,.0f} TL")
+    lines.extend([
+        f"✅ Kategori: {category}",
+        f"✅ Açıklama: {description}",
+        f"✅ Durum: {condition}",
+        f"✅ Konum: {location}",
+    ])
+    if first_image:
+        lines.append(f"✅ Görsel: {first_image}")
+
+    return MessageResponse(
+        success=True,
+        text="\n".join(lines),
+        metadata={"intent": "SEARCH", "detail": True},
+    )
 
 async def _call_perplexity(query: str) -> Optional[float]:
     """Perplexity API - fiyat araştırması"""
