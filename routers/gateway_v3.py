@@ -446,29 +446,9 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         fsm_state = session.get("state", "IDLE")
         last_intent = session.get("last_intent")
         
-        # 2.5 DETERMINISTIC PRICE QUERY DETECTION - Before Brain!
-        # Handles: "kaç para eder", "fiyat araştır", "piyasa değeri", "ne kadara satılır"
-        price_query = _detect_price_query(request.message)
-        if price_query:
-            logger.info(f"Price query detected (deterministic): {price_query}")
-            price_result = await _call_perplexity_with_response(price_query)
-            
-            # Save to session
-            session["last_intent"] = "CHAT"
-            session["last_price_query"] = price_query
-            if price_result.get("suggested_price"):
-                session["last_suggested_price"] = price_result["suggested_price"]
-            await save_session(request.user_id, request.channel, session)
-            
-            return MessageResponse(
-                success=True,
-                text=price_result["response"],
-                buttons=[
-                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
-                    ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
-                ],
-                metadata={"intent": "PRICE_RESEARCH", "tool": "perplexity", "price": price_result.get("suggested_price")},
-            )
+        # NOTE: Deterministik price detection kaldırıldı!
+        # Artık Brain (LLM) native function calling ile Perplexity tool'unu çağırıyor.
+        # LLM "kaç para eder" gibi sorguları algılayıp tool_call döndürüyor.
         
         # Pre-calculate missing fields
         _, missing_fields = FSMEngine.validate(current_listing) if current_listing else (False, ["title", "price", "category"])

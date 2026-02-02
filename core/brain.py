@@ -424,6 +424,26 @@ class Brain:
     Tek tool: Perplexity (fiyat önerisi)
     """
     
+    # Perplexity tool definition for OpenAI function calling
+    # Type hint: ChatCompletionToolParam
+    PERPLEXITY_TOOL: dict = {
+        "type": "function",
+        "function": {
+            "name": "perplexity_price_research",
+            "description": "Bir ürünün piyasa fiyatını araştırır. SADECE kullanıcı fiyat öğrenmek istediğinde çağır: 'kaç para eder', 'fiyatı ne kadar', 'piyasa değeri', 'ne kadara satılır' gibi sorularda.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {
+                        "type": "string",
+                        "description": "Fiyatı araştırılacak ürünün adı ve modeli (örn: 'Samsung Galaxy S21', 'iPhone 14 Pro 256GB', 'Golf 7 1.6 TDI')"
+                    }
+                },
+                "required": ["product_name"]
+            }
+        }
+    }
+    
     def __init__(self):
         self.client = AsyncOpenAI(api_key=settings.openai_api_key)
         self.model = settings.openai_model or "gpt-4o"
@@ -487,12 +507,14 @@ class Brain:
             
             logger.debug(f"Brain calling LLM: model={model}, message={clean_message[:100]}, fsm_state={fsm_state}")
             
-            # Call LLM with timeout
+            # Call LLM with timeout and native function calling
             try:
                 response = await asyncio.wait_for(
                     self.client.chat.completions.create(
                         model=model,
                         messages=messages,
+                        tools=cast(Any, [self.PERPLEXITY_TOOL]),  # Native function calling!
+                        tool_choice="auto",  # LLM decides when to call
                         response_format={"type": "json_object"},
                         max_tokens=1500,
                         temperature=0.3,  # Deterministik JSON için düşük
@@ -503,8 +525,32 @@ class Brain:
                 logger.error("Brain LLM call timed out after 30s")
                 return self._fallback_response("LLM timeout - tekrar deneyin")
             
-            # Parse response
-            content = response.choices[0].message.content
+            # Check if LLM wants to call a tool
+            choice = response.choices[0]
+            if choice.message.tool_calls:
+                tool_call = choice.message.tool_calls[0]
+                # Access function info safely
+                func_name = getattr(tool_call, 'function', None)
+                if func_name and hasattr(func_name, 'name') and func_name.name == "perplexity_price_research":
+                    import json as json_module
+                    args = json_module.loads(func_name.arguments)
+                    product_name = args.get("product_name", clean_message)
+                    logger.info(f"Brain requested Perplexity tool for: {product_name}")
+                    
+                    # Return special output indicating tool call needed
+                    return BrainOutput(
+                        intent=Intent.CHAT,
+                        response_text="🔍 Fiyat araştırması yapıyorum...",
+                        listing_data={},
+                        missing_fields=[],
+                        ready_for_fsm=False,
+                        user_confirmed=False,
+                        raw_response={"tool_requested": True},
+                        tool_call={"name": "perplexity", "query": product_name}
+                    )
+            
+            # Parse regular response
+            content = choice.message.content
             logger.debug(f"Brain LLM response: {content[:500] if content else 'EMPTY'}")
             if not content:
                 raise ValueError("LLM response is empty")
