@@ -24,6 +24,7 @@ import re
 import uuid
 from datetime import datetime
 
+from config.settings import settings
 from core.brain import brain, BrainOutput, Intent
 from services.redis_client import redis_client
 from services.supabase_client import supabase_client
