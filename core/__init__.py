@@ -1,16 +1,11 @@
 """
-Core module - State Machine, Slot Filler, Intent Classifier
+Core module - V3 Single LLM Brain Architecture
 """
-from .state_machine import ListingState, StateMachine
-from .intent_classifier import IntentClassifier, Intent
-from .slot_filler import SlotFiller
-from .response_builder import ResponseBuilder
+from .brain import brain, Brain, BrainOutput, Intent
 
 __all__ = [
-    "ListingState",
-    "StateMachine",
-    "IntentClassifier",
+    "brain",
+    "Brain",
+    "BrainOutput",
     "Intent",
-    "SlotFiller",
-    "ResponseBuilder",
 ]

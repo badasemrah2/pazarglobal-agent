@@ -1,7 +1,6 @@
 """
-Routers module - API endpoints
+Routers module - V3 API endpoints
 """
+from .gateway_v3 import router as gateway_v3_router
 
-from routers.gateway import router as gateway_router
-
-__all__ = ["gateway_router"]
+__all__ = ["gateway_v3_router"]

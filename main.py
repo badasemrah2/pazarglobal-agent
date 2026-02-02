@@ -9,8 +9,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from config import settings
-from api import whatsapp, webchat
-from routers import gateway_router
 from routers.gateway_v3 import router as gateway_v3_router
 from services.logger import get_logger
 from services.monitoring import monitoring_router
@@ -38,57 +36,39 @@ app.add_middleware(
 
 
 # Include routers
-app.include_router(gateway_v3_router)  # NEW v3 - Single LLM Brain (recommended)
-app.include_router(gateway_router)  # v2 gateway (legacy)
-app.include_router(whatsapp.router)  # Legacy whatsapp (for bridge compatibility)
-app.include_router(webchat.router)  # Legacy webchat (for frontend compatibility)
+app.include_router(gateway_v3_router)  # V3 - Single LLM Brain
 app.include_router(monitoring_router)
 
 
 @app.post("/agent/run")
 async def agent_run(request: Request):
     """
-    Unified agent endpoint for Edge Function traffic
-    Routes WhatsApp and WebChat requests to appropriate handlers
-    
-    Expected payload from Edge Function:
-    {
-        "user_id": str,
-        "phone": str,
-        "message": str,
-        "conversation_history": List[dict],
-        "media_paths": List[str] (optional),
-        "media_type": str (optional),
-        "draft_listing_id": str (optional),
-        "session_token": str (optional),
-        "user_context": dict (optional)
-    }
+    Unified agent endpoint for Edge Function traffic (WhatsApp bridge)
+    Now routes to V3 gateway
     """
     try:
         data = await request.json()
-        logger.info(f"🎯 /agent/run called - user_id: {data.get('user_id')}, message: {data.get('message')[:50]}")
+        logger.info(f"🎯 /agent/run called - user_id: {data.get('user_id')}, message: {data.get('message', '')[:50]}")
         
-        # Import process function from webchat
-        from api.webchat import process_webchat_message
+        # Import V3 handler
+        from routers.gateway_v3 import handle_message, MessageRequest
         
-        # Convert Edge Function format to webchat format
-        user_id = data.get("user_id")
-        session_id = data.get("session_token") or data.get("phone") or user_id
-
-        result = await process_webchat_message(
-            message_body=data.get("message", ""),
-            session_id=session_id,
-            user_id=user_id,
-            media_url=data.get("media_paths", [None])[0] if data.get("media_paths") else None,
-            media_urls=data.get("media_paths")
+        # Convert Edge Function format to V3 format
+        v3_request = MessageRequest(
+            user_id=data.get("user_id") or data.get("phone") or "unknown",
+            message=data.get("message", ""),
+            media_urls=data.get("media_paths"),
+            channel="whatsapp"
         )
+        
+        result = await handle_message(v3_request)
         
         # Return in format Edge Function expects
         return {
-            "success": result.get("success", True),
-            "response": result.get("message", ""),
-            "intent": result.get("intent"),
-            "data": result.get("data")
+            "success": result.success,
+            "response": result.text,
+            "intent": result.metadata.get("intent") if result.metadata else None,
+            "data": result.listing_preview
         }
         
     except Exception as e:
@@ -104,17 +84,12 @@ async def root():
     """Root endpoint"""
     return {
         "service": "PazarGlobal Agent API",
-        "version": "2.0.2",
+        "version": "3.0.0",
         "status": "active",
         "endpoints": {
-            # v2 API (recommended)
-            "message": "/api/v1/message",
-            "media_analyze": "/api/v1/media/analyze",
-            "health": "/api/v1/health",
-            # Legacy (for compatibility)
-            "whatsapp": "/whatsapp/webhook",
-            "webchat": "/webchat/message",
-            "websocket": "/webchat/ws/{session_id}",
+            "v3_message": "/api/v3/message",
+            "agent_run": "/agent/run",
+            "health": "/health",
             "docs": "/docs"
         }
     }
