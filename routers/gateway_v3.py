@@ -225,7 +225,8 @@ class FSMEngine:
         try:
             logger.info(f"Checking wallet for user_id: {user_id}")
             # Use .limit(1) instead of .single() to avoid exception when no row found
-            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).limit(1).execute()
+            # Column name is balance_bigint (not balance) in actual Supabase table
+            result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
             
             if not result.data or len(result.data) == 0:
                 logger.warning(f"No wallet found for user_id: {user_id}, creating one with 0 balance")
@@ -235,14 +236,14 @@ class FSMEngine:
                 try:
                     supabase_client.client.table("wallets").insert({
                         "user_id": user_id,
-                        "balance": 0
+                        "balance_bigint": 0
                     }).execute()
                     logger.info(f"Created wallet with 0 balance for {user_id}")
                 except Exception as create_err:
                     logger.error(f"Failed to create wallet: {create_err}")
                 return False, 0.0
             
-            balance = float(result.data[0].get("balance", 0))
+            balance = float(result.data[0].get("balance_bigint", 0))
             logger.info(f"Wallet balance for {user_id}: {balance} TL (required: {required_amount})")
             return balance >= required_amount, balance
             
@@ -256,13 +257,14 @@ class FSMEngine:
         try:
             logger.info(f"Deducting {amount} TL from user_id: {user_id}")
             # Get current balance - use .limit(1) instead of .single() to avoid exception
-            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).limit(1).execute()
+            # Column name is balance_bigint (not balance) in actual Supabase table
+            result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
             
             if not result.data or len(result.data) == 0:
                 logger.error(f"No wallet found for deduction: {user_id}")
                 return False
             
-            current = float(result.data[0].get("balance", 0))
+            current = float(result.data[0].get("balance_bigint", 0))
             new_balance = current - amount
             
             if new_balance < 0:
@@ -270,7 +272,7 @@ class FSMEngine:
                 return False
             
             # Update
-            supabase_client.client.table("wallets").update({"balance": new_balance}).eq("user_id", user_id).execute()
+            supabase_client.client.table("wallets").update({"balance_bigint": int(new_balance)}).eq("user_id", user_id).execute()
             logger.info(f"Deducted {amount} TL from {user_id}. New balance: {new_balance}")
             return True
             
