@@ -11,13 +11,15 @@ Ana Beyin:
 
 FSM Engine JSON'u alır, validate eder, publish eder.
 """
+import asyncio
 import json
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, cast
 from dataclasses import dataclass, field
 from enum import Enum
 
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 from services.logger import get_logger
 from config import settings
@@ -411,17 +413,29 @@ class Brain:
             # Choose model
             model = self.vision_model if images else self.model
             
-            # Call LLM
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                max_tokens=1500,
-                temperature=0.3,  # Deterministik JSON için düşük
-            )
+            logger.debug(f"Brain calling LLM: model={model}, message={clean_message[:100]}, fsm_state={fsm_state}")
+            
+            # Call LLM with timeout
+            try:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        response_format={"type": "json_object"},
+                        max_tokens=1500,
+                        temperature=0.3,  # Deterministik JSON için düşük
+                    ),
+                    timeout=30.0  # 30 second timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error("Brain LLM call timed out after 30s")
+                return self._fallback_response("LLM timeout - tekrar deneyin")
             
             # Parse response
             content = response.choices[0].message.content
+            logger.debug(f"Brain LLM response: {content[:500] if content else 'EMPTY'}")
+            if not content:
+                raise ValueError("LLM response is empty")
             llm_output = json.loads(content)
             
             # Guardrails - validate and sanitize
@@ -431,12 +445,18 @@ class Brain:
             return result
             
         except json.JSONDecodeError as e:
-            logger.error(f"LLM JSON parse error: {e}")
-            return self._fallback_response("JSON parse hatası")
+            logger.error(f"LLM JSON parse error: {e}, raw content may be malformed")
+            return self._fallback_response("JSON parse hatası - LLM geçersiz yanıt döndü")
         
         except Exception as e:
-            logger.error(f"Brain error: {e}", exc_info=True)
-            return self._fallback_response(str(e))
+            error_type = type(e).__name__
+            logger.error(f"Brain error ({error_type}): {e}", exc_info=True)
+            # More helpful error message for debugging
+            if "rate_limit" in str(e).lower():
+                return self._fallback_response("API rate limit - biraz bekleyin")
+            elif "timeout" in str(e).lower():
+                return self._fallback_response("API timeout - tekrar deneyin")
+            return self._fallback_response(f"Sistem hatası: {error_type}")
     
     def _build_context(
         self,
@@ -506,21 +526,28 @@ class Brain:
         context: str,
         images: Optional[List[str]],
         history: Optional[List[Dict]],
-    ) -> List[Dict]:
+    ) -> List[ChatCompletionMessageParam]:
         """LLM mesajlarını oluştur"""
-        
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        messages: List[ChatCompletionMessageParam] = [
+            cast(ChatCompletionMessageParam, {"role": "system", "content": SYSTEM_PROMPT})
+        ]
         
         # Conversation history (son 10 mesaj)
         if history:
             for msg in history[-10:]:
-                messages.append({
-                    "role": msg.get("role", "user"),
-                    "content": msg.get("content", ""),
-                })
+                messages.append(
+                    cast(
+                        ChatCompletionMessageParam,
+                        {
+                            "role": msg.get("role", "user"),
+                            "content": msg.get("content", ""),
+                        },
+                    )
+                )
         
         # User message content
-        user_content = []
+        user_content: List[Dict[str, Any]] = []
         
         # Zengin context
         user_content.append({"type": "text", "text": context})
@@ -537,11 +564,11 @@ class Brain:
                     "image_url": {"url": img_url, "detail": "low"}
                 })
         
-        messages.append({"role": "user", "content": user_content})
-        
-        return messages
-        
-        return messages
+        messages.append(
+            cast(ChatCompletionMessageParam, {"role": "user", "content": user_content})
+        )
+
+        return cast(List[ChatCompletionMessageParam], messages)
     
     def _fallback_response(self, error: str) -> BrainOutput:
         """Hata durumunda fallback"""
