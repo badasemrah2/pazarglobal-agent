@@ -952,47 +952,85 @@ async def _call_perplexity(query: str) -> Optional[float]:
 
 
 async def _call_perplexity_with_response(query: str) -> Dict[str, Any]:
-    """Perplexity API - fiyat araştırması ile detaylı cevap via Supabase Edge Function"""
+    """Perplexity API - doğrudan fiyat araştırması (Edge Function bypass)"""
     import httpx
+    import json as json_module
     
     try:
-        logger.info(f"Calling Perplexity for price research: {query}")
+        logger.info(f"Calling Perplexity API directly for: {query}")
         
-        # Call Supabase Edge Function directly with httpx
-        supabase_url = settings.supabase_url.rstrip("/")
-        edge_function_url = f"{supabase_url}/functions/v1/ai-assistant-cached"
+        # Check if API key is configured
+        if not settings.perplexity_api_key:
+            logger.error("PERPLEXITY_API_KEY not configured")
+            return {
+                "suggested_price": None,
+                "response": f"🔍 Fiyat araştırması yapılandırılmamış.\n\n**{query}** için ilan vermek ister misiniz?",
+            }
         
+        # Build Perplexity prompt for Turkish market price research
+        prompt = f"""Türkiye'de "{query}" ürününün 2. el piyasa fiyatını araştır.
+
+Sadece aşağıdaki JSON formatında yanıt ver, başka bir şey yazma:
+{{
+  "suggested_price": <sayı - TL cinsinden ortalama fiyat>,
+  "min_price": <sayı - minimum fiyat>,
+  "max_price": <sayı - maksimum fiyat>,
+  "reasoning": "<kısa açıklama - max 100 karakter>"
+}}
+
+Eğer fiyat bulamazsan: {{"suggested_price": null, "reasoning": "Fiyat bilgisi bulunamadı"}}"""
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                edge_function_url,
+                "https://api.perplexity.ai/chat/completions",
                 json={
-                    "action": "suggest_price",
-                    "title": query,
-                    "category": "Genel",
-                    "condition": "İyi",
+                    "model": "llama-3.1-sonar-small-128k-online",
+                    "messages": [
+                        {"role": "system", "content": "Sen Türkiye'deki 2. el ürün fiyatları konusunda uzman bir asistansın. Sadece JSON formatında yanıt ver."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 300,
                 },
                 headers={
-                    "Authorization": f"Bearer {settings.supabase_key}",
+                    "Authorization": f"Bearer {settings.perplexity_api_key}",
                     "Content-Type": "application/json",
                 }
             )
             
             if response.status_code != 200:
-                logger.error(f"Edge function returned {response.status_code}: {response.text}")
-                raise Exception(f"Edge function error: {response.status_code}")
+                logger.error(f"Perplexity API returned {response.status_code}: {response.text}")
+                raise Exception(f"Perplexity API error: {response.status_code}")
             
             result = response.json()
         
-        # Parse result - could be {"data": {...}} or direct response
-        data = result.get("data", result) if isinstance(result, dict) else {}
+        # Extract content from Perplexity response
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        logger.debug(f"Perplexity raw response: {content}")
+        
+        # Parse JSON from response (handle markdown code blocks)
+        json_str = content
+        if "```json" in content:
+            json_str = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            json_str = content.split("```")[1].split("```")[0].strip()
+        
+        try:
+            data = json_module.loads(json_str)
+        except json_module.JSONDecodeError:
+            # Try to extract just the price if JSON parse fails
+            logger.warning(f"Could not parse Perplexity JSON: {content}")
+            data = {"suggested_price": None, "reasoning": "Fiyat bilgisi alınamadı"}
+        
         suggested_price = data.get("suggested_price")
-        price_range = data.get("price_range", {})
+        min_price = data.get("min_price")
+        max_price = data.get("max_price")
         reasoning = data.get("reasoning", "")
         
         if suggested_price:
             price_float = float(suggested_price)
-            min_price = price_range.get("min", price_float * 0.8)
-            max_price = price_range.get("max", price_float * 1.2)
+            min_price = float(min_price) if min_price else price_float * 0.8
+            max_price = float(max_price) if max_price else price_float * 1.2
             
             response_text = f"""🔍 **{query}** için fiyat araştırması:
 

@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     twilio_auth_token: Optional[str] = None
     twilio_whatsapp_number: Optional[str] = None
     
+    # Perplexity API Configuration
+    perplexity_api_key: Optional[str] = None
+    
     # API Configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000
