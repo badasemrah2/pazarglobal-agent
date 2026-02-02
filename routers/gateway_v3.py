@@ -205,9 +205,10 @@ class FSMEngine:
         """
         try:
             logger.info(f"Checking wallet for user_id: {user_id}")
-            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
+            # Use .limit(1) instead of .single() to avoid exception when no row found
+            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).limit(1).execute()
             
-            if not result.data:
+            if not result.data or len(result.data) == 0:
                 logger.warning(f"No wallet found for user_id: {user_id}, creating one with 0 balance")
                 # Auto-create wallet with 0 balance
                 try:
@@ -215,11 +216,12 @@ class FSMEngine:
                         "user_id": user_id,
                         "balance": 0
                     }).execute()
+                    logger.info(f"Created wallet with 0 balance for {user_id}")
                 except Exception as create_err:
                     logger.error(f"Failed to create wallet: {create_err}")
                 return False, 0.0
             
-            balance = float(result.data.get("balance", 0))
+            balance = float(result.data[0].get("balance", 0))
             logger.info(f"Wallet balance for {user_id}: {balance} TL (required: {required_amount})")
             return balance >= required_amount, balance
             
@@ -232,14 +234,14 @@ class FSMEngine:
         """Wallet'tan kredi düş"""
         try:
             logger.info(f"Deducting {amount} TL from user_id: {user_id}")
-            # Get current balance
-            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).single().execute()
+            # Get current balance - use .limit(1) instead of .single() to avoid exception
+            result = supabase_client.client.table("wallets").select("balance").eq("user_id", user_id).limit(1).execute()
             
-            if not result.data:
+            if not result.data or len(result.data) == 0:
                 logger.error(f"No wallet found for deduction: {user_id}")
                 return False
             
-            current = float(result.data.get("balance", 0))
+            current = float(result.data[0].get("balance", 0))
             new_balance = current - amount
             
             if new_balance < 0:
