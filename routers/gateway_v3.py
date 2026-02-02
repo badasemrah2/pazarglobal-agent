@@ -347,6 +347,22 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             if 0 <= idx < len(search_cache):
                 return await _format_listing_detail_response(search_cache[idx])
         
+        # 1.3 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
+        preview_keywords = ["son hal", "önizleme", "preview", "göster bana", "goster bana"]
+        if any(kw in lower_msg for kw in preview_keywords) and session.get("listing_data"):
+            current_listing = session.get("listing_data", {})
+            if current_listing.get("title"):  # At least title exists
+                preview = _format_preview(current_listing)
+                return MessageResponse(
+                    success=True,
+                    text=f"{preview}\n\nİlanı yayınlamak için 'yayınla' yazabilirsiniz.",
+                    buttons=[
+                        ButtonResponse(text="✅ Yayınla", payload="yayınla"),
+                        ButtonResponse(text="✏️ Düzenle", payload="düzenleme yapmak istiyorum"),
+                    ],
+                    metadata={"intent": "PREVIEW"},
+                )
+        
         # 2. Calculate context for Brain
         current_listing = session.get("listing_data", {})
         fsm_state = session.get("state", "IDLE")
@@ -577,6 +593,56 @@ async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: 
 # ═══════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
+
+def _format_preview(listing: Dict[str, Any]) -> str:
+    """Format current draft as preview text."""
+    lines = ["📋 İlan Önizleme:"]
+    
+    title = listing.get("title")
+    price = listing.get("price")
+    category = listing.get("category")
+    description = listing.get("description")
+    condition = listing.get("condition")
+    location = listing.get("location")
+    images = listing.get("images") or []
+    
+    # Show fields with checkmarks for filled, hourglass for missing
+    if title:
+        lines.append(f"✅ Başlık: {title}")
+    else:
+        lines.append("⏳ Başlık: (eksik)")
+    
+    if price:
+        lines.append(f"✅ Fiyat: {price:,.0f} TL".replace(",", "."))
+    else:
+        lines.append("⏳ Fiyat: (eksik)")
+    
+    if category:
+        lines.append(f"✅ Kategori: {category}")
+    else:
+        lines.append("⏳ Kategori: (eksik)")
+    
+    if description:
+        lines.append(f"✅ Açıklama: {description[:100]}{'...' if len(description) > 100 else ''}")
+    else:
+        lines.append("⏳ Açıklama: (opsiyonel)")
+    
+    if condition:
+        lines.append(f"✅ Durum: {condition}")
+    else:
+        lines.append("⏳ Durum: (varsayılan: 2. El)")
+    
+    if location:
+        lines.append(f"✅ Konum: {location}")
+    else:
+        lines.append("⏳ Konum: (opsiyonel)")
+    
+    if images:
+        lines.append(f"✅ Fotoğraf: {len(images)} adet")
+    else:
+        lines.append("⏳ Fotoğraf: (opsiyonel)")
+    
+    return "\n".join(lines)
 
 async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageResponse:
     """Format listing detail like WhatsApp card style.
