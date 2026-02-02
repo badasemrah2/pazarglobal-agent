@@ -107,11 +107,35 @@ class Guardrails:
     def detect_confirmation(cls, message: str) -> bool:
         """Kullanıcı onay veriyor mu?"""
         msg_lower = message.lower().strip()
+        
+        # Negative patterns - bunlar onay DEĞİL
+        negative_patterns = [
+            r"bekliyorum",
+            r"bekle",
+            r"düşün",
+            r"bakarım",
+            r"sonra",
+            r"değil",
+            r"hayır",
+            r"iptal",
+        ]
+        for pattern in negative_patterns:
+            if re.search(pattern, msg_lower):
+                return False
+        
+        # Positive patterns - bunlar onay
         confirm_patterns = [
-            r"\b(yayınla|yayinla|onayla|onaylıyorum|onayliyorum|tamam|evet|olur|yayına al|paylaş|paylas)\b",
-            r"^(evet|ok|olur|tamam|onayla|onaylıyorum)$",
+            r"^(yayınla|yayinla|onayla|onaylıyorum|onayliyorum|evet|olur)$",  # Tek kelime
+            r"\byayınla\b",
+            r"\byayinla\b",
+            r"\bonaylıyorum\b",
+            r"\bonayliyorum\b",
+            r"\bonayla\b",
+            r"^tamam$",  # Sadece "tamam" tek başına
+            r"^evet$",
+            r"^olur$",
+            r"yayına al",
             r"onay.*ver",
-            r"yayın.*al",
         ]
         for pattern in confirm_patterns:
             if re.search(pattern, msg_lower):

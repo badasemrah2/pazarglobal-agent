@@ -88,11 +88,49 @@ async def root():
         "status": "active",
         "endpoints": {
             "v3_message": "/api/v3/message",
+            "webchat_media_analyze": "/webchat/media/analyze",
             "agent_run": "/agent/run",
             "health": "/health",
             "docs": "/docs"
         }
     }
+
+
+@app.post("/webchat/media/analyze")
+async def webchat_media_analyze(request: Request):
+    """
+    Legacy webchat media analyze endpoint.
+    Routes to V3 gateway media analyze.
+    """
+    try:
+        data = await request.json()
+        logger.info(f"📷 /webchat/media/analyze - user_id: {data.get('user_id')}, urls: {len(data.get('media_urls', []))}")
+        
+        from routers.gateway_v3 import analyze_media, MediaAnalyzeRequest
+        
+        v3_request = MediaAnalyzeRequest(
+            session_id=data.get("session_id", data.get("user_id", "")),
+            user_id=data.get("user_id", ""),
+            phone_number=data.get("phone_number"),
+            media_urls=data.get("media_urls", [])
+        )
+        
+        result = await analyze_media(v3_request)
+        
+        return {
+            "success": result.success,
+            "message": result.message,
+            "response": result.message,  # Alias for frontend compatibility
+            "data": result.data
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ /webchat/media/analyze error: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"Görsel analiz hatası: {str(e)}",
+            "response": f"Görsel analiz hatası: {str(e)}"
+        }
 
 
 @app.get("/health")

@@ -305,13 +305,24 @@ class FSMEngine:
             }
             
             # 5. Insert to Supabase
-            result = supabase_client.client.table("listings").insert(final_listing).execute()
+            logger.info(f"Inserting listing to Supabase: {listing_id}")
+            logger.debug(f"Listing data: {final_listing}")
+            
+            try:
+                result = supabase_client.client.table("listings").insert(final_listing).execute()
+            except Exception as insert_err:
+                logger.error(f"Supabase insert exception: {insert_err}", exc_info=True)
+                # Refund credit
+                await cls.deduct_credit(user_id, -55.0)
+                return False, f"İlan kaydedilemedi: {str(insert_err)}", None
             
             if not result.data:
+                logger.error(f"Supabase insert returned no data. Result: {result}")
                 # Refund credit
                 await cls.deduct_credit(user_id, -55.0)
                 return False, "İlan kaydedilemedi. Lütfen tekrar deneyin.", None
             
+            logger.info(f"Listing published successfully: {listing_id}")
             return True, "İlan başarıyla yayınlandı!", listing_id
             
         except Exception as e:
@@ -793,3 +804,146 @@ async def _call_perplexity(query: str) -> Optional[float]:
         logger.error(f"Perplexity error: {e}")
     
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MEDIA ANALYZE ENDPOINT (for webchat image upload)
+# ═══════════════════════════════════════════════════════════════════
+
+class MediaAnalyzeRequest(BaseModel):
+    session_id: str = Field(..., description="Session ID (usually user_id)")
+    user_id: str = Field(..., description="User ID")
+    phone_number: Optional[str] = Field(default=None)
+    media_urls: List[str] = Field(default=[])
+
+
+class MediaAnalyzeResponse(BaseModel):
+    success: bool = True
+    message: str = ""
+    data: Optional[Dict[str, Any]] = None
+
+
+@router.post("/webchat/media/analyze", response_model=MediaAnalyzeResponse)
+async def analyze_media(request: MediaAnalyzeRequest) -> MediaAnalyzeResponse:
+    """
+    Analyze uploaded media for product information.
+    
+    Flow:
+    1. Check safety (content moderation)
+    2. Analyze product (GPT-4 Vision)
+    3. Save images to session/draft
+    4. Return description of what AI sees
+    """
+    logger.info(f"Media analyze: user={request.user_id}, urls={len(request.media_urls)}")
+    
+    if not request.media_urls:
+        return MediaAnalyzeResponse(
+            success=False,
+            message="Görsel bulunamadı. Lütfen bir görsel yükleyin.",
+        )
+    
+    try:
+        from services.vision_service import vision_service
+        
+        # Process each image
+        all_descriptions = []
+        analyzed_products = []
+        blocked_images = []
+        
+        for i, url in enumerate(request.media_urls[:5]):  # Max 5 images
+            logger.info(f"Analyzing image {i+1}: {url[:100]}...")
+            
+            # 1. Safety check
+            safety = await vision_service.check_safety(url)
+            if not safety.get("safe", True):
+                blocked_images.append({
+                    "index": i,
+                    "reason": ", ".join(safety.get("flagged_categories", ["policy"]))
+                })
+                continue
+            
+            # 2. Product analysis
+            analysis = await vision_service.analyze_product(url)
+            
+            if analysis.get("error"):
+                logger.warning(f"Analysis error for image {i+1}: {analysis.get('error')}")
+                all_descriptions.append(f"Görsel {i+1}: Analiz edilemedi.")
+                continue
+            
+            # Build description
+            parts = []
+            if analysis.get("product"):
+                parts.append(f"**Ürün:** {analysis['product']}")
+            if analysis.get("brand"):
+                parts.append(f"**Marka:** {analysis['brand']}")
+            if analysis.get("category"):
+                parts.append(f"**Kategori:** {analysis['category']}")
+            if analysis.get("condition"):
+                parts.append(f"**Durum:** {analysis['condition']}")
+            if analysis.get("color"):
+                parts.append(f"**Renk:** {analysis['color']}")
+            
+            if parts:
+                desc = f"📷 Görsel {i+1}:\n" + "\n".join(parts)
+                all_descriptions.append(desc)
+                analyzed_products.append(analysis)
+            else:
+                all_descriptions.append(f"Görsel {i+1}: Ürün tanınamadı.")
+        
+        # 3. Save to session
+        session = await load_session(request.user_id, "webchat")
+        
+        # Add images to listing_data
+        listing_data = session.get("listing_data", {})
+        existing_images = listing_data.get("images", [])
+        
+        # Add new images (avoid duplicates)
+        for url in request.media_urls:
+            if url not in existing_images:
+                existing_images.append(url)
+        
+        listing_data["images"] = existing_images[:5]  # Max 5 images
+        
+        # Pre-fill from first analysis if no data yet
+        if analyzed_products and not listing_data.get("title"):
+            first = analyzed_products[0]
+            if first.get("product"):
+                listing_data["title"] = first["product"]
+            if first.get("category"):
+                listing_data["category"] = first["category"]
+            if first.get("condition"):
+                listing_data["condition"] = first["condition"]
+        
+        session["listing_data"] = listing_data
+        session["state"] = "DRAFTING"
+        session["draft_updated_at"] = datetime.utcnow().isoformat()
+        await save_session(request.user_id, "webchat", session)
+        
+        # 4. Build response message
+        if blocked_images:
+            block_msg = f"⚠️ {len(blocked_images)} görsel içerik politikası nedeniyle engellendi.\n\n"
+        else:
+            block_msg = ""
+        
+        if all_descriptions:
+            analysis_msg = "\n\n".join(all_descriptions)
+            response_msg = f"{block_msg}📸 Yüklenen görseller analiz edildi:\n\n{analysis_msg}\n\n💡 İlan oluşturmak için fiyat ve açıklama ekleyin."
+        else:
+            response_msg = f"{block_msg}Görseller yüklendi ancak ürün tanınamadı. Lütfen başlık ve fiyat bilgisi verin."
+        
+        return MediaAnalyzeResponse(
+            success=True,
+            message=response_msg,
+            data={
+                "analyzed_products": analyzed_products,
+                "image_count": len(existing_images),
+                "listing_preview": listing_data if listing_data.get("title") else None,
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Media analyze error: {e}", exc_info=True)
+        return MediaAnalyzeResponse(
+            success=False,
+            message=f"Görsel analiz hatası: {str(e)}",
+        )
