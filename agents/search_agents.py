@@ -589,21 +589,14 @@ class SearchComposerAgent(BaseAgent):
                     except Exception:
                         pass
 
-            # If still no results but we have a category, try category-only search
-            # This is for generic terms like "araba" where listings may not have "araba" in title
-            if not all_listings and inferred_category:
-                try:
-                    category_fallback = await search_listings_tool.execute(
-                        category=inferred_category,
-                        min_price=min_price,
-                        max_price=max_price,
-                        search_text=None,  # No text filter, just category
-                        limit=20,
-                    )
-                    if isinstance(category_fallback, dict) and category_fallback.get("success"):
-                        all_listings = (category_fallback.get("data") or {}).get("listings") or []
-                except Exception:
-                    pass
+            # Category-only fallback REMOVED:
+            # This was returning irrelevant results (e.g., "saat" query → kazak from same category)
+            # Users searching for "saat" should see 0 results if no saat listings exist
+            # Rather than random items from the inferred category
+            # 
+            # If you need category-only search, it should only be for TRULY generic terms like
+            # "araba", "emlak", "giyim" where no specific product is mentioned.
+            # For specific products like "saat", "ayakkabı", "kazak" - return 0 if not found.
 
             if not all_listings and inferred_category and search_text:
                 try:
