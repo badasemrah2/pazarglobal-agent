@@ -182,12 +182,25 @@ def _is_cancel_command(message: str) -> bool:
 
 def _is_flow_switch_command(message: str) -> bool:
     """
-    Check if user explicitly wants to switch flows.
+    Check if user explicitly wants to switch flows OR is just chatting.
     
     NOTE: Only include patterns that ALWAYS indicate flow switch.
     Contextual commands like "fiyat öner" should be handled by current handler.
     """
     msg_lower = message.lower().strip()
+    
+    # Simple greetings/chat - should break flow and go to CHAT intent
+    chat_patterns = [
+        "selam", "merhaba", "hey", "hi", "hello",
+        "nasılsın", "nasilsin", "nasıl gidiyor", "naber",
+        "teşekkürler", "tesekkurler", "sağol", "sagol", "eyvallah",
+        "görüşürüz", "gorusuruz", "hoşçakal", "hoscakal", "bye",
+        "yardım", "yardim", "help", "ne yapabilirim", "komutlar",
+    ]
+    
+    # If message is just a greeting (exact match or very short), break flow
+    if msg_lower in chat_patterns:
+        return True
     
     # Explicit listing intent - user wants to CREATE a listing
     listing_patterns = [
