@@ -952,23 +952,39 @@ async def _call_perplexity(query: str) -> Optional[float]:
 
 
 async def _call_perplexity_with_response(query: str) -> Dict[str, Any]:
-    """Perplexity API - fiyat araştırması ile detaylı cevap"""
+    """Perplexity API - fiyat araştırması ile detaylı cevap via Supabase Edge Function"""
+    import httpx
+    
     try:
         logger.info(f"Calling Perplexity for price research: {query}")
         
-        result = await supabase_client.client.functions.invoke(
-            "ai-assistant-cached",
-            invoke_options={
-                "body": {
+        # Call Supabase Edge Function directly with httpx
+        supabase_url = settings.supabase_url.rstrip("/")
+        edge_function_url = f"{supabase_url}/functions/v1/ai-assistant-cached"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                edge_function_url,
+                json={
                     "action": "suggest_price",
                     "title": query,
                     "category": "Genel",
                     "condition": "İyi",
+                },
+                headers={
+                    "Authorization": f"Bearer {settings.supabase_key}",
+                    "Content-Type": "application/json",
                 }
-            }
-        )
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Edge function returned {response.status_code}: {response.text}")
+                raise Exception(f"Edge function error: {response.status_code}")
+            
+            result = response.json()
         
-        data = result.get("data", {})
+        # Parse result - could be {"data": {...}} or direct response
+        data = result.get("data", result) if isinstance(result, dict) else {}
         suggested_price = data.get("suggested_price")
         price_range = data.get("price_range", {})
         reasoning = data.get("reasoning", "")
@@ -978,7 +994,7 @@ async def _call_perplexity_with_response(query: str) -> Dict[str, Any]:
             min_price = price_range.get("min", price_float * 0.8)
             max_price = price_range.get("max", price_float * 1.2)
             
-            response = f"""🔍 **{query}** için fiyat araştırması:
+            response_text = f"""🔍 **{query}** için fiyat araştırması:
 
 💰 **Önerilen Fiyat:** {price_float:,.0f} TL
 
@@ -994,7 +1010,7 @@ Bu fiyatlar güncel piyasa verilerine göre hesaplanmıştır. İlan vermek iste
                 "suggested_price": price_float,
                 "min_price": min_price,
                 "max_price": max_price,
-                "response": response,
+                "response": response_text,
             }
         else:
             return {
