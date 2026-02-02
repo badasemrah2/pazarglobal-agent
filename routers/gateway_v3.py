@@ -339,8 +339,9 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
                 await save_session(request.user_id, request.channel, session)
 
         # 1.2 Detail command handling (uses last search cache)
-        detail_match = re.search(r"(\d+)\s*nolu\s*ilan[ıi]?\s*detay", (request.message or "").lower())
-        if detail_match:
+        lower_msg = (request.message or "").lower()
+        detail_match = re.search(r"(\d+)\s*nolu\s*ilan", lower_msg)
+        if detail_match and ("detay" in lower_msg or "goster" in lower_msg or "göster" in lower_msg):
             idx = int(detail_match.group(1)) - 1
             search_cache = session.get("search_cache") or []
             if 0 <= idx < len(search_cache):
