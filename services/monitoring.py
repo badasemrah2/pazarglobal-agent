@@ -2,7 +2,7 @@
 Production monitoring checklist and utilities
 Provides health checks and metrics collection for critical failure modes
 """
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, cast
 from datetime import datetime, timedelta
 from services import supabase_client, redis_client
 from services.logger import get_logger
@@ -33,7 +33,13 @@ async def check_redis_health() -> Dict[str, Any]:
         
         # Ping Redis
         client = await redis_client.get_client()
-        await client.ping()
+        if client:
+            await client.ping()
+        else:
+            return {
+                "healthy": False,
+                "error": "Redis client is None"
+            }
         
         latency = (datetime.now() - start).total_seconds() * 1000
         return {
@@ -76,14 +82,19 @@ async def check_draft_orphans(hours: int = 24) -> Dict[str, Any]:
         if not orphans:
             return {"orphan_count": 0}
         
-        # Calculate age of oldest
-        oldest = min(orphans, key=lambda d: d["updated_at"])
-        oldest_age = (datetime.now() - datetime.fromisoformat(oldest["updated_at"])).total_seconds() / 3600
+        # Calculate age of oldest - cast to proper type
+        orphan_list = cast(List[Dict[str, Any]], orphans)
+        oldest = min(orphan_list, key=lambda d: str(d.get("updated_at", "")))
+        oldest_updated = oldest.get("updated_at", "")
+        if oldest_updated:
+            oldest_age = (datetime.now() - datetime.fromisoformat(str(oldest_updated))).total_seconds() / 3600
+        else:
+            oldest_age = 0
         
         return {
             "orphan_count": len(orphans),
             "oldest_orphan_hours": round(oldest_age, 1),
-            "sample_orphans": orphans[:5]
+            "sample_orphans": orphan_list[:5]
         }
     except Exception as e:
         logger.error(f"Orphan check failed: {e}")
@@ -115,12 +126,13 @@ async def check_draft_conflicts(hours: int = 1) -> Dict[str, Any]:
         if not conflicts:
             return {"conflict_count": 0}
         
-        affected_users = list(set(c["user_id"] for c in conflicts if c.get("user_id")))
+        conflict_list = cast(List[Dict[str, Any]], conflicts)
+        affected_users = list(set(str(c.get("user_id", "")) for c in conflict_list if c.get("user_id")))
         
         return {
             "conflict_count": len(conflicts),
             "affected_users": affected_users,
-            "recent_conflicts": conflicts[:10]
+            "recent_conflicts": conflict_list[:10]
         }
     except Exception as e:
         logger.error(f"Conflict check failed: {e}")
@@ -153,17 +165,19 @@ async def check_fsm_state_distribution() -> Dict[str, Any]:
         
         logs = response.data or []
         
-        state_counts = {}
-        for log in logs:
-            metadata = log.get("metadata", {})
-            state = metadata.get("fsm_state")
-            if state:
-                state_counts[state] = state_counts.get(state, 0) + 1
+        log_list = cast(List[Dict[str, Any]], logs)
+        state_counts: Dict[str, int] = {}
+        for log in log_list:
+            metadata = log.get("metadata")
+            if isinstance(metadata, dict):
+                state = metadata.get("fsm_state")
+                if state:
+                    state_counts[str(state)] = state_counts.get(str(state), 0) + 1
         
         if not state_counts:
             return {"states": {}, "most_common_state": None}
         
-        most_common = max(state_counts, key=state_counts.get)
+        most_common = max(state_counts, key=lambda k: state_counts[k])
         
         return {
             "states": state_counts,
@@ -191,12 +205,12 @@ async def check_moderation_api_failures(hours: int = 1) -> Dict[str, Any]:
         
         # Count total moderation checks
         total_response = supabase_client.client.table("audit_logs") \
-            .select("id", count="exact") \
+            .select("id") \
             .eq("action", "vision_analysis") \
             .gte("created_at", cutoff.isoformat()) \
             .execute()
         
-        total = total_response.count or 0
+        total = len(total_response.data) if total_response.data else 0
         
         # Count failures (where metadata contains error)
         failure_response = supabase_client.client.table("audit_logs") \
