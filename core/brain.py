@@ -376,11 +376,32 @@ Kullanıcı schema dışı bilgi verirse VEYA görsellerden tespit edersen, bunl
 }
 ```
 
+## TOOL CALL - Perplexity Fiyat Araştırması
+
+SADECE şu durumlarda tool_call kullan:
+- "kaç para eder" / "kaç para ediyor"
+- "fiyat araştır" / "piyasa değeri"
+- "ne kadara satılır" / "değeri ne"
+
+Tool call formatı:
+```json
+{
+  "intent": "CHAT",
+  "response_text": "🔍 Fiyat araştırması yapıyorum...",
+  "listing_data": null,
+  "suggestions": [],
+  "tool_call": {"name": "perplexity", "query": "iPhone 14 Pro 256GB"}
+}
+```
+
+ÖNEMLİ: "kaç para eder" sorulduğunda SEARCH intent KULLANMA! CHAT intent ile tool_call döndür.
+
 ## YASAKLAR
 - Schema'ya olmayan alan ekleme (örn: km, tramer alanı yok - description'a yaz)
 - Fiyat tahmini/uydurma (Perplexity kullan veya kullanıcıya sor)
 - Eksik alanlarla ready_for_fsm: true döndürme
-- Preview GÖSTERMEDEN yanıt verme (her mesajda güncel durumu göster!)"""
+- Preview GÖSTERMEDEN yanıt verme (her mesajda güncel durumu göster!)
+- "kaç para eder" sorgularını SEARCH olarak yorumlama - her zaman tool_call kullan!"""
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -446,6 +446,30 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         fsm_state = session.get("state", "IDLE")
         last_intent = session.get("last_intent")
         
+        # 2.5 DETERMINISTIC PRICE QUERY DETECTION - Before Brain!
+        # Handles: "kaç para eder", "fiyat araştır", "piyasa değeri", "ne kadara satılır"
+        price_query = _detect_price_query(request.message)
+        if price_query:
+            logger.info(f"Price query detected (deterministic): {price_query}")
+            price_result = await _call_perplexity_with_response(price_query)
+            
+            # Save to session
+            session["last_intent"] = "CHAT"
+            session["last_price_query"] = price_query
+            if price_result.get("suggested_price"):
+                session["last_suggested_price"] = price_result["suggested_price"]
+            await save_session(request.user_id, request.channel, session)
+            
+            return MessageResponse(
+                success=True,
+                text=price_result["response"],
+                buttons=[
+                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
+                    ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
+                ],
+                metadata={"intent": "PRICE_RESEARCH", "tool": "perplexity", "price": price_result.get("suggested_price")},
+            )
+        
         # Pre-calculate missing fields
         _, missing_fields = FSMEngine.validate(current_listing) if current_listing else (False, ["title", "price", "category"])
         
@@ -460,6 +484,31 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             missing_fields=missing_fields,
             last_intent=last_intent,
         )
+        
+        # 3.5. PERPLEXITY TOOL CALL - Handle BEFORE intent routing!
+        # "kaç para eder" / "fiyat araştır" queries should call Perplexity regardless of intent
+        if brain_output.tool_call and brain_output.tool_call.get("name") == "perplexity":
+            query = brain_output.tool_call.get("query", request.message)
+            logger.info(f"Perplexity tool call detected: query={query}")
+            
+            price_result = await _call_perplexity_with_response(query)
+            
+            # Save to session for future reference
+            session["last_intent"] = "CHAT"
+            session["last_price_query"] = query
+            if price_result.get("suggested_price"):
+                session["last_suggested_price"] = price_result["suggested_price"]
+            await save_session(request.user_id, request.channel, session)
+            
+            return MessageResponse(
+                success=True,
+                text=price_result["response"],
+                buttons=[
+                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
+                    ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
+                ],
+                metadata={"intent": "PRICE_RESEARCH", "tool": "perplexity", "price": price_result.get("suggested_price")},
+            )
         
         # 4. Handle by intent
         if brain_output.intent == Intent.CANCEL:
@@ -699,6 +748,70 @@ async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: 
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
+def _detect_price_query(message: str) -> Optional[str]:
+    """
+    Detect if message is asking for price research (not search).
+    Returns the product name to research, or None if not a price query.
+    
+    Patterns detected:
+    - "X kaç para eder" / "X kaç para"
+    - "X fiyatı ne kadar" / "X fiyatı nekadar"  
+    - "X piyasa değeri" / "X piyasası nekadar"
+    - "X ne kadara satılır"
+    - "fiyat araştır" / "fiyat öğren"
+    """
+    if not message:
+        return None
+    
+    lower = message.lower().strip()
+    
+    # Price query patterns - order matters (more specific first)
+    price_patterns = [
+        r"(.+?)\s*kaç\s*para\s*eder",
+        r"(.+?)\s*kaç\s*para$",
+        r"(.+?)\s*fiyat[ıi]\s*ne\s*kadar",
+        r"(.+?)\s*fiyat[ıi]\s*nekadar",
+        r"(.+?)\s*piyasa\s*değeri",
+        r"(.+?)\s*piyasas[ıi]\s*ne\s*kadar",
+        r"(.+?)\s*piyasas[ıi]\s*nekadar",
+        r"(.+?)\s*ne\s*kadara\s*sat[ıi]l[ıi]r",
+        r"(.+?)\s*için\s*fiyat\s*araştır",
+        r"(.+?)\s*fiyat\s*araştır",
+        r"fiyat\s*araştır[ıi]?\s*(.+)",
+        r"(.+?)\s*değeri\s*ne",
+    ]
+    
+    for pattern in price_patterns:
+        match = re.search(pattern, lower)
+        if match:
+            product = match.group(1).strip()
+            # Clean up common prefixes
+            product = re.sub(r"^(bir|bu|şu|o)\s+", "", product)
+            # Remove "ürünü", "telefon" etc. suffixes if they're standalone
+            product = re.sub(r"\s+(ürünü|telfon|telefon)$", "", product)
+            
+            if len(product) > 2:  # At least 3 chars
+                return product
+    
+    # Also detect standalone price research requests WITH context
+    standalone_patterns = [
+        "fiyat araştırması yap",
+        "fiyat öğren", 
+        "piyasa araştır",
+    ]
+    if any(p in lower for p in standalone_patterns):
+        # Try to extract product from the same message
+        # Remove the command part and see what's left
+        cleaned = lower
+        for p in standalone_patterns:
+            cleaned = cleaned.replace(p, "")
+        cleaned = cleaned.strip(" .,!?")
+        if len(cleaned) > 2:
+            return cleaned
+    
+    return None
+
+
 def _format_preview(listing: Dict[str, Any]) -> str:
     """Format current draft as preview text."""
     lines = ["📋 İlan Önizleme:"]
@@ -836,7 +949,7 @@ async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageRes
     )
 
 async def _call_perplexity(query: str) -> Optional[float]:
-    """Perplexity API - fiyat araştırması"""
+    """Perplexity API - fiyat araştırması (sadece fiyat döner)"""
     try:
         result = await supabase_client.client.functions.invoke(
             "ai-assistant-cached",
@@ -856,6 +969,65 @@ async def _call_perplexity(query: str) -> Optional[float]:
         logger.error(f"Perplexity error: {e}")
     
     return None
+
+
+async def _call_perplexity_with_response(query: str) -> Dict[str, Any]:
+    """Perplexity API - fiyat araştırması ile detaylı cevap"""
+    try:
+        logger.info(f"Calling Perplexity for price research: {query}")
+        
+        result = await supabase_client.client.functions.invoke(
+            "ai-assistant-cached",
+            invoke_options={
+                "body": {
+                    "action": "suggest_price",
+                    "title": query,
+                    "category": "Genel",
+                    "condition": "İyi",
+                }
+            }
+        )
+        
+        data = result.get("data", {})
+        suggested_price = data.get("suggested_price")
+        price_range = data.get("price_range", {})
+        reasoning = data.get("reasoning", "")
+        
+        if suggested_price:
+            price_float = float(suggested_price)
+            min_price = price_range.get("min", price_float * 0.8)
+            max_price = price_range.get("max", price_float * 1.2)
+            
+            response = f"""🔍 **{query}** için fiyat araştırması:
+
+💰 **Önerilen Fiyat:** {price_float:,.0f} TL
+
+📊 **Fiyat Aralığı:**
+• Minimum: {min_price:,.0f} TL
+• Maksimum: {max_price:,.0f} TL
+
+{f"📝 {reasoning}" if reasoning else ""}
+
+Bu fiyatlar güncel piyasa verilerine göre hesaplanmıştır. İlan vermek isterseniz "ilan ver" yazabilirsiniz!"""
+            
+            return {
+                "suggested_price": price_float,
+                "min_price": min_price,
+                "max_price": max_price,
+                "response": response,
+            }
+        else:
+            return {
+                "suggested_price": None,
+                "response": f"🤔 **{query}** için fiyat bilgisi bulunamadı.\n\nFarklı bir ürün sorabilir veya direkt ilan verebilirsiniz!",
+            }
+            
+    except Exception as e:
+        logger.error(f"Perplexity error: {e}")
+        return {
+            "suggested_price": None,
+            "response": f"🔍 Fiyat araştırması şu an yapılamıyor.\n\n**{query}** için ilan vermek ister misiniz?",
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════
