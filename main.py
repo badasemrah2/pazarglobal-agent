@@ -2,8 +2,8 @@
 PazarGlobal Agent API - Main Application
 FastAPI application with WhatsApp and WebChat integration
 
-v2.0.1 - Clean architecture with modular handlers
-Updated: 2026-02-02 15:48
+v2.0.2 - Clean architecture with modular handlers
+Updated: 2026-02-02 15:55
 """
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,7 +102,7 @@ async def root():
     """Root endpoint"""
     return {
         "service": "PazarGlobal Agent API",
-        "version": "2.0.0",
+        "version": "2.0.2",
         "status": "active",
         "endpoints": {
             # v2 API (recommended)
