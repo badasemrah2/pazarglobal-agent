@@ -390,6 +390,178 @@ class FSMEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FSM STATE MACHINE - Deterministic confirmation flow (LLM bypass)
+# ═══════════════════════════════════════════════════════════════════
+
+# FSM States
+FSM_STATE_IDLE = "IDLE"
+FSM_STATE_DRAFTING = "DRAFTING"
+FSM_STATE_PENDING_CONFIRMATION = "PENDING_CONFIRMATION"  # Waiting for "onayla"
+
+# FSM Commands (deterministic, LLM bypassed)
+FSM_COMMANDS = {
+    "onayla": "CONFIRM",
+    "onaylıyorum": "CONFIRM",
+    "evet onayla": "CONFIRM",
+    "iptal": "CANCEL",
+    "vazgeçtim": "CANCEL",
+    "iptal et": "CANCEL",
+}
+
+
+async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Dict) -> MessageResponse:
+    """FSM: Show detailed confirmation preview with credit info"""
+    listing = session.get("listing_data", {})
+    
+    # Get user balance
+    try:
+        result = await supabase_client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
+        balance = float(result.data[0]["balance_bigint"]) if result.data else 0
+    except Exception:
+        balance = 0
+    
+    credit_cost = 55
+    
+    # Format detailed preview
+    preview = f"""📋 **YAYIN ÖNCESİ KONTROL**
+
+**BAŞLIK:**
+{listing.get('title', '—')}
+
+**AÇIKLAMA:**
+{listing.get('description', '—')}
+
+**FİYAT:**
+{listing.get('price', 0):,.0f} ₺
+
+**DURUM:**
+{listing.get('condition', '2. El')}
+
+**KATEGORİ:**
+{listing.get('category', '—')}
+
+**LOKASYON:**
+{listing.get('location', 'Belirtilmemiş')}
+
+**FOTOĞRAFLAR:**
+{len(listing.get('images', []))} adet
+
+─────────────────────────
+💳 **Mevcut bakiyeniz:** {balance:,.0f} kredi
+💰 **Yayın ücreti:** {credit_cost} kredi
+{"✅ Bakiye yeterli" if balance >= credit_cost else "❌ Bakiye yetersiz!"}
+
+─────────────────────────
+🛠️ **KOMUTLAR**
+👉 Onayla: `onayla`
+👉 İptal: `iptal`
+👉 Düzenle: değişiklik için yazın (örn: "başlık: Yeni Başlık")
+
+İlanınızı yayınlamak için **onayla** yazın."""
+
+    # Update session state
+    session["fsm_state"] = FSM_STATE_PENDING_CONFIRMATION
+    session["pending_publish_balance"] = balance
+    session["pending_publish_cost"] = credit_cost
+    await save_session(user_id, channel, session)
+    
+    buttons = []
+    if balance >= credit_cost:
+        buttons = [
+            ButtonResponse(text="✅ Onayla", payload="onayla"),
+            ButtonResponse(text="❌ İptal", payload="iptal"),
+        ]
+    else:
+        buttons = [
+            ButtonResponse(text="💳 Kredi Yükle", payload="kredi yükle"),
+            ButtonResponse(text="❌ İptal", payload="iptal"),
+        ]
+    
+    return MessageResponse(
+        success=True,
+        text=preview,
+        buttons=buttons,
+        metadata={
+            "intent": "PENDING_CONFIRMATION",
+            "fsm_state": FSM_STATE_PENDING_CONFIRMATION,
+            "balance": balance,
+            "cost": credit_cost,
+        },
+    )
+
+
+async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, command: str) -> MessageResponse:
+    """FSM: Handle deterministic commands in PENDING_CONFIRMATION state"""
+    
+    if command == "CONFIRM":
+        # Direct publish - no LLM involved
+        listing = session.get("listing_data", {})
+        balance = session.get("pending_publish_balance", 0)
+        cost = session.get("pending_publish_cost", 55)
+        
+        if balance < cost:
+            return MessageResponse(
+                success=False,
+                text=f"❌ Bakiye yetersiz!\n\nMevcut: {balance:,.0f} kredi\nGerekli: {cost} kredi\n\nKredi yükleyip tekrar deneyin.",
+                buttons=[ButtonResponse(text="💳 Kredi Yükle", payload="kredi yükle")],
+                metadata={"error": "insufficient_balance"},
+            )
+        
+        # Publish
+        success, message, listing_id = await FSMEngine.publish(user_id, listing)
+        
+        if success:
+            # Clear session
+            await clear_session(user_id, channel)
+            
+            return MessageResponse(
+                success=True,
+                text=f"""🎉 **İlanınız Yayınlandı!**
+
+📋 **{listing.get('title')}**
+💰 {listing.get('price', 0):,.0f} TL
+📍 {listing.get('location', 'Belirtilmemiş')}
+
+💳 Kalan bakiye: {balance - cost:,.0f} kredi
+
+🔗 pazarglobal.com/listing/{listing_id}""",
+                buttons=[
+                    ButtonResponse(text="📸 Yeni İlan", payload="yeni ilan vermek istiyorum"),
+                    ButtonResponse(text="📋 İlanlarım", payload="ilanlarım"),
+                ],
+                metadata={"intent": "PUBLISHED", "listing_id": listing_id},
+            )
+        else:
+            return MessageResponse(
+                success=False,
+                text=f"❌ Yayınlama hatası: {message}",
+                buttons=[ButtonResponse(text="🔄 Tekrar Dene", payload="onayla")],
+                metadata={"error": message},
+            )
+    
+    elif command == "CANCEL":
+        # Reset to drafting
+        session["fsm_state"] = FSM_STATE_DRAFTING
+        await save_session(user_id, channel, session)
+        
+        return MessageResponse(
+            success=True,
+            text="❌ Yayınlama iptal edildi.\n\nİlanınız taslak olarak saklandı. Düzenleme yapabilir veya daha sonra yayınlayabilirsiniz.",
+            buttons=[
+                ButtonResponse(text="✏️ Düzenle", payload="düzenlemek istiyorum"),
+                ButtonResponse(text="🗑️ Taslağı Sil", payload="taslağı sil"),
+                ButtonResponse(text="📋 Önizle", payload="önizleme göster"),
+            ],
+            metadata={"intent": "CANCEL", "fsm_state": FSM_STATE_DRAFTING},
+        )
+    
+    return MessageResponse(
+        success=False,
+        text="Geçersiz komut. 'onayla' veya 'iptal' yazın.",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN ENDPOINT
 # ═══════════════════════════════════════════════════════════════════
 
@@ -412,6 +584,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
                 if (datetime.utcnow() - last_ts).total_seconds() > 600:
                     session["listing_data"] = {}
                     session["state"] = "IDLE"
+                    session["fsm_state"] = FSM_STATE_IDLE
                     session["draft_updated_at"] = None
                     session["last_intent"] = None
                     await save_session(request.user_id, request.channel, session)
@@ -419,12 +592,33 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
                 # If parsing fails, reset draft defensively
                 session["listing_data"] = {}
                 session["state"] = "IDLE"
+                session["fsm_state"] = FSM_STATE_IDLE
                 session["draft_updated_at"] = None
                 session["last_intent"] = None
                 await save_session(request.user_id, request.channel, session)
 
-        # 1.2 Detail command handling (uses last search cache)
-        lower_msg = (request.message or "").lower()
+        # ═══════════════════════════════════════════════════════════════════
+        # 1.2 FSM STATE CHECK - LLM BYPASS for deterministic commands
+        # ═══════════════════════════════════════════════════════════════════
+        lower_msg = (request.message or "").lower().strip()
+        fsm_state = session.get("fsm_state", FSM_STATE_IDLE)
+        
+        if fsm_state == FSM_STATE_PENDING_CONFIRMATION:
+            # In confirmation state - check for deterministic commands
+            fsm_command = FSM_COMMANDS.get(lower_msg)
+            
+            if fsm_command:
+                # Deterministic command - LLM BYPASSED
+                logger.info(f"FSM: PENDING_CONFIRMATION state, command={fsm_command}, bypassing LLM")
+                return await _fsm_handle_confirmation(request.user_id, request.channel, session, fsm_command)
+            else:
+                # Not a command - treat as edit request, go back to DRAFTING
+                session["fsm_state"] = FSM_STATE_DRAFTING
+                await save_session(request.user_id, request.channel, session)
+                logger.info(f"FSM: User sent non-command in PENDING_CONFIRMATION, reverting to DRAFTING")
+                # Continue to LLM for editing...
+        
+        # 1.3 Detail command handling (uses last search cache)
         detail_match = re.search(r"(\d+)\s*nolu\s*ilan", lower_msg)
         if detail_match and ("detay" in lower_msg or "goster" in lower_msg or "göster" in lower_msg):
             idx = int(detail_match.group(1)) - 1
@@ -432,7 +626,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             if 0 <= idx < len(search_cache):
                 return await _format_listing_detail_response(search_cache[idx])
         
-        # 1.3 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
+        # 1.4 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
         preview_keywords = ["son hal", "önizleme", "preview", "göster bana", "goster bana"]
         if any(kw in lower_msg for kw in preview_keywords) and session.get("listing_data"):
             current_listing = session.get("listing_data", {})
@@ -572,6 +766,7 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     # Update session
     session["listing_data"] = current
     session["state"] = "READY" if is_valid else "DRAFTING"
+    session["fsm_state"] = FSM_STATE_DRAFTING  # Still in drafting until explicit confirmation flow
     session["last_intent"] = "CREATE"  # Brain'in context için bilmesi lazım
     session["draft_updated_at"] = datetime.utcnow().isoformat()
     
@@ -592,39 +787,37 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
         if price_result:
             response_text += f"\n\n💰 **Piyasa Araştırması:** {price_result:,.0f} TL civarı"
     
-    # Check if user confirmed - use direct confirmation detection on user message
-    # because brain_output.user_confirmed depends on Brain's listing_data which may be incomplete
+    # Check if user wants to publish - use direct confirmation detection on user message
     from core.brain import Guardrails
     user_wants_to_publish = Guardrails.detect_confirmation(user_message)
     
     logger.info(f"CREATE: is_valid={is_valid}, user_wants_to_publish={user_wants_to_publish}")
     
     if user_wants_to_publish and is_valid:
-        # FSM → Publish
-        logger.info(f"Publishing listing for user {user_id}: {current}")
-        success, message, listing_id = await FSMEngine.publish(user_id, current)
+        # ═══════════════════════════════════════════════════════════════════
+        # NEW FSM FLOW: Show confirmation preview instead of direct publish
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info(f"User wants to publish - showing FSM confirmation preview")
+        return await _fsm_show_confirmation_preview(user_id, channel, session)
+    
+    elif user_wants_to_publish and not is_valid:
+        # User wants to publish but listing is incomplete
+        logger.info(f"User wants to publish but missing fields: {missing}")
         
-        if success:
-            await clear_session(user_id, channel)
-            return MessageResponse(
-                success=True,
-                text=f"🎉 **İlanınız Yayınlandı!**\n\n📋 {current.get('title')}\n💰 {current.get('price', 0):,.0f} TL\n📍 {current.get('location', 'Belirtilmemiş')}\n\n🔗 pazarglobal.com/listing/{listing_id}",
-                buttons=[
-                    ButtonResponse(text="📸 Yeni İlan", payload="yeni ilan vermek istiyorum"),
-                    ButtonResponse(text="📋 İlanlarım", payload="ilanlarım"),
-                ],
-                metadata={"intent": "CREATE", "listing_id": listing_id, "published": True},
-            )
-        else:
-            # Publish failed - return error
-            logger.error(f"Publish failed for user {user_id}: {message}")
-            return MessageResponse(
-                success=False,
-                text=message,
-                listing_preview=current,
-                buttons=[ButtonResponse(text="🔄 Tekrar Dene", payload="yayınla")],
-                metadata={"intent": "CREATE", "error": message},
-            )
+        # Show what's missing
+        missing_text = ", ".join(missing)
+        return MessageResponse(
+            success=True,
+            text=f"⚠️ İlan yayınlamak için şu alanları tamamlamanız gerekiyor:\n\n**Eksik:** {missing_text}\n\n{response_text}",
+            listing_preview=current,
+            buttons=[ButtonResponse(text="❌ İptal", payload="iptal")],
+            metadata={
+                "intent": "CREATE",
+                "state": "DRAFTING",
+                "missing_fields": missing,
+                "ready_for_publish": False,
+            },
+        )
     
     # Not ready or not confirmed - show preview
     buttons = []
