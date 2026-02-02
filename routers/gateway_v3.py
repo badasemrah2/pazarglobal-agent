@@ -189,37 +189,56 @@ async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput)
 
 
 async def _handle_search(user_id: str, query: str, brain_output: BrainOutput) -> MessageResponse:
-    """SEARCH intent - Arama FSM"""
+    """SEARCH intent - SearchComposerAgent'a delege et"""
     
     try:
-        # Extract search terms from message
-        search_query = query.replace("var mı", "").replace("arıyorum", "").strip()
+        # Use the battle-tested SearchComposerAgent
+        from agents.search_agents import SearchComposerAgent
+        search_agent = SearchComposerAgent()
         
-        # Search in Supabase
-        result = supabase_client.client.table("listings").select("*").ilike(
-            "title", f"%{search_query}%"
-        ).limit(5).execute()
+        # Call orchestrate_search (not run)
+        result = await search_agent.orchestrate_search(user_message=query)
         
-        if result.data:
-            # Format results
-            results_text = f"🔍 **{len(result.data)} sonuç bulundu:**\n\n"
-            for i, listing in enumerate(result.data, 1):
-                results_text += f"{i}. **{listing.get('title')}**\n"
-                results_text += f"   💰 {listing.get('price', 0):,.0f} TL\n\n"
+        # Parse result
+        if isinstance(result, dict):
+            # Get message from search agent (already formatted nicely)
+            message = result.get("message", "")
+            listings = result.get("listings", [])
             
-            return MessageResponse(
-                success=True,
-                text=results_text,
-                metadata={"intent": "SEARCH", "count": len(result.data)},
-            )
+            if message:
+                return MessageResponse(
+                    success=True,
+                    text=message,
+                    metadata={"intent": "SEARCH", "count": result.get("count", len(listings))},
+                )
+            elif listings:
+                # Format results
+                results_text = f"🔍 **{len(listings)} sonuç bulundu:**\n\n"
+                for i, listing in enumerate(listings[:5], 1):
+                    title = listing.get("title", "İsimsiz")
+                    price = listing.get("price", 0)
+                    results_text += f"{i}. **{title}**\n   💰 {price:,.0f} TL\n\n"
+                
+                return MessageResponse(
+                    success=True,
+                    text=results_text,
+                    metadata={"intent": "SEARCH", "count": len(listings)},
+                )
+            else:
+                return MessageResponse(
+                    success=True,
+                    text=f"🔍 Aramanıza uygun ilan bulunamadı. Farklı kelimelerle deneyin.",
+                    buttons=[
+                        ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
+                    ],
+                    metadata={"intent": "SEARCH", "count": 0},
+                )
         else:
+            # Agent returned string
             return MessageResponse(
                 success=True,
-                text=f"🔍 '{search_query}' için sonuç bulunamadı. Farklı kelimelerle deneyin.",
-                buttons=[
-                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
-                ],
-                metadata={"intent": "SEARCH", "count": 0},
+                text=str(result),
+                metadata={"intent": "SEARCH"},
             )
     
     except Exception as e:
