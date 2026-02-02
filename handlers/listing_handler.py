@@ -51,9 +51,9 @@ class ListingHandler:
     - Fill slots and build responses
     """
     
-    # Required slots for publishing
-    REQUIRED_SLOTS = ["title", "price", "images"]
-    OPTIONAL_SLOTS = ["description", "category", "condition", "location"]
+    # Required slots for publishing (images optional - can add later)
+    REQUIRED_SLOTS = ["title", "price"]
+    OPTIONAL_SLOTS = ["description", "category", "condition", "location", "images"]
     
     def __init__(self):
         self.state_machine = StateMachine()

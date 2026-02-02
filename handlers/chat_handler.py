@@ -26,10 +26,20 @@ class ChatHandler:
         # Greetings
         "greeting": {
             "patterns": ["merhaba", "selam", "hey", "hi", "hello", "günaydın", "iyi akşamlar"],
-            "response": "👋 Merhaba! Ben PazarGlobal asistanı.\n\n"
-                       "📸 **İlan vermek** için ürün fotoğrafı gönderin\n"
-                       "🔍 **Ürün aramak** için ne aradığınızı yazın\n"
-                       "📋 **İlanlarınızı görmek** için 'ilanlarım' yazın",
+            "response": "👋 Merhaba! Ben PazarGlobal asistanı. Size nasıl yardımcı olabilirim?\n\n"
+                       "🛒 **İlan Vermek İçin:**\n"
+                       "• Ürün fotoğrafı gönderin (önerilen)\n"
+                       "• veya sadece ürünü anlatın: 'iPhone 14 satıyorum'\n\n"
+                       "🔍 **Ürün Aramak İçin:**\n"
+                       "• Aradığınızı yazın: 'koltuk var mı?'\n\n"
+                       "💰 **Fiyat Araştırması:**\n"
+                       "• 'MacBook Pro kaç para eder?' gibi sorun\n\n"
+                       "📋 **İlanlarınız:** 'ilanlarım' yazın",
+            "buttons": [
+                {"text": "📸 İlan Ver", "payload": "ilan vermek istiyorum"},
+                {"text": "🔍 Ürün Ara", "payload": "aramak istiyorum"},
+                {"text": "📋 İlanlarım", "payload": "ilanlarım"}
+            ],
         },
         
         # Help
@@ -107,7 +117,8 @@ class ChatHandler:
         for intent_type, data in self.RESPONSES.items():
             for pattern in data["patterns"]:
                 if pattern in message_lower:
-                    return self._build_response(intent_type, data["response"])
+                    custom_buttons = data.get("buttons")
+                    return self._build_response(intent_type, data["response"], custom_buttons)
         
         # Check for specific commands
         if message_lower in ["ilanlarım", "ilanlarim", "my listings", "ilanlar"]:
@@ -118,15 +129,20 @@ class ChatHandler:
         # Unknown - default response
         return self._build_unknown_response()
     
-    def _build_response(self, intent_type: str, text: str) -> Response:
+    def _build_response(self, intent_type: str, text: str, custom_buttons: list = None) -> Response:
         """Build response with appropriate buttons"""
         buttons = []
         
-        if intent_type in ["greeting", "help"]:
+        # Use custom buttons if provided
+        if custom_buttons:
             buttons = [
-                Button("📸 İlan Ver", "create_listing"),
-                Button("🔍 Ara", "search"),
-                Button("📋 İlanlarım", "my_listings"),
+                Button(b["text"], b["payload"]) for b in custom_buttons
+            ]
+        elif intent_type in ["greeting", "help"]:
+            buttons = [
+                Button("📸 İlan Ver", "ilan vermek istiyorum"),
+                Button("🔍 Ara", "aramak istiyorum"),
+                Button("📋 İlanlarım", "ilanlarım"),
             ]
         
         return self.response_builder.build_custom(text, buttons=buttons)
