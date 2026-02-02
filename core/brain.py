@@ -332,13 +332,19 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
 {
   "title": "string, max 200 karakter, ZORUNLU",
   "description": "string, max 2000 karakter, opsiyonel - ekstra bilgiler buraya (görsel analizi dahil)",
-  "category": "Elektronik|Otomotiv|Emlak|Mobilya & Dekorasyon|Moda & Aksesuar|Spor & Hobi|Hobi, Koleksiyon & Sanat|Diğer, ZORUNLU",
+  "category": "Emlak|Otomotiv|Elektronik|Ev & Yaşam|Moda & Aksesuar|Anne, Bebek & Oyuncak|Spor & Outdoor|Hobi, Koleksiyon & Sanat|Hayvanlar Alemi|Tarım & Gıda|İş Makineleri & Sanayi|Yedek Parça & Aksesuar|Hizmetler|Eğitim & Kurs|İş İlanları|Dijital Ürün & Hizmetler|Diğer, ZORUNLU",
   "price": "number, 1-100000000 arası TL, ZORUNLU",
   "condition": "Sıfır|Az Kullanılmış|2. El, default: 2. El",
   "location": "string, şehir, opsiyonel",
   "images": "array of URLs, opsiyonel (FSM resim zorunlu tutmaz)"
 }
 ```
+
+**Kategori Örnekleri:**
+- Domates, meyve, sebze → "Tarım & Gıda"
+- iPhone, laptop, TV → "Elektronik"
+- Araba, motorsiklet → "Otomotiv"
+- Daire, ev, arsa → "Emlak"
 
 ## EKSTRA BİLGİ KURALI
 

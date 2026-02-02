@@ -109,6 +109,7 @@ class FSMEngine:
     
     Görevler:
     - JSON validasyon (schema kontrolü)
+    - Otomatik kategori belirleme (category_library kullanarak)
     - Keywords üretme
     - Wallet kontrolü
     - İlan yayınlama
@@ -118,10 +119,9 @@ class FSMEngine:
     
     REQUIRED_FIELDS = ["title", "price", "category"]
     
-    ALLOWED_CATEGORIES = {
-        "Elektronik", "Otomotiv", "Emlak", "Mobilya & Dekorasyon",
-        "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer"
-    }
+    # Import from category_library - single source of truth
+    from services.category_library import SUPPORTED_CATEGORIES, classify_category, normalize_category_id
+    ALLOWED_CATEGORIES = set(SUPPORTED_CATEGORIES)
     
     ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "2. El"}
     
@@ -151,8 +151,27 @@ class FSMEngine:
             except (ValueError, TypeError):
                 missing.append("price")
         
-        # Category
+        # Category - otomatik belirleme dene
         category = listing_data.get("category")
+        
+        # Önce normalize et (kullanıcı "Tarım&Gıda" yazmışsa "Tarım & Gıda" yap)
+        if category:
+            normalized = cls.normalize_category_id(category)
+            if normalized:
+                listing_data["category"] = normalized
+                category = normalized
+        
+        # Kategori hala geçersizse, başlık ve açıklamadan otomatik belirle
+        if not category or category not in cls.ALLOWED_CATEGORIES:
+            title = listing_data.get("title", "")
+            description = listing_data.get("description", "")
+            auto_category = cls.classify_category(f"{title} {description}")
+            if auto_category:
+                listing_data["category"] = auto_category
+                category = auto_category
+                logger.info(f"Auto-classified category: {auto_category} from title/desc")
+        
+        # Son kontrol
         if not category or category not in cls.ALLOWED_CATEGORIES:
             missing.append("category")
         
@@ -308,12 +327,14 @@ class FSMEngine:
             
             # 5. Insert to Supabase
             logger.info(f"Inserting listing to Supabase: {listing_id}")
-            logger.debug(f"Listing data: {final_listing}")
+            logger.info(f"Listing data for insert: title={final_listing.get('title')}, category={final_listing.get('category')}, price={final_listing.get('price')}, user_id={user_id}")
             
             try:
                 result = supabase_client.client.table("listings").insert(final_listing).execute()
+                logger.info(f"Supabase insert result: data={bool(result.data)}, count={len(result.data) if result.data else 0}")
             except Exception as insert_err:
                 logger.error(f"Supabase insert exception: {insert_err}", exc_info=True)
+                logger.error(f"Failed listing data: {final_listing}")
                 # Refund credit
                 await cls.deduct_credit(user_id, -55.0)
                 return False, f"İlan kaydedilemedi: {str(insert_err)}", None
