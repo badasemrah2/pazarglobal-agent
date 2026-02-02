@@ -108,8 +108,10 @@ class Guardrails:
         """Kullanıcı onay veriyor mu?"""
         msg_lower = message.lower().strip()
         confirm_patterns = [
-            r"\b(yayınla|yayinla|onayla|tamam|evet|olur|yayına al|paylaş|paylas)\b",
-            r"^(evet|ok|olur|tamam)$"
+            r"\b(yayınla|yayinla|onayla|onaylıyorum|onayliyorum|tamam|evet|olur|yayına al|paylaş|paylas)\b",
+            r"^(evet|ok|olur|tamam|onayla|onaylıyorum)$",
+            r"onay.*ver",
+            r"yayın.*al",
         ]
         for pattern in confirm_patterns:
             if re.search(pattern, msg_lower):

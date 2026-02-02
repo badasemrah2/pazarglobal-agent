@@ -422,6 +422,13 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             return await _handle_create(request.user_id, request.channel, session, brain_output, request.message)
         
         else:  # CHAT
+            # IMPORTANT: Check if user is trying to confirm an existing draft
+            # Even if Brain says CHAT, if there's an active draft and user confirms, publish it!
+            from core.brain import Guardrails
+            if last_intent == "CREATE" and current_listing and Guardrails.detect_confirmation(request.message):
+                logger.info(f"User confirming existing draft via CHAT intent, routing to CREATE handler")
+                return await _handle_create(request.user_id, request.channel, session, brain_output, request.message)
+            
             session["last_intent"] = "CHAT"
             return await _handle_chat(request.user_id, request.channel, session, brain_output)
     
@@ -442,11 +449,23 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     """
     CREATE intent - LLM'den JSON al, FSM'e gönder
     """
-    # Merge new data with existing
+    # Merge new data with existing - preserve images from session!
     current = session.get("listing_data", {})
+    
+    # First preserve existing images
+    existing_images = current.get("images", [])
+    
+    # Merge Brain output
     for key, value in brain_output.listing_data.items():
         if value is not None:
             current[key] = value
+    
+    # Ensure images are preserved (don't overwrite with empty list)
+    if existing_images and not current.get("images"):
+        current["images"] = existing_images
+    
+    logger.info(f"CREATE: current listing data: {current}")
+    logger.info(f"CREATE: user_confirmed={brain_output.user_confirmed}, ready_for_fsm={brain_output.ready_for_fsm}")
     
     # FSM validates
     is_valid, missing = FSMEngine.validate(current)
@@ -474,9 +493,16 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
         if price_result:
             response_text += f"\n\n💰 **Piyasa Araştırması:** {price_result:,.0f} TL civarı"
     
-    # Check if user confirmed
-    if brain_output.user_confirmed and is_valid:
+    # Check if user confirmed - use direct confirmation detection on user message
+    # because brain_output.user_confirmed depends on Brain's listing_data which may be incomplete
+    from core.brain import Guardrails
+    user_wants_to_publish = Guardrails.detect_confirmation(user_message)
+    
+    logger.info(f"CREATE: is_valid={is_valid}, user_wants_to_publish={user_wants_to_publish}")
+    
+    if user_wants_to_publish and is_valid:
         # FSM → Publish
+        logger.info(f"Publishing listing for user {user_id}: {current}")
         success, message, listing_id = await FSMEngine.publish(user_id, current)
         
         if success:
@@ -492,6 +518,7 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
             )
         else:
             # Publish failed - return error
+            logger.error(f"Publish failed for user {user_id}: {message}")
             return MessageResponse(
                 success=False,
                 text=message,
