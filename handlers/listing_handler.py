@@ -416,6 +416,10 @@ class ListingHandler:
         """Handle message in PREVIEW state"""
         message_lower = message.lower().strip()
         
+        # Check for price suggestion request (before slot extraction!)
+        if any(p in message_lower for p in ["fiyat öner", "fiyat oner", "fiyat araştır", "fiyat arastir", "ne kadar eder"]):
+            return await self._handle_price_suggestion(context)
+        
         # Check for publish command
         if message_lower in ["yayınla", "yayinla", "publish", "onayla", "tamam", "evet"]:
             return await self._publish_listing(context)

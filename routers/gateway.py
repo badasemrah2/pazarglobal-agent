@@ -174,8 +174,10 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
 
 def _is_cancel_command(message: str) -> bool:
     """Check if message is a cancel/reset command"""
-    cancel_words = ["iptal", "vazgeç", "vazgec", "cancel", "sıfırla", "sifirla", "reset"]
-    return message.lower().strip() in cancel_words
+    cancel_words = ["iptal", "iptal et", "vazgeç", "vazgec", "cancel", "sıfırla", "sifirla", "reset", "iptal ediyorum"]
+    msg_lower = message.lower().strip()
+    # Exact match or starts with cancel word
+    return msg_lower in cancel_words or any(msg_lower.startswith(w + " ") for w in cancel_words)
 
 
 def _is_flow_switch_command(message: str) -> bool:
