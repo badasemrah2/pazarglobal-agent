@@ -985,7 +985,7 @@ Eğer fiyat bulamazsan: {{"suggested_price": null, "reasoning": "Fiyat bilgisi b
             response = await client.post(
                 "https://api.perplexity.ai/chat/completions",
                 json={
-                    "model": "llama-3.1-sonar-small-128k-online",
+                    "model": "sonar",
                     "messages": [
                         {"role": "system", "content": "Sen Türkiye'deki 2. el ürün fiyatları konusunda uzman bir asistansın. Sadece JSON formatında yanıt ver."},
                         {"role": "user", "content": prompt}
