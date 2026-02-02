@@ -323,23 +323,54 @@ class ListingHandler:
             return response
     
     async def _handle_idle(self, context: ListingContext, message: str) -> Response:
-        """Handle message in IDLE state"""
-        # Extract any slots from message
+        """Handle message in IDLE state - user wants to create listing"""
+        # Extract slots from message
         extraction = slot_filler.extract(message)
         
+        # If we got slots (price, category, etc), start draft
         if extraction.slots:
-            # User provided some info, start draft
             self._merge_slots(context, extraction)
+            
+            # Use remaining text as title if no title extracted
+            if "title" not in context.slots and extraction.raw_text:
+                # Clean "satıyorum", "satılık" etc from raw text for title
+                title_text = self._clean_title_text(extraction.raw_text)
+                if title_text:
+                    context.slots["title"] = title_text
+            
             context.state = ListingState.DRAFTING
             await self._save_context(context)
             return await self._build_slot_request(context)
         
-        # No slots, ask for image
+        # No slots extracted but user sent text
+        if message.strip():
+            # Treat entire message as product description/title start
+            title_text = self._clean_title_text(message)
+            if title_text:
+                context.slots["title"] = title_text
+                context.state = ListingState.DRAFTING
+                await self._save_context(context)
+                return await self._build_slot_request(context)
+        
+        # No meaningful input, ask for image
         response = self.response_builder.build("listing_start")
-        # Signal that we're in CREATE flow, waiting for image
         response.metadata["continue_flow"] = True
         response.metadata["waiting_for"] = "image"
         return response
+    
+    def _clean_title_text(self, text: str) -> str:
+        """Clean text to use as title - remove 'satıyorum', 'satılık' etc"""
+        remove_patterns = [
+            r"\b(?:satıyorum|satiyorum|satacağım|satacagim|satılık|satilik|satmak|satayim|satayım)\b",
+            r"\b(?:vermek istiyorum|istiyorum|ilan vermek)\b",
+            r"\b(?:var|mevcut)\b",
+        ]
+        clean = text
+        for pattern in remove_patterns:
+            clean = re.sub(pattern, "", clean, flags=re.IGNORECASE)
+        # Remove extra spaces and trim
+        clean = re.sub(r"\s+", " ", clean).strip()
+        return clean
     
     async def _handle_drafting(self, context: ListingContext, message: str) -> Response:
         """Handle message in DRAFTING state"""
