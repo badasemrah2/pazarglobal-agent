@@ -72,7 +72,7 @@ LISTING_SCHEMA = {
     "images": {"type": "array", "required": False},  # FSM zorunlu tutmaz
 }
 
-REQUIRED_FIELDS = ["title", "price", "category"]
+REQUIRED_FIELDS = ["title", "price", "category", "description"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -331,7 +331,7 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
 ```json
 {
   "title": "string, max 200 karakter, ZORUNLU",
-  "description": "string, max 2000 karakter, opsiyonel - ekstra bilgiler buraya (görsel analizi dahil)",
+  "description": "string, min 10 karakter, max 2000 karakter, ZORUNLU - ürün detayları ve görsel analizi buraya",
   "category": "Emlak|Otomotiv|Elektronik|Ev & Yaşam|Moda & Aksesuar|Anne, Bebek & Oyuncak|Spor & Outdoor|Hobi, Koleksiyon & Sanat|Hayvanlar Alemi|Tarım & Gıda|İş Makineleri & Sanayi|Yedek Parça & Aksesuar|Hizmetler|Eğitim & Kurs|İş İlanları|Dijital Ürün & Hizmetler|Diğer, ZORUNLU",
   "price": "number, 1-100000000 arası TL, ZORUNLU",
   "condition": "Sıfır|Az Kullanılmış|2. El, default: 2. El",

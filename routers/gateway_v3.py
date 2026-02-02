@@ -118,7 +118,7 @@ class FSMEngine:
     NOT: Resim zorunlu DEĞİL
     """
     
-    REQUIRED_FIELDS = ["title", "price", "category"]
+    REQUIRED_FIELDS = ["title", "price", "category", "description"]
     
     # Import from category_library - single source of truth
     from services.category_library import SUPPORTED_CATEGORIES, classify_category, normalize_category_id
@@ -136,9 +136,15 @@ class FSMEngine:
         """
         missing = []
         
-        # Title
-        if not listing_data.get("title"):
+        # Title - minimum 3 karakter
+        title = listing_data.get("title", "")
+        if not title or len(str(title).strip()) < 3:
             missing.append("title")
+        
+        # Description - minimum 10 karakter (zorunlu alan)
+        description = listing_data.get("description", "")
+        if not description or len(str(description).strip()) < 10:
+            missing.append("description")
         
         # Price
         price = listing_data.get("price")
