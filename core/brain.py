@@ -361,6 +361,10 @@ class Brain:
         current_listing: Optional[Dict[str, Any]] = None,
         images: Optional[List[str]] = None,
         conversation_history: Optional[List[Dict]] = None,
+        # YENİ: Zengin context parametreleri
+        fsm_state: str = "IDLE",  # IDLE, DRAFTING, READY
+        missing_fields: Optional[List[str]] = None,
+        last_intent: Optional[str] = None,
     ) -> BrainOutput:
         """
         Ana beyin fonksiyonu.
@@ -370,6 +374,9 @@ class Brain:
             current_listing: Mevcut listing_data (session'dan)
             images: Görsel URL'leri
             conversation_history: Geçmiş mesajlar
+            fsm_state: FSM durumu (IDLE, DRAFTING, READY)
+            missing_fields: Eksik alanlar listesi
+            last_intent: Son intent (CREATE, SEARCH, CHAT)
         
         Returns:
             BrainOutput: Sanitized LLM çıktısı
@@ -390,8 +397,16 @@ class Brain:
                     raw_response={"cancelled": True}
                 )
             
+            # Build context
+            context = self._build_context(
+                current_listing=current_listing,
+                fsm_state=fsm_state,
+                missing_fields=missing_fields or [],
+                last_intent=last_intent,
+            )
+            
             # Build messages
-            messages = self._build_messages(clean_message, current_listing, images, conversation_history)
+            messages = self._build_messages(clean_message, context, images, conversation_history)
             
             # Choose model
             model = self.vision_model if images else self.model
@@ -423,10 +438,72 @@ class Brain:
             logger.error(f"Brain error: {e}", exc_info=True)
             return self._fallback_response(str(e))
     
+    def _build_context(
+        self,
+        current_listing: Optional[Dict],
+        fsm_state: str,
+        missing_fields: List[str],
+        last_intent: Optional[str],
+    ) -> str:
+        """
+        Zengin context oluştur - Brain'in durumu anlaması için
+        """
+        lines = ["## 📍 MEVCUT DURUM"]
+        
+        # FSM State
+        state_emoji = {"IDLE": "🆕", "DRAFTING": "✏️", "READY": "✅"}.get(fsm_state, "❓")
+        state_desc = {
+            "IDLE": "Yeni başlıyor, henüz ilan oluşturma başlamadı",
+            "DRAFTING": "İlan oluşturuluyor, bazı bilgiler eksik",
+            "READY": "İlan hazır, kullanıcı onayı bekleniyor"
+        }.get(fsm_state, "Bilinmiyor")
+        lines.append(f"**Durum:** {state_emoji} {fsm_state} - {state_desc}")
+        
+        # Last Intent
+        if last_intent:
+            lines.append(f"**Son işlem:** {last_intent}")
+        
+        # Current Listing Data
+        if current_listing:
+            lines.append("\n**Mevcut İlan Verisi:**")
+            lines.append("```json")
+            lines.append(json.dumps(current_listing, ensure_ascii=False, indent=2))
+            lines.append("```")
+            
+            # Filled fields
+            filled = [k for k, v in current_listing.items() if v]
+            if filled:
+                lines.append(f"✅ Dolu alanlar: {', '.join(filled)}")
+        else:
+            lines.append("\n**Mevcut İlan Verisi:** Henüz yok (yeni başlıyor)")
+        
+        # Missing Fields
+        if missing_fields:
+            lines.append(f"⏳ **Eksik zorunlu alanlar:** {', '.join(missing_fields)}")
+            lines.append("→ Bu alanları kullanıcıdan iste!")
+        elif fsm_state == "READY":
+            lines.append("✅ **Tüm zorunlu alanlar tamam!** Yayınlamak için onay iste.")
+        
+        # Instructions based on state
+        lines.append("\n## 📋 NE YAPMALISIN")
+        if fsm_state == "IDLE":
+            lines.append("- Yeni kullanıcı, selamla ve ne yapmak istediğini sor")
+            lines.append("- İlan vermek istiyorsa CREATE intent ile başla")
+        elif fsm_state == "DRAFTING":
+            lines.append("- Eksik alanları doğal bir şekilde sor")
+            lines.append("- Mevcut verileri KORU, üzerine ekle")
+            lines.append("- Her mesajda preview göster")
+        elif fsm_state == "READY":
+            lines.append("- İlan hazır, son preview göster")
+            lines.append("- Kullanıcıdan 'yayınla' onayı iste")
+            lines.append("- Düzenleme isterse yardımcı ol")
+        
+        return "\n".join(lines)
+    
     def _build_messages(
         self,
         message: str,
-        current_listing: Optional[Dict],
+        context: str,
         images: Optional[List[str]],
         history: Optional[List[Dict]],
     ) -> List[Dict]:
@@ -445,21 +522,15 @@ class Brain:
         # User message content
         user_content = []
         
-        # Current listing context - LLM'in mevcut durumu bilmesi için
-        if current_listing:
-            context = f"""Mevcut ilan verisi (session'dan):
-```json
-{json.dumps(current_listing, ensure_ascii=False, indent=2)}
-```
-
-Bu veriyi koru ve üzerine ekle. Kullanıcı yeni bilgi verirse güncelle."""
-            user_content.append({"type": "text", "text": context})
+        # Zengin context
+        user_content.append({"type": "text", "text": context})
         
         # User message
-        user_content.append({"type": "text", "text": f"Kullanıcı: {message}"})
+        user_content.append({"type": "text", "text": f"\n## 💬 KULLANICI MESAJI\n{message}"})
         
         # Images - Vision analysis
         if images:
+            user_content.append({"type": "text", "text": "\n## 📷 GELEN GÖRSELLER"})
             for img_url in images[:3]:
                 user_content.append({
                     "type": "image_url",
@@ -467,6 +538,8 @@ Bu veriyi koru ve üzerine ekle. Kullanıcı yeni bilgi verirse güncelle."""
                 })
         
         messages.append({"role": "user", "content": user_content})
+        
+        return messages
         
         return messages
     

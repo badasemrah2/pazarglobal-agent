@@ -307,15 +307,27 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         # 1. Load session
         session = await load_session(request.user_id)
         
-        # 2. Call Brain
+        # 2. Calculate context for Brain
+        current_listing = session.get("listing_data", {})
+        fsm_state = session.get("state", "IDLE")
+        last_intent = session.get("last_intent")
+        
+        # Pre-calculate missing fields
+        _, missing_fields = FSMEngine.validate(current_listing) if current_listing else (False, ["title", "price", "category"])
+        
+        # 3. Call Brain with rich context
         brain_output = await brain.process(
             message=request.message,
-            current_listing=session.get("listing_data"),
+            current_listing=current_listing,
             images=request.media_urls,
             conversation_history=session.get("conversation_history"),
+            # Zengin context
+            fsm_state=fsm_state,
+            missing_fields=missing_fields,
+            last_intent=last_intent,
         )
         
-        # 3. Handle by intent
+        # 4. Handle by intent
         if brain_output.intent == Intent.CANCEL:
             # LLM override - reset
             await clear_session(request.user_id)
@@ -330,12 +342,16 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             )
         
         elif brain_output.intent == Intent.SEARCH:
+            # Save last intent
+            session["last_intent"] = "SEARCH"
+            await save_session(request.user_id, session)
             return await _handle_search(request.message)
         
         elif brain_output.intent == Intent.CREATE:
             return await _handle_create(request.user_id, session, brain_output, request.message)
         
         else:  # CHAT
+            session["last_intent"] = "CHAT"
             return await _handle_chat(request.user_id, session, brain_output)
     
     except Exception as e:
@@ -367,6 +383,7 @@ async def _handle_create(user_id: str, session: Dict, brain_output: BrainOutput,
     # Update session
     session["listing_data"] = current
     session["state"] = "READY" if is_valid else "DRAFTING"
+    session["last_intent"] = "CREATE"  # Brain'in context için bilmesi lazım
     
     # Add to history
     session.setdefault("conversation_history", []).append({
