@@ -37,6 +37,14 @@ router = APIRouter(prefix="/api/v3", tags=["gateway-v3"])
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FSM STATE CONSTANTS (defined early for use in load_session)
+# ═══════════════════════════════════════════════════════════════════
+FSM_STATE_IDLE = "IDLE"
+FSM_STATE_DRAFTING = "DRAFTING"
+FSM_STATE_PENDING_CONFIRMATION = "PENDING_CONFIRMATION"  # Waiting for "onayla"
+
+
+# ═══════════════════════════════════════════════════════════════════
 # REQUEST/RESPONSE MODELS
 # ═══════════════════════════════════════════════════════════════════
 
@@ -82,6 +90,10 @@ async def load_session(user_id: str, channel: str) -> Dict[str, Any]:
         "last_intent": session.get("last_intent"),
         "draft_updated_at": session.get("draft_updated_at"),
         "search_cache": session.get("search_cache", []),
+        # FSM 2-step confirmation state
+        "fsm_state": session.get("fsm_state", FSM_STATE_IDLE),
+        "pending_publish_balance": session.get("pending_publish_balance"),
+        "pending_publish_cost": session.get("pending_publish_cost"),
     }
 
 
@@ -400,11 +412,6 @@ class FSMEngine:
 # FSM STATE MACHINE - Deterministic confirmation flow (LLM bypass)
 # ═══════════════════════════════════════════════════════════════════
 
-# FSM States
-FSM_STATE_IDLE = "IDLE"
-FSM_STATE_DRAFTING = "DRAFTING"
-FSM_STATE_PENDING_CONFIRMATION = "PENDING_CONFIRMATION"  # Waiting for "onayla"
-
 # FSM Commands (deterministic, LLM bypassed)
 # IMPORTANT: In PENDING_CONFIRMATION state, these commands trigger direct action without LLM
 FSM_COMMANDS = {
@@ -487,6 +494,10 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
     session["fsm_state"] = FSM_STATE_PENDING_CONFIRMATION
     session["pending_publish_balance"] = balance
     session["pending_publish_cost"] = credit_cost
+    
+    # DEBUG: Log that we're setting PENDING_CONFIRMATION state
+    logger.info(f"FSM: Setting fsm_state=PENDING_CONFIRMATION for user={user_id}")
+    
     await save_session(user_id, channel, session)
     
     buttons = []
@@ -655,6 +666,9 @@ async def handle_message(
         # ═══════════════════════════════════════════════════════════════════
         lower_msg = (request.message or "").lower().strip()
         fsm_state = session.get("fsm_state", FSM_STATE_IDLE)
+        
+        # DEBUG: Log FSM state for troubleshooting
+        logger.info(f"FSM state check: fsm_state={fsm_state}, msg={lower_msg}")
         
         if fsm_state == FSM_STATE_PENDING_CONFIRMATION:
             # In confirmation state - check for deterministic commands
