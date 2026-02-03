@@ -438,11 +438,13 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
     # FSM validate - kategori otomatik belirlensin!
     FSMEngine.validate(listing)
     
-    # Get user balance
+    # Get user balance - use sync client
     try:
-        result = await supabase_client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
+        result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
         balance = float(result.data[0]["balance_bigint"]) if result.data else 0
-    except Exception:
+        logger.info(f"FSM: Wallet balance for {user_id}: {balance} (raw: {result.data})")
+    except Exception as e:
+        logger.error(f"FSM: Failed to get wallet balance for {user_id}: {e}")
         balance = 0
     
     credit_cost = 55
@@ -531,8 +533,16 @@ async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, co
     if command == "CONFIRM":
         # Direct publish - no LLM involved
         listing = session.get("listing_data", {})
-        balance = session.get("pending_publish_balance", 0)
         cost = session.get("pending_publish_cost", 55)
+        
+        # Get FRESH balance from DB (not from session - may be stale)
+        try:
+            result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
+            balance = float(result.data[0]["balance_bigint"]) if result.data else 0
+            logger.info(f"FSM CONFIRM: Fresh balance for {user_id}: {balance}")
+        except Exception as e:
+            logger.error(f"FSM CONFIRM: Failed to get balance: {e}")
+            balance = 0
         
         if balance < cost:
             return MessageResponse(
