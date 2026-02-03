@@ -69,6 +69,67 @@ class MessageResponse(BaseModel):
     error: Optional[str] = None
 
 
+def _normalize_media_url(candidate: str) -> str:
+    """Convert storage paths to public Supabase URLs when possible."""
+    c = (candidate or "").strip()
+    if not c:
+        return ""
+    if c.startswith(("http://", "https://")):
+        return c
+    base = (settings.supabase_url or "").strip().rstrip("/")
+    if c.startswith("/storage/"):
+        return f"{base}{c}" if base else c
+    if base:
+        path = c.lstrip("/")
+        return f"{base}/storage/v1/object/public/product-images/{path}"
+    return c
+
+
+def _normalize_media_urls(media_urls: Optional[List[str]]) -> List[str]:
+    if not media_urls:
+        return []
+    normalized: List[str] = []
+    for url in media_urls:
+        norm = _normalize_media_url(url)
+        if norm and norm not in normalized:
+            normalized.append(norm)
+    return normalized
+
+
+def _filter_valid_images(images: Optional[List[Any]]) -> List[str]:
+    if not images:
+        return []
+    valid: List[str] = []
+    for entry in images:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            candidate = (
+                entry.get("image_url")
+                or entry.get("public_url")
+                or entry.get("url")
+                or entry.get("path")
+            )
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+        elif isinstance(entry, str):
+            value = entry.strip()
+        else:
+            continue
+
+        if not value or value.upper() == "URL":
+            continue
+        if not re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", value, re.IGNORECASE):
+            continue
+
+        norm = _normalize_media_url(value)
+        if norm and norm not in valid:
+            valid.append(norm)
+
+    return valid
+
+
 # ═══════════════════════════════════════════════════════════════════
 # SESSION MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════
@@ -359,11 +420,35 @@ class FSMEngine:
             
             # Generate keywords
             keywords_text = cls.generate_keywords(listing_data)
+
+            # Build metadata (standardized format)
+            from datetime import datetime, timezone
+
+            existing_metadata = listing_data.get("metadata")
+            metadata: Dict[str, Any] = existing_metadata if isinstance(existing_metadata, dict) else {}
+
+            created_via = listing_data.get("created_via") or "webchat"
+            keyword_list = [
+                k.lower()
+                for k in re.findall(r"[\wğüşöçıİĞÜŞÖÇ]+", keywords_text, flags=re.UNICODE)
+                if k
+            ]
+
+            metadata.update({
+                "source": "agent",
+                "created_via": created_via,
+                "client_app": "pazarglobal-agent",
+                "flow_version": "2026-01-18",
+                "keyword_source": metadata.get("keyword_source") or "fsm",
+                "created_at_client": metadata.get("created_at_client") or datetime.now(timezone.utc).isoformat(),
+                "attributes": metadata.get("attributes") or {},
+                "keywords": metadata.get("keywords") or keyword_list,
+                "keywords_text": metadata.get("keywords_text") or keywords_text,
+            })
             
-            # Build metadata
-            metadata = listing_data.get("metadata", {})
-            metadata["keywords_text"] = keywords_text
-            
+            # Sanitize images before publish
+            safe_images = _filter_valid_images(listing_data.get("images", []))
+
             # Build final listing object
             final_listing = {
                 "id": listing_id,
@@ -375,8 +460,8 @@ class FSMEngine:
                 "condition": listing_data.get("condition", "2. El"),
                 "location": listing_data.get("location"),
                 "status": "active",
-                "images": listing_data.get("images", []),
-                "image_url": listing_data.get("images", [None])[0] if listing_data.get("images") else None,
+                "images": safe_images,
+                "image_url": safe_images[0] if safe_images else None,
                 "metadata": metadata,
             }
             
@@ -429,6 +514,98 @@ FSM_COMMANDS = {
     "iptal et": "CANCEL",
     "hayır": "CANCEL",
 }
+
+# FSM Edit commands (deterministic, LLM bypassed)
+EDIT_FIELD_MAP = {
+    "başlık": "title",
+    "baslik": "title",
+    "title": "title",
+    "açıklama": "description",
+    "aciklama": "description",
+    "description": "description",
+    "fiyat": "price",
+    "price": "price",
+    "durum": "condition",
+    "condition": "condition",
+    "lokasyon": "location",
+    "konum": "location",
+    "location": "location",
+    "kategori": "category",
+    "category": "category",
+}
+
+CONDITION_ALIASES = {
+    "sıfır": "Sıfır",
+    "sifir": "Sıfır",
+    "az kullanılmış": "Az Kullanılmış",
+    "az kullanilmis": "Az Kullanılmış",
+    "az kullanilmis": "Az Kullanılmış",
+    "2. el": "2. El",
+    "2 el": "2. El",
+    "2el": "2. El",
+    "ikinci el": "2. El",
+}
+
+
+def _parse_price_value(raw_value: str) -> Optional[int]:
+    cleaned = re.sub(r"[^0-9]", "", raw_value or "")
+    if not cleaned:
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def _parse_condition_value(raw_value: str) -> Optional[str]:
+    normalized = (raw_value or "").strip().lower()
+    if normalized in CONDITION_ALIASES:
+        return CONDITION_ALIASES[normalized]
+    # Allow exact matches if user already typed a valid condition
+    for allowed in FSMEngine.ALLOWED_CONDITIONS:
+        if normalized == allowed.lower():
+            return allowed
+    return None
+
+
+def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
+    updates: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    if not message:
+        return updates, errors
+
+    # Split by lines or semicolons for multi-field edits
+    parts = re.split(r"[\n;]+", message)
+    for part in parts:
+        if ":" not in part:
+            continue
+        raw_key, raw_value = part.split(":", 1)
+        key = raw_key.strip().lower()
+        value = (raw_value or "").strip()
+        if not value:
+            continue
+
+        field = EDIT_FIELD_MAP.get(key)
+        if not field:
+            continue
+
+        if field == "price":
+            parsed_price = _parse_price_value(value)
+            if parsed_price is None:
+                errors.append("fiyat")
+            else:
+                updates[field] = parsed_price
+        elif field == "condition":
+            parsed_condition = _parse_condition_value(value)
+            if parsed_condition is None:
+                errors.append("durum")
+            else:
+                updates[field] = parsed_condition
+        else:
+            updates[field] = value
+
+    return updates, errors
 
 
 async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Dict) -> MessageResponse:
@@ -606,6 +783,44 @@ async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, co
     )
 
 
+async def _fsm_handle_edit_request(user_id: str, channel: str, session: Dict, message: str) -> MessageResponse:
+    """FSM: Handle edit requests in PENDING_CONFIRMATION state without LLM"""
+    updates, errors = _parse_edit_updates(message)
+
+    if errors:
+        return MessageResponse(
+            success=False,
+            text=(
+                "❌ Geçersiz değer girdiniz.\n\n"
+                "Geçerli alanlar: başlık, açıklama, fiyat, durum, lokasyon.\n"
+                "Örnek: `başlık: Yeni Başlık` veya `fiyat: 12500`"
+            ),
+            metadata={"error": "invalid_edit_value", "fields": errors},
+        )
+
+    if not updates:
+        return MessageResponse(
+            success=True,
+            text=(
+                "Düzenlemek için şu formatı kullanın:\n"
+                "`başlık: Yeni Başlık`\n"
+                "`açıklama: Yeni açıklama`\n"
+                "`fiyat: 12500`\n"
+                "`durum: Sıfır | Az Kullanılmış | 2. El`\n"
+                "`lokasyon: Kadıköy, İstanbul`\n\n"
+                "Onaylamak için **onayla**, iptal için **iptal** yazın."
+            ),
+            metadata={"intent": "PENDING_CONFIRMATION"},
+        )
+
+    listing = session.get("listing_data", {})
+    listing.update(updates)
+    session["listing_data"] = listing
+    session["draft_updated_at"] = datetime.utcnow().isoformat()
+
+    return await _fsm_show_confirmation_preview(user_id, channel, session)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # MAIN ENDPOINT
 # ═══════════════════════════════════════════════════════════════════
@@ -650,6 +865,28 @@ async def handle_message(
         # 1. Load session (channel scoped)
         session = await load_session(user_id, request.channel)
 
+        # Ensure created_via is tracked for consistent metadata
+        if request.channel in ("webchat", "whatsapp"):
+            listing_data = session.get("listing_data", {})
+            if isinstance(listing_data, dict) and not listing_data.get("created_via"):
+                listing_data["created_via"] = request.channel
+                session["listing_data"] = listing_data
+                await save_session(user_id, request.channel, session)
+
+        # 1.0 Attach WhatsApp media paths to listing_data (if provided)
+        if request.channel == "whatsapp" and request.media_urls:
+            normalized_media = _normalize_media_urls(request.media_urls)
+            if normalized_media:
+                listing_data = session.get("listing_data", {})
+                existing_images = listing_data.get("images", [])
+                for url in normalized_media:
+                    if url not in existing_images:
+                        existing_images.append(url)
+                listing_data["images"] = existing_images[:5]
+                session["listing_data"] = listing_data
+                session["draft_updated_at"] = datetime.utcnow().isoformat()
+                await save_session(user_id, request.channel, session)
+
         # 1.1 Draft TTL check (10 minutes)
         draft_updated_at = session.get("draft_updated_at")
         if draft_updated_at:
@@ -675,6 +912,7 @@ async def handle_message(
         # 1.2 FSM STATE CHECK - LLM BYPASS for deterministic commands
         # ═══════════════════════════════════════════════════════════════════
         lower_msg = (request.message or "").lower().strip()
+        normalized_cmd = re.sub(r"[^\wşğıöçü]+", " ", lower_msg, flags=re.UNICODE).strip()
         fsm_state = session.get("fsm_state", FSM_STATE_IDLE)
         
         # DEBUG: Log FSM state for troubleshooting
@@ -682,18 +920,16 @@ async def handle_message(
         
         if fsm_state == FSM_STATE_PENDING_CONFIRMATION:
             # In confirmation state - check for deterministic commands
-            fsm_command = FSM_COMMANDS.get(lower_msg)
+            fsm_command = FSM_COMMANDS.get(normalized_cmd)
             
             if fsm_command:
                 # Deterministic command - LLM BYPASSED
                 logger.info(f"FSM: PENDING_CONFIRMATION state, command={fsm_command}, bypassing LLM")
                 return await _fsm_handle_confirmation(user_id, request.channel, session, fsm_command)
-            else:
-                # Not a command - treat as edit request, go back to DRAFTING
-                session["fsm_state"] = FSM_STATE_DRAFTING
-                await save_session(user_id, request.channel, session)
-                logger.info(f"FSM: User sent non-command in PENDING_CONFIRMATION, reverting to DRAFTING")
-                # Continue to LLM for editing...
+            # Not a command - allow free-form edits via LLM
+            session["fsm_state"] = FSM_STATE_DRAFTING
+            await save_session(user_id, request.channel, session)
+            logger.info("FSM: PENDING_CONFIRMATION state, non-command received, routing to LLM for edits")
         
         # 1.3 Detail command handling (uses last search cache)
         detail_match = re.search(r"(\d+)\s*nolu\s*ilan", lower_msg)
@@ -830,9 +1066,14 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
         if value is not None:
             current[key] = value
     
-    # Ensure images are preserved (don't overwrite with empty list)
-    if existing_images and not current.get("images"):
-        current["images"] = existing_images
+    # Sanitize images and preserve existing ones if LLM overwrote with placeholders
+    sanitized_images = _filter_valid_images(current.get("images", []))
+    if sanitized_images:
+        current["images"] = sanitized_images
+    elif existing_images:
+        fallback_images = _filter_valid_images(existing_images)
+        if fallback_images:
+            current["images"] = fallback_images
     
     logger.info(f"CREATE: current listing data: {current}")
     logger.info(f"CREATE: user_confirmed={brain_output.user_confirmed}, ready_for_fsm={brain_output.ready_for_fsm}")
