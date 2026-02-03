@@ -406,13 +406,21 @@ FSM_STATE_DRAFTING = "DRAFTING"
 FSM_STATE_PENDING_CONFIRMATION = "PENDING_CONFIRMATION"  # Waiting for "onayla"
 
 # FSM Commands (deterministic, LLM bypassed)
+# IMPORTANT: In PENDING_CONFIRMATION state, these commands trigger direct action without LLM
 FSM_COMMANDS = {
+    # Confirmation commands
     "onayla": "CONFIRM",
     "onaylıyorum": "CONFIRM",
     "evet onayla": "CONFIRM",
+    "yayınla": "CONFIRM",  # In PENDING_CONFIRMATION state, "yayınla" = final confirm
+    "yayinla": "CONFIRM",  # Turkish keyboard variation
+    "evet": "CONFIRM",
+    "evet yayınla": "CONFIRM",
+    # Cancel commands
     "iptal": "CANCEL",
     "vazgeçtim": "CANCEL",
     "iptal et": "CANCEL",
+    "hayır": "CANCEL",
 }
 
 
