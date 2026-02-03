@@ -1496,10 +1496,20 @@ class SupabaseClient:
                 query = query.lte("price", max_price)
             
             if search_text:
+                try:
+                    from services.text_normalization import normalize_keyboard_text
+
+                    normalized_search = normalize_keyboard_text(search_text)
+                except Exception:
+                    normalized_search = search_text
+
+                search_norm = (normalized_search or "").lower()
+                search_raw = (search_text or "").lower()
+
                 if getattr(settings, "enable_metadata_keyword_search", False):
                     # Multi-word search strategy: search each token individually
                     # "nike ayakkabı" should match "Nike koşu ayakkabısı" (both words present)
-                    tokens = [t for t in re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ]+", search_text.lower()) if len(t) >= 2]
+                    tokens = [t for t in re.findall(r"[0-9a-zA-ZçğıöşüÇĞİÖŞÜ]+", search_norm) if len(t) >= 2]
                     
                     if len(tokens) >= 2:
                         # Multi-word query: search ALL tokens (AND logic via multiple OR clauses per token)
@@ -1511,27 +1521,34 @@ class SupabaseClient:
                             clauses.append(f"description.ilike.%{tok}%")
                             clauses.append(f"metadata->>keywords_text.ilike.%{tok}%")
                         # Also try full phrase for exact matches (bonus)
-                        clauses.append(f"title.ilike.%{search_text}%")
-                        clauses.append(f"metadata->>keywords_text.ilike.%{search_text}%")
+                        clauses.append(f"title.ilike.%{search_norm}%")
+                        clauses.append(f"metadata->>keywords_text.ilike.%{search_norm}%")
+                        if search_raw and search_raw != search_norm:
+                            clauses.append(f"title.ilike.%{search_raw}%")
+                            clauses.append(f"metadata->>keywords_text.ilike.%{search_raw}%")
                         query = query.or_(",".join(clauses))
                     else:
                         # Single-word query: use broader matching for better recall
                         # This ensures "laptop" matches "Dell Laptop", "dizüstü" matches "dizüstü bilgisayar"
                         clauses: List[str] = [
-                            f"title.ilike.%{search_text}%",
-                            f"description.ilike.%{search_text}%",
-                            f"category.ilike.%{search_text}%",  # Added: search in category too
+                            f"title.ilike.%{search_norm}%",
+                            f"description.ilike.%{search_norm}%",
+                            f"category.ilike.%{search_norm}%",  # Added: search in category too
                         ]
                         # Add individual token search for single words (broad recall)
                         for tok in tokens[:4]:
                             clauses.append(f"title.ilike.%{tok}%")
                             clauses.append(f"description.ilike.%{tok}%")
                             clauses.append(f"metadata->>keywords_text.ilike.%{tok}%")
-                        clauses.append(f"metadata->>keywords_text.ilike.%{search_text}%")
+                        clauses.append(f"metadata->>keywords_text.ilike.%{search_norm}%")
+                        if search_raw and search_raw != search_norm:
+                            clauses.append(f"title.ilike.%{search_raw}%")
+                            clauses.append(f"description.ilike.%{search_raw}%")
+                            clauses.append(f"metadata->>keywords_text.ilike.%{search_raw}%")
                         query = query.or_(",".join(clauses))
                 else:
                     # Legacy fallback: title/description only (less accurate but faster)
-                    query = query.or_(f"title.ilike.%{search_text}%,description.ilike.%{search_text}%")
+                    query = query.or_(f"title.ilike.%{search_norm}%,description.ilike.%{search_norm}%")
             
             result = query.limit(limit).execute()
             rows = self._list_of_dicts(result.data)

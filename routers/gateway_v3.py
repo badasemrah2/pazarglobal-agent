@@ -211,17 +211,28 @@ class FSMEngine:
             (is_valid, missing_fields)
         """
         missing = []
-        
-        # Title - minimum 3 karakter
+
+        # Normalize text fields to TR/EN keyboard-safe alphabet
+        try:
+            from services.text_normalization import normalize_keyboard_text
+
+            for key in ["title", "description", "location"]:
+                raw_val = listing_data.get(key)
+                if isinstance(raw_val, str) and raw_val.strip():
+                    listing_data[key] = normalize_keyboard_text(raw_val)
+        except Exception:
+            pass
+
+        # Title - minimum 5 karakter (zorunlu alan)
         title = listing_data.get("title", "")
-        if not title or len(str(title).strip()) < 3:
+        if not title or len(str(title).strip()) < 5:
             missing.append("title")
-        
+
         # Description - minimum 10 karakter (zorunlu alan)
         description = listing_data.get("description", "")
         if not description or len(str(description).strip()) < 10:
             missing.append("description")
-        
+
         # Price
         price = listing_data.get("price")
         if price is None:
@@ -233,10 +244,9 @@ class FSMEngine:
                     missing.append("price")
             except (ValueError, TypeError):
                 missing.append("price")
-        
+
         # Category - FSM OTOMATİK BELİRLER (LLM sorumluluğunda değil!)
         category = listing_data.get("category")
-        
         # Önce normalize et (kullanıcı "Tarım&Gıda" yazmışsa "Tarım & Gıda" yap)
         if category and category not in ["Sistem", "Otomatik", ""]:
             normalized = cls.normalize_category_id(category)
