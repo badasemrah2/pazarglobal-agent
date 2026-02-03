@@ -212,14 +212,15 @@ class FSMEngine:
         """
         missing = []
 
-        # Normalize text fields to TR/EN keyboard-safe alphabet
+        # Normalize text fields to TR/EN keyboard-safe alphabet + sentence case
         try:
-            from services.text_normalization import normalize_keyboard_text
+            from services.text_normalization import normalize_keyboard_text, sentence_case_tr
 
             for key in ["title", "description", "location"]:
                 raw_val = listing_data.get(key)
                 if isinstance(raw_val, str) and raw_val.strip():
-                    listing_data[key] = normalize_keyboard_text(raw_val)
+                    normalized = normalize_keyboard_text(raw_val)
+                    listing_data[key] = sentence_case_tr(normalized)
         except Exception:
             pass
 
@@ -642,13 +643,18 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
         category_display = "Diğer"
     
     # Format detailed preview
+    try:
+        from services.text_normalization import sentence_case_tr
+    except Exception:
+        sentence_case_tr = lambda s: s
+
     preview = f"""📋 **YAYIN ÖNCESİ KONTROL**
 
 **BAŞLIK:**
-{listing.get('title', '—')}
+{sentence_case_tr(listing.get('title', '—'))}
 
 **AÇIKLAMA:**
-{listing.get('description', '—')}
+{sentence_case_tr(listing.get('description', '—'))}
 
 **FİYAT:**
 {listing.get('price', 0):,.0f} ₺
@@ -660,7 +666,7 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
 {category_display} ✅ (Sistem tarafından belirlendi)
 
 **LOKASYON:**
-{listing.get('location', 'Belirtilmemiş')}
+{sentence_case_tr(listing.get('location', 'Belirtilmemiş'))}
 
 **FOTOĞRAFLAR:**
 {len(listing.get('images', []))} adet
@@ -1323,13 +1329,18 @@ def _detect_price_query(message: str) -> Optional[str]:
 def _format_preview(listing: Dict[str, Any]) -> str:
     """Format current draft as preview text."""
     lines = ["📋 İlan Önizleme:"]
+
+    try:
+        from services.text_normalization import sentence_case_tr
+    except Exception:
+        sentence_case_tr = lambda s: s
     
-    title = listing.get("title")
+    title = sentence_case_tr(listing.get("title") or "")
     price = listing.get("price")
     category = listing.get("category")
-    description = listing.get("description")
+    description = sentence_case_tr(listing.get("description") or "")
     condition = listing.get("condition")
-    location = listing.get("location")
+    location = sentence_case_tr(listing.get("location") or "")
     images = listing.get("images") or []
     
     # Show fields with checkmarks for filled, hourglass for missing

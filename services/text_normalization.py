@@ -59,6 +59,46 @@ _CHAR_MAP = {
 }
 
 
+_TR_UPPER = {
+    "i": "İ",
+    "ı": "I",
+    "ç": "Ç",
+    "ğ": "Ğ",
+    "ö": "Ö",
+    "ş": "Ş",
+    "ü": "Ü",
+}
+
+
+def _tr_upper(ch: str) -> str:
+    return _TR_UPPER.get(ch, ch.upper())
+
+
+def sentence_case_tr(text: str) -> str:
+    """Uppercase sentence starts with Turkish casing rules."""
+    if text is None:
+        return ""
+
+    s = str(text).strip()
+    if not s:
+        return ""
+
+    result: list[str] = []
+    capitalize_next = True
+
+    for ch in s:
+        if capitalize_next and ch.isalpha():
+            result.append(_tr_upper(ch))
+            capitalize_next = False
+        else:
+            result.append(ch)
+
+        if ch in ".!?\n":
+            capitalize_next = True
+
+    return "".join(result)
+
+
 def normalize_keyboard_text(text: str) -> str:
     """Normalize text to TR/EN keyboard-safe alphabet (Turkish 29 + q/w/x).
 
