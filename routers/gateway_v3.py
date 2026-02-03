@@ -18,13 +18,14 @@ Flow:
    - Ready + Confirmed? → Publish
 """
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 import re
 import uuid
 from datetime import datetime
 
 from config.settings import settings
+from services.jwt_auth import get_user_id_from_request
 from core.brain import brain, BrainOutput, Intent
 from services.redis_client import redis_client
 from services.supabase_client import supabase_client
@@ -581,15 +582,44 @@ async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, co
 # ═══════════════════════════════════════════════════════════════════
 
 @router.post("/message", response_model=MessageResponse)
-async def handle_message(request: MessageRequest) -> MessageResponse:
+async def handle_message(
+    request: MessageRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+) -> MessageResponse:
     """
     V3 Gateway - LLM Brain + FSM Engine
+    
+    Security:
+    - webchat: JWT token required (Authorization header)
+    - whatsapp: user_id from Edge Function (already PIN verified)
     """
-    logger.info(f"V3: user={request.user_id}, msg={request.message[:50]}...")
+    logger.info(f"V3: user={request.user_id}, channel={request.channel}, msg={request.message[:50]}...")
     
     try:
+        # ═══════════════════════════════════════════════════════════════════
+        # 0. SECURITY: Verify user_id based on channel
+        # ═══════════════════════════════════════════════════════════════════
+        is_valid, verified_user_id, auth_error = await get_user_id_from_request(
+            authorization=authorization,
+            request_user_id=request.user_id,
+            channel=request.channel
+        )
+        
+        if not is_valid:
+            logger.warning(f"Auth failed: {auth_error}")
+            return MessageResponse(
+                success=False,
+                text=f"🔒 Kimlik doğrulama hatası: {auth_error}",
+                error=auth_error,
+                metadata={"auth_error": True}
+            )
+        
+        # Use verified user_id for all operations
+        user_id = verified_user_id
+        logger.info(f"✅ Auth verified: user_id={user_id}")
+        
         # 1. Load session (channel scoped)
-        session = await load_session(request.user_id, request.channel)
+        session = await load_session(user_id, request.channel)
 
         # 1.1 Draft TTL check (10 minutes)
         draft_updated_at = session.get("draft_updated_at")
@@ -602,7 +632,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
                     session["fsm_state"] = FSM_STATE_IDLE
                     session["draft_updated_at"] = None
                     session["last_intent"] = None
-                    await save_session(request.user_id, request.channel, session)
+                    await save_session(user_id, request.channel, session)
             except Exception:
                 # If parsing fails, reset draft defensively
                 session["listing_data"] = {}
@@ -610,7 +640,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
                 session["fsm_state"] = FSM_STATE_IDLE
                 session["draft_updated_at"] = None
                 session["last_intent"] = None
-                await save_session(request.user_id, request.channel, session)
+                await save_session(user_id, request.channel, session)
 
         # ═══════════════════════════════════════════════════════════════════
         # 1.2 FSM STATE CHECK - LLM BYPASS for deterministic commands
@@ -625,11 +655,11 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             if fsm_command:
                 # Deterministic command - LLM BYPASSED
                 logger.info(f"FSM: PENDING_CONFIRMATION state, command={fsm_command}, bypassing LLM")
-                return await _fsm_handle_confirmation(request.user_id, request.channel, session, fsm_command)
+                return await _fsm_handle_confirmation(user_id, request.channel, session, fsm_command)
             else:
                 # Not a command - treat as edit request, go back to DRAFTING
                 session["fsm_state"] = FSM_STATE_DRAFTING
-                await save_session(request.user_id, request.channel, session)
+                await save_session(user_id, request.channel, session)
                 logger.info(f"FSM: User sent non-command in PENDING_CONFIRMATION, reverting to DRAFTING")
                 # Continue to LLM for editing...
         
@@ -694,7 +724,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             session["last_price_query"] = query
             if price_result.get("suggested_price"):
                 session["last_suggested_price"] = price_result["suggested_price"]
-            await save_session(request.user_id, request.channel, session)
+            await save_session(user_id, request.channel, session)
             
             return MessageResponse(
                 success=True,
@@ -709,7 +739,7 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         # 4. Handle by intent
         if brain_output.intent == Intent.CANCEL:
             # LLM override - reset
-            await clear_session(request.user_id, request.channel)
+            await clear_session(user_id, request.channel)
             return MessageResponse(
                 success=True,
                 text=brain_output.response_text,
@@ -723,11 +753,11 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
         elif brain_output.intent == Intent.SEARCH:
             # Save last intent
             session["last_intent"] = "SEARCH"
-            await save_session(request.user_id, request.channel, session)
-            return await _handle_search(request.user_id, request.channel, session, request.message)
+            await save_session(user_id, request.channel, session)
+            return await _handle_search(user_id, request.channel, session, request.message)
         
         elif brain_output.intent == Intent.CREATE:
-            return await _handle_create(request.user_id, request.channel, session, brain_output, request.message)
+            return await _handle_create(user_id, request.channel, session, brain_output, request.message)
         
         else:  # CHAT
             # IMPORTANT: Check if user is trying to confirm an existing draft
@@ -735,10 +765,10 @@ async def handle_message(request: MessageRequest) -> MessageResponse:
             from core.brain import Guardrails
             if last_intent == "CREATE" and current_listing and Guardrails.detect_confirmation(request.message):
                 logger.info(f"User confirming existing draft via CHAT intent, routing to CREATE handler")
-                return await _handle_create(request.user_id, request.channel, session, brain_output, request.message)
+                return await _handle_create(user_id, request.channel, session, brain_output, request.message)
             
             session["last_intent"] = "CHAT"
-            return await _handle_chat(request.user_id, request.channel, session, brain_output)
+            return await _handle_chat(user_id, request.channel, session, brain_output)
     
     except Exception as e:
         logger.error(f"V3 error: {e}", exc_info=True)
@@ -1297,17 +1327,38 @@ class MediaAnalyzeResponse(BaseModel):
 
 
 @router.post("/webchat/media/analyze", response_model=MediaAnalyzeResponse)
-async def analyze_media(request: MediaAnalyzeRequest) -> MediaAnalyzeResponse:
+async def analyze_media(
+    request: MediaAnalyzeRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+) -> MediaAnalyzeResponse:
     """
     Analyze uploaded media for product information.
     
+    Security: JWT token required for webchat channel
+    
     Flow:
-    1. Check safety (content moderation)
-    2. Analyze product (GPT-4 Vision)
-    3. Save images to session/draft
-    4. Return description of what AI sees
+    1. Verify JWT token
+    2. Check safety (content moderation)
+    3. Analyze product (GPT-4 Vision)
+    4. Save images to session/draft
+    5. Return description of what AI sees
     """
-    logger.info(f"Media analyze: user={request.user_id}, urls={len(request.media_urls)}")
+    # Security check
+    is_valid, verified_user_id, auth_error = await get_user_id_from_request(
+        authorization=authorization,
+        request_user_id=request.user_id,
+        channel="webchat"
+    )
+    
+    if not is_valid:
+        logger.warning(f"Media analyze auth failed: {auth_error}")
+        return MediaAnalyzeResponse(
+            success=False,
+            message=f"🔐 Kimlik doğrulama hatası: {auth_error}",
+        )
+    
+    user_id = verified_user_id
+    logger.info(f"Media analyze: user={user_id}, urls={len(request.media_urls)}")
     
     if not request.media_urls:
         return MediaAnalyzeResponse(
@@ -1364,7 +1415,7 @@ async def analyze_media(request: MediaAnalyzeRequest) -> MediaAnalyzeResponse:
                 all_descriptions.append(f"Görsel {i+1}: Ürün tanınamadı.")
         
         # 3. Save to session
-        session = await load_session(request.user_id, "webchat")
+        session = await load_session(user_id, "webchat")
         
         # Add images to listing_data
         listing_data = session.get("listing_data", {})
@@ -1390,7 +1441,7 @@ async def analyze_media(request: MediaAnalyzeRequest) -> MediaAnalyzeResponse:
         session["listing_data"] = listing_data
         session["state"] = "DRAFTING"
         session["draft_updated_at"] = datetime.utcnow().isoformat()
-        await save_session(request.user_id, "webchat", session)
+        await save_session(user_id, "webchat", session)
         
         # 4. Build response message
         if blocked_images:
