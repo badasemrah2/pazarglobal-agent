@@ -54,12 +54,12 @@ class BrainOutput:
 
 LISTING_SCHEMA = {
     "title": {"type": "string", "max_length": 200, "required": True},
-    "description": {"type": "string", "max_length": 2000, "required": False},
+    "description": {"type": "string", "min_length": 10, "max_length": 2000, "required": True},  # REQUIRED - matches REQUIRED_FIELDS
     "category": {
         "type": "enum",
         "values": ["Elektronik", "Otomotiv", "Emlak", "Mobilya & Dekorasyon", 
-                   "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer"],
-        "required": True
+                   "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer", "Sistem"],
+        "required": False  # FSM auto-determines, LLM writes "Sistem"
     },
     "price": {"type": "number", "min": 1, "max": 100_000_000, "required": True},
     "condition": {
@@ -83,9 +83,11 @@ REQUIRED_FIELDS = ["title", "price", "description"]
 class Guardrails:
     """LLM çıktısını validate et - deterministik, halüsinasyon yok"""
     
+    # "Sistem" is a sentinel value - LLM writes it, FSM replaces with real category
     ALLOWED_CATEGORIES = {
         "Elektronik", "Otomotiv", "Emlak", "Mobilya & Dekorasyon",
-        "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer"
+        "Moda & Aksesuar", "Spor & Hobi", "Hobi, Koleksiyon & Sanat", "Diğer",
+        "Sistem"  # Sentinel - FSM will auto-determine from title/description
     }
     
     ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "2. El"}
@@ -125,18 +127,21 @@ class Guardrails:
                 return False
         
         # Positive patterns - bunlar onay
+        # NOTE: FSM uses 2-step confirmation: "yayınla" → preview → "onayla" → publish
+        # So Brain's confirmation is just for initial "yayınla" detection
         confirm_patterns = [
-            r"^(yayınla|yayinla|onayla|onaylıyorum|onayliyorum|evet|olur)$",  # Tek kelime
+            r"^(yayınla|yayinla|onayla|onaylıyorum|onayliyorum)$",  # Tek kelime - evet/olur ÇIKARTILDI (çok belirsiz)
             r"\byayınla\b",
             r"\byayinla\b",
             r"\bonaylıyorum\b",
             r"\bonayliyorum\b",
             r"\bonayla\b",
-            r"^tamam$",  # Sadece "tamam" tek başına
-            r"^evet$",
-            r"^olur$",
+            # "^tamam$" ÇIKARTILDI - çok belirsiz, "anladım" anlamında da kullanılır
+            # "^evet$" ÇIKARTILDI - çok belirsiz
+            # "^olur$" ÇIKARTILDI - çok belirsiz
             r"yayına al",
             r"onay.*ver",
+            r"ilan.*yayınla",
         ]
         for pattern in confirm_patterns:
             if re.search(pattern, msg_lower):
@@ -225,12 +230,11 @@ class Guardrails:
         # 5. User confirmed
         user_confirmed = cls.detect_confirmation(user_message) and ready_for_fsm
         
-        # 6. Tool call - sadece perplexity
+        # 6. Tool call
+        # DEPRECATED: JSON-based tool_call removed - we use native OpenAI function calling
+        # Tool calls are handled in Brain.process() BEFORE Guardrails.sanitize() is called
+        # If we reach here, there's no tool call (native function calling returns early)
         tool_call = None
-        raw_tool = llm_response.get("tool_call")
-        if raw_tool and isinstance(raw_tool, dict):
-            if raw_tool.get("name") == "perplexity" and raw_tool.get("query"):
-                tool_call = {"name": "perplexity", "query": str(raw_tool["query"])[:200]}
         
         # 7. Suggestions
         suggestions = llm_response.get("suggestions") or []
@@ -366,36 +370,22 @@ Kullanıcı schema dışı bilgi verirse VEYA görsellerden tespit edersen, bunl
   "listing_data": {
     "title": "...",
     "description": "...",
-    "category": "...",
+    "category": "Sistem",
     "price": 0,
     "condition": "...",
     "location": "...",
     "images": []
   },
-  "suggestions": ["Başlık önerisi: ...", "Açıklama önerisi: ..."],
-  "tool_call": null
+  "suggestions": ["Başlık önerisi: ...", "Açıklama önerisi: ..."]
 }
 ```
 
-## TOOL CALL - Perplexity Fiyat Araştırması
+## PERPLEXITY FİYAT ARAŞTIRMASI
 
-SADECE şu durumlarda tool_call kullan:
-- "kaç para eder" / "kaç para ediyor"
-- "fiyat araştır" / "piyasa değeri"
-- "ne kadara satılır" / "değeri ne"
+Sistem otomatik olarak "kaç para eder", "fiyat öner", "piyasa değeri" sorularını algılar ve Perplexity API'yi çağırır.
+Sen sadece normal JSON yanıtı döndür - tool çağrısı sistem tarafından otomatik yapılır.
 
-Tool call formatı:
-```json
-{
-  "intent": "CHAT",
-  "response_text": "🔍 Fiyat araştırması yapıyorum...",
-  "listing_data": null,
-  "suggestions": [],
-  "tool_call": {"name": "perplexity", "query": "iPhone 14 Pro 256GB"}
-}
-```
-
-ÖNEMLİ: "kaç para eder" sorulduğunda SEARCH intent KULLANMA! CHAT intent ile tool_call döndür.
+ÖNEMLİ: "kaç para eder" sorulduğunda SEARCH intent KULLANMA! CHAT intent kullan.
 
 ## YASAKLAR
 - Schema'ya olmayan alan ekleme (örn: km, tramer alanı yok - description'a yaz)
