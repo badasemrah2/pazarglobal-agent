@@ -475,6 +475,24 @@ class FSMEngine:
                 "image_url": safe_images[0] if safe_images else None,
                 "metadata": metadata,
             }
+
+            # Attach user display info (best-effort)
+            try:
+                user_name = await supabase_client.get_user_display_name(user_id)
+            except Exception:
+                user_name = None
+            try:
+                user_phone = await supabase_client.get_user_phone(user_id)
+            except Exception:
+                user_phone = None
+
+            if not user_phone and isinstance(listing_data, dict):
+                raw_phone = listing_data.get("contact_phone")
+                if isinstance(raw_phone, str) and raw_phone.strip():
+                    user_phone = raw_phone.strip()
+
+            final_listing["user_name"] = user_name
+            final_listing["user_phone"] = user_phone
             
             # 5. Insert to Supabase
             logger.info(f"Inserting listing to Supabase: {listing_id}")
