@@ -1625,10 +1625,28 @@ class SupabaseClient:
     async def get_wallet_balance(self, user_id: str) -> Optional[float]:
         """Get user wallet balance"""
         try:
-            result = self.client.table("wallets").select("balance_bigint").eq("user_id", user_id).execute()
+            result = (
+                self.client.table("wallets")
+                .select("balance_bigint, free_unlimited_until")
+                .eq("user_id", user_id)
+                .execute()
+            )
             row = self._first_dict(result.data)
             if not row:
                 return None
+
+            promo_until = row.get("free_unlimited_until")
+            try:
+                if promo_until:
+                    from datetime import datetime, timezone
+                    dt = promo_until
+                    if isinstance(dt, str):
+                        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                    if isinstance(dt, datetime) and dt > datetime.now(timezone.utc):
+                        return float(10**12)
+            except Exception:
+                pass
+
             balance_value = row.get("balance_bigint")
             if balance_value is None:
                 return None
@@ -1660,6 +1678,33 @@ class SupabaseClient:
     async def deduct_credits(self, user_id: str, amount: int, description: str) -> bool:
         """Deduct credits from user wallet and record transaction"""
         try:
+            # Promo: if free_unlimited_until is active, do not deduct.
+            try:
+                promo_row = (
+                    self.client.table("wallets")
+                    .select("free_unlimited_until")
+                    .eq("user_id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                promo = self._first_dict(promo_row.data)
+                if promo and promo.get("free_unlimited_until") and amount > 0:
+                    from datetime import datetime, timezone
+                    dt = promo.get("free_unlimited_until")
+                    if isinstance(dt, str):
+                        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                    if isinstance(dt, datetime) and dt > datetime.now(timezone.utc):
+                        await self.log_action(
+                            action="deduct_credits_skipped_promo",
+                            metadata={"amount": amount, "description": description},
+                            resource_type="wallet",
+                            resource_id=user_id,
+                            user_id=user_id,
+                        )
+                        return True
+            except Exception:
+                pass
+
             balance = await self.get_wallet_balance(user_id)
             balance_int = int(balance) if balance is not None else None
             if balance_int is None or balance_int < amount:

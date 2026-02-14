@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from config import settings
 from routers.gateway_v3 import router as gateway_v3_router
+from routers.admin import router as admin_router
 from services.logger import get_logger
 from services.monitoring import monitoring_router
 from services.alerting import get_alerting_service
@@ -38,6 +39,7 @@ app.add_middleware(
 # Include routers
 app.include_router(gateway_v3_router)  # V3 - Single LLM Brain
 app.include_router(monitoring_router)
+app.include_router(admin_router)
 
 
 @app.post("/agent/run")

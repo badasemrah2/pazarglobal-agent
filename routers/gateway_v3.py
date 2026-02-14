@@ -324,7 +324,14 @@ class FSMEngine:
             logger.info(f"Checking wallet for user_id: {user_id}")
             # Use .limit(1) instead of .single() to avoid exception when no row found
             # Column name is balance_bigint (not balance) in actual Supabase table
-            result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
+            result = (
+                supabase_client.client
+                .table("wallets")
+                .select("balance_bigint, free_unlimited_until")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
             
             if not result.data or len(result.data) == 0:
                 logger.warning(f"No wallet found for user_id: {user_id}, creating one with 0 balance")
@@ -334,14 +341,30 @@ class FSMEngine:
                 try:
                     supabase_client.client.table("wallets").insert({
                         "user_id": user_id,
-                        "balance_bigint": 0
+                        "balance_bigint": 0,
                     }).execute()
                     logger.info(f"Created wallet with 0 balance for {user_id}")
                 except Exception as create_err:
                     logger.error(f"Failed to create wallet: {create_err}")
                 return False, 0.0
-            
-            balance = float(result.data[0].get("balance_bigint", 0))
+
+            row = result.data[0] if isinstance(result.data, list) and result.data else {}
+            promo_until = row.get("free_unlimited_until")
+            try:
+                if promo_until:
+                    # If promo is active, treat as unlimited credits.
+                    # We return a high balance for display purposes.
+                    from datetime import datetime, timezone
+                    dt = promo_until
+                    if isinstance(dt, str):
+                        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                    if isinstance(dt, datetime) and dt > datetime.now(timezone.utc):
+                        logger.info(f"Promo unlimited credits active until {dt.isoformat()} for user {user_id}")
+                        return True, 10**12
+            except Exception:
+                pass
+
+            balance = float(row.get("balance_bigint", 0) or 0)
             logger.info(f"Wallet balance for {user_id}: {balance} TL (required: {required_amount})")
             return balance >= required_amount, balance
             
@@ -356,13 +379,34 @@ class FSMEngine:
             logger.info(f"Deducting {amount} TL from user_id: {user_id}")
             # Get current balance - use .limit(1) instead of .single() to avoid exception
             # Column name is balance_bigint (not balance) in actual Supabase table
-            result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
+            result = (
+                supabase_client.client
+                .table("wallets")
+                .select("balance_bigint, free_unlimited_until")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
             
             if not result.data or len(result.data) == 0:
                 logger.error(f"No wallet found for deduction: {user_id}")
                 return False
-            
-            current = float(result.data[0].get("balance_bigint", 0))
+
+            row = result.data[0] if isinstance(result.data, list) and result.data else {}
+            promo_until = row.get("free_unlimited_until")
+            try:
+                if promo_until and float(amount) > 0:
+                    from datetime import datetime, timezone
+                    dt = promo_until
+                    if isinstance(dt, str):
+                        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                    if isinstance(dt, datetime) and dt > datetime.now(timezone.utc):
+                        logger.info(f"Promo active; skipping credit deduction for user {user_id}")
+                        return True
+            except Exception:
+                pass
+
+            current = float(row.get("balance_bigint", 0) or 0)
             new_balance = current - amount
             
             if new_balance < 0:
@@ -646,8 +690,29 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
     
     # Get user balance - use sync client
     try:
-        result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
-        balance = float(result.data[0]["balance_bigint"]) if result.data else 0
+        result = (
+            supabase_client.client
+            .table("wallets")
+            .select("balance_bigint, free_unlimited_until")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        row = result.data[0] if result.data else {}
+        balance = float(row.get("balance_bigint") or 0)
+
+        promo_until = row.get("free_unlimited_until")
+        try:
+            if promo_until:
+                from datetime import datetime, timezone
+                dt = promo_until
+                if isinstance(dt, str):
+                    dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                if isinstance(dt, datetime) and dt > datetime.now(timezone.utc):
+                    balance = float(10**12)
+        except Exception:
+            pass
+
         logger.info(f"FSM: Wallet balance for {user_id}: {balance} (raw: {result.data})")
     except Exception as e:
         logger.error(f"FSM: Failed to get wallet balance for {user_id}: {e}")
@@ -748,8 +813,29 @@ async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, co
         
         # Get FRESH balance from DB (not from session - may be stale)
         try:
-            result = supabase_client.client.table("wallets").select("balance_bigint").eq("user_id", user_id).limit(1).execute()
-            balance = float(result.data[0]["balance_bigint"]) if result.data else 0
+            result = (
+                supabase_client.client
+                .table("wallets")
+                .select("balance_bigint, free_unlimited_until")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            row = result.data[0] if result.data else {}
+            balance = float(row.get("balance_bigint") or 0)
+
+            promo_until = row.get("free_unlimited_until")
+            try:
+                if promo_until and cost > 0:
+                    from datetime import datetime, timezone
+                    dt = promo_until
+                    if isinstance(dt, str):
+                        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                    if isinstance(dt, datetime) and dt > datetime.now(timezone.utc):
+                        balance = float(10**12)
+            except Exception:
+                pass
+
             logger.info(f"FSM CONFIRM: Fresh balance for {user_id}: {balance}")
         except Exception as e:
             logger.error(f"FSM CONFIRM: Failed to get balance: {e}")
@@ -1133,11 +1219,20 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     await save_session(user_id, channel, session)
     
     # Handle Perplexity tool call
-    response_text = brain_output.response_text
+    response_text = (brain_output.response_text or "").strip()
     if brain_output.tool_call and brain_output.tool_call.get("name") == "perplexity":
         price_result = await _call_perplexity(brain_output.tool_call["query"])
         if price_result:
             response_text += f"\n\n💰 **Piyasa Araştırması:** {price_result:,.0f} TL civarı"
+
+    # Safety: never return an empty assistant message.
+    # Frontend commits assistant response only when `text` is non-empty.
+    if not response_text:
+        response_text = "✅ İlan bilgilerini güncelledim."
+
+    # Channels like WhatsApp may not render `listing_preview`; include a compact preview in text.
+    if channel != "webchat" and current.get("title") and "📋" not in response_text:
+        response_text = f"{response_text}\n\n{_format_preview(current)}"
     
     # Check if user wants to publish - use direct confirmation detection on user message
     from core.brain import Guardrails
