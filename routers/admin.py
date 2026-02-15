@@ -39,7 +39,7 @@ async def _require_admin_or_support(authorization: Optional[str]) -> Dict[str, A
         raise HTTPException(status_code=403, detail="inactive_user")
 
     role = (row.get("role") or "").strip().lower()
-    if role not in {"admin", "support"}:
+    if role not in {"admin", "assist"}:
         raise HTTPException(status_code=403, detail="forbidden")
 
     return {"user_id": user_id, "role": role}
@@ -170,7 +170,7 @@ async def admin_audit_recent(
     limit: int = 50,
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ):
-    """Fetch recent audit_logs entries (admin/support)."""
+    """Fetch recent audit_logs entries (admin/assist)."""
     await _require_admin_or_support(authorization)
     safe_limit = max(1, min(int(limit), 200))
     try:
