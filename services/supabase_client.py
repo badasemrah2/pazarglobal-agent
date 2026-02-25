@@ -1872,6 +1872,145 @@ class SupabaseClient:
         }
         return await self._call_edge_function("ai-assistant-cached", payload)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # image_safety_flags — Vision güvenlik olayları kaydı
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def log_image_safety_flag(
+        self,
+        flag_type: str,
+        confidence: str,
+        message: str,
+        user_id: Optional[str] = None,
+        image_url: Optional[str] = None,
+        status: str = "pending",
+    ) -> bool:
+        """
+        Vision katmanı bir görseli engellediğinde image_safety_flags tablosuna kayıt düşer.
+
+        Args:
+            flag_type: Engelleme sebebi (ör. "violence", "illicit", "moderation_api_error")
+            confidence: Güven skoru veya seviye (ör. "high", "0.97")
+            message: İnsan okunabilir açıklama
+            user_id: Yükleyen kullanıcı (biliniyorsa)
+            image_url: Engellenen görsel URL (biliniyorsa)
+            status: "pending" | "reviewed" | "dismissed"
+
+        Returns:
+            True if logged successfully
+        """
+        try:
+            payload: Dict[str, Any] = {
+                "flag_type": flag_type,
+                "confidence": confidence,
+                "message": message,
+                "status": status,
+            }
+            if user_id:
+                payload["user_id"] = user_id
+            if image_url:
+                payload["image_url"] = image_url[:2048]  # URL uzunluk limiti
+
+            result = self.client.table("image_safety_flags").insert(payload).execute()
+            logger.info(f"🚩 image_safety_flags kaydedildi: flag_type={flag_type}, user_id={user_id}")
+            return bool(result.data)
+        except Exception as e:
+            logger.error(f"image_safety_flags kayıt hatası: {e}")
+            return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # illegal_reports — Kullanıcı kaynaklı ilan şikayetleri
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def create_illegal_report(
+        self,
+        reporter_user_id: str,
+        listing_id: str,
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Kullanıcı bir ilanı şikayet ettiğinde illegal_reports tablosuna kayıt oluşturur.
+
+        Args:
+            reporter_user_id: Şikayeti yapan kullanıcının UUID'si
+            listing_id: Şikayet edilen ilanın UUID'si
+            reason: Şikayet sebebi (serbest metin)
+            evidence: Ek kanıt verisi (JSON — ekran görüntüsü URL, açıklama vb.)
+
+        Returns:
+            Oluşturulan satır dict veya None
+        """
+        try:
+            payload: Dict[str, Any] = {
+                "reporter_user": reporter_user_id,
+                "listing_id": listing_id,
+                "reason": reason,
+                "reviewed": False,
+            }
+            if evidence:
+                payload["evidence"] = evidence
+
+            result = self.client.table("illegal_reports").insert(payload).execute()
+            if result.data:
+                logger.info(f"📋 illegal_reports oluşturuldu: listing={listing_id}, reporter={reporter_user_id}")
+                return result.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"illegal_reports oluşturma hatası: {e}")
+            return None
+
+    async def get_illegal_reports(
+        self,
+        listing_id: Optional[str] = None,
+        reviewed: Optional[bool] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        illegal_reports tablosundan şikayetleri getirir.
+
+        Args:
+            listing_id: Belirli bir ilana ait şikayetleri filtrele
+            reviewed: True=incelenmiş, False=bekleyen, None=hepsi
+            limit: Maksimum satır sayısı
+
+        Returns:
+            Şikayet listesi
+        """
+        try:
+            query = self.client.table("illegal_reports").select("*")
+            if listing_id:
+                query = query.eq("listing_id", listing_id)
+            if reviewed is not None:
+                query = query.eq("reviewed", reviewed)
+            result = query.order("created_at", desc=True).limit(limit).execute()
+            return self._list_of_dicts(result.data)
+        except Exception as e:
+            logger.error(f"illegal_reports getirme hatası: {e}")
+            return []
+
+    async def mark_illegal_report_reviewed(
+        self,
+        report_id: str,
+        reviewer_id: str,
+        notes: Optional[str] = None,
+    ) -> bool:
+        """Admin: Şikayeti incelenmiş olarak işaretle."""
+        try:
+            from datetime import datetime, timezone
+            payload: Dict[str, Any] = {
+                "reviewed": True,
+                "reviewed_by": reviewer_id,
+                "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if notes:
+                payload["notes"] = notes
+            result = self.client.table("illegal_reports").update(payload).eq("id", report_id).execute()
+            return bool(result.data)
+        except Exception as e:
+            logger.error(f"illegal_reports güncelleme hatası: {e}")
+            return False
+
 
 # Global instance
 supabase_client = SupabaseClient()

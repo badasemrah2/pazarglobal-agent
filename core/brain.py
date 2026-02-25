@@ -32,6 +32,7 @@ class Intent(Enum):
     SEARCH = "SEARCH"
     CHAT = "CHAT"
     CANCEL = "CANCEL"  # FSM override - işlemi iptal et
+    REPORT = "REPORT"  # İlan şikayet / ihbar
 
 
 @dataclass
@@ -46,6 +47,7 @@ class BrainOutput:
     tool_call: Optional[Dict[str, str]] = None  # {"name": "perplexity", "query": "..."}
     suggestions: List[str] = field(default_factory=list)  # Başlık/açıklama tavsiyeleri
     raw_response: Dict[str, Any] = field(default_factory=dict)
+    report_data: Optional[Dict[str, Any]] = None  # REPORT intent için: {listing_id, reason}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -172,6 +174,8 @@ class Guardrails:
             intent = Intent.CREATE
         elif intent_str == "SEARCH":
             intent = Intent.SEARCH
+        elif intent_str == "REPORT":
+            intent = Intent.REPORT
         else:
             intent = Intent.CHAT
         
@@ -242,6 +246,15 @@ class Guardrails:
             suggestions = [str(s)[:200] for s in suggestions[:3]]
         else:
             suggestions = []
+
+        # Report data (REPORT intent için)
+        report_data = None
+        if intent == Intent.REPORT:
+            raw_report = llm_response.get("report_data") or {}
+            report_data = {
+                "listing_id": raw_report.get("listing_id") or None,
+                "reason": str(raw_report.get("reason", ""))[:500] or "Belirtilmedi",
+            }
         
         return BrainOutput(
             intent=intent,
@@ -253,6 +266,7 @@ class Guardrails:
             tool_call=tool_call,
             suggestions=suggestions,
             raw_response=llm_response,
+            report_data=report_data,
         )
 
 
@@ -308,6 +322,7 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
 2. **Intent Belirleme**:
    - CREATE: "satmak istiyorum", "satıyorum", "ilan ver", "satılık"
    - SEARCH: "var mı", "arıyorum", "bul", "ara"
+   - REPORT: "şikayetim var", "ihbar", "yasadışı", "şika yet et", "bu ilanı şikayete vereyim", "dolandırıcı", "sahte ilan"
    - CHAT: merhaba, teşekkürler, yardım, diğer sohbet
    - Not: İptal tespiti Guardrails tarafından yapılır
 
@@ -365,7 +380,7 @@ Kullanıcı schema dışı bilgi verirse VEYA görsellerden tespit edersen, bunl
 
 ```json
 {
-  "intent": "CREATE|SEARCH|CHAT",
+  "intent": "CREATE|SEARCH|CHAT|REPORT",
   "response_text": "Türkçe, samimi kullanıcı mesajı + HER ZAMAN preview göster",
   "listing_data": {
     "title": "...",
@@ -376,9 +391,15 @@ Kullanıcı schema dışı bilgi verirse VEYA görsellerden tespit edersen, bunl
     "location": "...",
     "images": []
   },
+  "report_data": {
+    "listing_id": "UUID - kullanıcı belirttiyse, yoksa null",
+    "reason": "şikayetin nedeni"
+  },
   "suggestions": ["Başlık önerisi: ...", "Açıklama önerisi: ..."]
 }
 ```
+
+**REPORT intent kullanıldığında:** liste_data boş olabilir, report_data doldurul-MALIDIR.
 
 ## PERPLEXITY FİYAT ARAŞTIRMASI
 

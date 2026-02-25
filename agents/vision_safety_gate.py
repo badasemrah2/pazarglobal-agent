@@ -32,12 +32,13 @@ class VisionSafetyGate:
         else:
             self.client = AsyncOpenAI(api_key=api_key)
         
-    async def check_media(self, media_urls: List[str]) -> Dict[str, Any]:
+    async def check_media(self, media_urls: List[str], user_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Check if media URLs contain unsafe content.
         
         Args:
             media_urls: List of image URLs to check
+            user_id: Yükleyen kullanıcı (loglama için, opsiyonel)
             
         Returns:
             {
@@ -55,14 +56,21 @@ class VisionSafetyGate:
                 "block_reason": None
             }
         
-        # Fail-open if client not initialized (missing API key)
+        # FAIL-CLOSED: If client is not initialized, block all media uploads.
+        # Missing API key is a misconfiguration — should not allow unchecked content.
         if self.client is None:
-            logger.warning("Vision safety check skipped: OpenAI client not initialized")
+            logger.error("Vision safety check: OpenAI client not initialized — blocking all media (fail-closed)")
+            await self._log_flag(
+                flag_type="moderation_not_configured",
+                confidence="n/a",
+                message="OpenAI Moderation API yapılandırılmamış, tüm medya engellendi.",
+                user_id=user_id,
+            )
             return {
-                "safe": True,
-                "allow_listing": True,
-                "flagged_categories": [],
-                "block_reason": None,
+                "safe": False,
+                "allow_listing": False,
+                "flagged_categories": ["moderation_not_configured"],
+                "block_reason": "Görsel güvenlik servisi yapılandırılmamış. Lütfen yönetici ile iletişime geçin.",
                 "skipped": True
             }
         
@@ -79,11 +87,20 @@ class VisionSafetyGate:
             
             # If any image is unsafe, block entire upload
             if unsafe_count > 0:
+                block_reason = self._get_block_message(flagged_categories)
+                # image_safety_flags tablosuna kayıt düş
+                await self._log_flag(
+                    flag_type=", ".join(sorted(flagged_categories)),
+                    confidence="high",
+                    message=f"{unsafe_count} görsel engellendi: {block_reason}",
+                    user_id=user_id,
+                    image_url=media_urls[0] if len(media_urls) == 1 else None,
+                )
                 return {
                     "safe": False,
                     "allow_listing": False,
                     "flagged_categories": list(flagged_categories),
-                    "block_reason": self._get_block_message(flagged_categories)
+                    "block_reason": block_reason
                 }
             
             return {
@@ -94,13 +111,19 @@ class VisionSafetyGate:
             }
             
         except Exception as e:
-            logger.error(f"Vision safety check failed: {e}")
-            # Fail-open: Allow content if check fails (avoid blocking legitimate users)
+            logger.error(f"Vision safety check failed (fail-CLOSED): {e}")
+            # FAIL-CLOSED: Block content if the overall safety check fails.
+            await self._log_flag(
+                flag_type="moderation_api_error",
+                confidence="unknown",
+                message=f"Vision safety check exception (fail-closed): {str(e)[:200]}",
+                user_id=user_id,
+            )
             return {
-                "safe": True,
-                "allow_listing": True,
-                "flagged_categories": [],
-                "block_reason": None,
+                "safe": False,
+                "allow_listing": False,
+                "flagged_categories": ["moderation_api_error"],
+                "block_reason": "Görsel güvenlik kontrolü şu an yapılamadı. Lütfen daha sonra tekrar deneyin.",
                 "error": str(e)
             }
     
@@ -117,12 +140,16 @@ class VisionSafetyGate:
         - illicit content (drugs, weapons)
         """
         try:
-            # Use OpenAI's vision model for content moderation
+            # Use OpenAI's vision model for content moderation.
+            # CRITICAL: input MUST be an object array with type=image_url,
+            # NOT a plain string — plain string only does text moderation.
             client = self.client
             if client is None:
                 raise RuntimeError("OpenAI client missing during image moderation")
             response = await client.moderations.create(
-                input=image_url,
+                input=[
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ],
                 model="omni-moderation-latest"
             )
             
@@ -158,9 +185,30 @@ class VisionSafetyGate:
             
         except Exception as e:
             logger.error(f"Single image check failed for {image_url}: {e}")
-            # Fail-open for single image errors
-            return {"safe": True, "categories": []}
-    
+            # FAIL-CLOSED: Block content when moderation check fails.
+            return {"safe": False, "categories": ["moderation_error"]}
+
+    async def _log_flag(
+        self,
+        flag_type: str,
+        confidence: str,
+        message: str,
+        user_id: Optional[str] = None,
+        image_url: Optional[str] = None,
+    ) -> None:
+        """image_safety_flags tablosuna kayıt düşer. Hata olsa bile akışı kesmez."""
+        try:
+            from services.supabase_client import supabase_client
+            await supabase_client.log_image_safety_flag(
+                flag_type=flag_type,
+                confidence=confidence,
+                message=message,
+                user_id=user_id,
+                image_url=image_url,
+            )
+        except Exception as e:
+            logger.error(f"image_safety_flags loglama hatası (akış devam ediyor): {e}")
+
     def _get_block_message(self, categories: set) -> str:
         """
         Generate user-friendly block message based on flagged categories.
@@ -195,8 +243,9 @@ class VisionSafetyGate:
         if not text or len(text.strip()) < 3:
             return {"safe": True, "flagged_categories": []}
         
-        # Fail-open if client not initialized
+        # FAIL-CLOSED: If client is not initialized, block all text moderation checks.
         if self.client is None:
+            logger.error("Text moderation: OpenAI client not initialized — skipping (text moderation is advisory only)")
             return {"safe": True, "flagged_categories": [], "skipped": True}
         
         try:
@@ -232,8 +281,9 @@ class VisionSafetyGate:
             
         except Exception as e:
             logger.error(f"Text moderation failed: {e}")
-            # Fail-open: Allow text if check fails
-            return {"safe": True, "flagged_categories": []}
+            # Text moderation is advisory (not blocking) — fail-open is acceptable for text.
+            # Image moderation is fail-closed (see check_media). Text is less critical.
+            return {"safe": True, "flagged_categories": [], "error": str(e)}
 
 
 # Singleton instance

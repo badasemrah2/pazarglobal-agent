@@ -18,6 +18,12 @@ from services.alerting import get_alerting_service
 # Shared logger instance for this module
 logger = get_logger(__name__)
 
+allowed_origins = [
+    origin.strip()
+    for origin in (settings.cors_allowed_origins or "").split(",")
+    if origin.strip()
+]
+
 # Create FastAPI app
 app = FastAPI(
     title="PazarGlobal Agent API",
@@ -29,7 +35,7 @@ app = FastAPI(
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure based on your frontend URL in production
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

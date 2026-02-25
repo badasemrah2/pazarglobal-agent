@@ -24,6 +24,10 @@ from .image_tools import (
 from .site_guide_tool import (
     read_site_guide_tool
 )
+from .report_tool import (
+    report_illegal_listing_tool,
+    get_illegal_reports_tool,
+)
 
 __all__ = [
     "BaseTool",
@@ -41,4 +45,6 @@ __all__ = [
     "deduct_credits_tool",
     "process_image_tool",
     "read_site_guide_tool",
+    "report_illegal_listing_tool",
+    "get_illegal_reports_tool",
 ]

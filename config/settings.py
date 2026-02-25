@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_env: str = "development"
+    cors_allowed_origins: str = "http://localhost:5173,http://localhost:5174"
     
     # Webhook Configuration
     webhook_base_url: Optional[str] = None

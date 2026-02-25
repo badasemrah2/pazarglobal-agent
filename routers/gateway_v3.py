@@ -1137,6 +1137,9 @@ async def handle_message(
                 ],
                 metadata={"intent": "CANCEL"},
             )
+
+        elif brain_output.intent == Intent.REPORT:
+            return await _handle_report(user_id, request.channel, session, brain_output)
         
         elif brain_output.intent == Intent.SEARCH:
             # Save last intent
@@ -1170,6 +1173,51 @@ async def handle_message(
 # ═══════════════════════════════════════════════════════════════════
 # INTENT HANDLERS
 # ═══════════════════════════════════════════════════════════════════
+
+async def _handle_report(user_id: str, channel: str, session: Dict, brain_output: BrainOutput) -> MessageResponse:
+    """
+    REPORT intent — kullanıcı bir ilanı şikayet ediyor.
+    illegal_reports tablosuna kayıt düşer.
+    """
+    report_data = brain_output.report_data or {}
+    listing_id = report_data.get("listing_id")
+    reason = report_data.get("reason") or "Belirtilmedi"
+
+    if not listing_id:
+        # listing_id bilinmiyor — kullanıcıdan iste
+        return MessageResponse(
+            success=True,
+            text=(
+                "📋 Şikayetinizi almak istiyorum. Lütfen şikayet etmek istediğiniz ilanın "
+                "numarasını veya başlığını belirtin, ben de kaydedelim."
+            ),
+            metadata={"intent": "REPORT", "waiting_for": "listing_id"},
+        )
+
+    try:
+        from tools.report_tool import report_illegal_listing_tool
+        result = await report_illegal_listing_tool.execute(
+            reporter_user_id=user_id,
+            listing_id=listing_id,
+            reason=reason,
+        )
+        if result.get("success"):
+            text = (
+                f"✅ Şikayetiniz kaydedildi. Ekibimiz en kısa sürede inceleyecek.\n\n"
+                f"📌 **Şikayet sebebi:** {reason}"
+            )
+        else:
+            text = "⚠️ Şikayet kaydedilirken bir sorun oluştu. Lütfen daha sonra tekrar deneyin."
+    except Exception as e:
+        logger.error(f"_handle_report hatası: {e}")
+        text = "⚠️ Şikayet işlenirken hata oluştu."
+
+    return MessageResponse(
+        success=True,
+        text=brain_output.response_text or text,
+        metadata={"intent": "REPORT", "listing_id": listing_id},
+    )
+
 
 async def _handle_create(user_id: str, channel: str, session: Dict, brain_output: BrainOutput, user_message: str) -> MessageResponse:
     """

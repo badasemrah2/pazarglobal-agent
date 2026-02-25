@@ -35,6 +35,28 @@ class ProductAnalysis:
     raw_response: Optional[str] = None
 
 
+async def _log_safety_flag_to_db(
+    flag_type: str,
+    confidence: str,
+    message: str,
+    user_id: Optional[str] = None,
+    image_url: Optional[str] = None,
+) -> None:
+    """image_safety_flags tablosuna engelleme kaydı düşer. Hata olsa bile akışı kesmez."""
+    try:
+        from services.supabase_client import supabase_client
+        await supabase_client.log_image_safety_flag(
+            flag_type=flag_type,
+            confidence=confidence,
+            message=message,
+            user_id=user_id,
+            image_url=image_url,
+            status="pending",
+        )
+    except Exception as e:
+        logger.error(f"image_safety_flags loglama hatası (akış devam ediyor): {e}")
+
+
 class VisionService:
     """
     Image analysis service.
@@ -75,7 +97,9 @@ class VisionService:
         """
         Check image for content policy violations.
         
-        Uses OpenAI Moderation API. Fail-open on error.
+        Uses OpenAI Moderation API.
+        FAIL-CLOSED: On any error, content is BLOCKED (not allowed through).
+        This prevents illegal content slipping past on API failures.
         
         Args:
             image_url: URL or base64 of image
@@ -86,7 +110,8 @@ class VisionService:
         try:
             client = await self._get_client()
             
-            # Use moderation API with image
+            # Use moderation API with image — MUST use object array format,
+            # NOT plain string, otherwise OpenAI cannot actually moderate the image.
             response = await client.moderations.create(
                 model="omni-moderation-latest",
                 input=[
@@ -97,8 +122,13 @@ class VisionService:
             result = response.results[0] if response.results else None
             
             if not result:
-                logger.warning("Empty moderation response, allowing content")
-                return {"safe": True, "flagged_categories": []}
+                # Empty moderation response — treat as UNSAFE (fail-closed)
+                logger.error("Empty moderation response — blocking content (fail-closed)")
+                return {
+                    "safe": False,
+                    "flagged_categories": ["moderation_empty_response"],
+                    "error": "empty_response",
+                }
             
             # Check categories
             flagged = []
@@ -119,6 +149,15 @@ class VisionService:
             is_safe = len(flagged) == 0
             
             logger.info(f"Vision safety: safe={is_safe}, flagged={flagged}")
+
+            if not is_safe:
+                # image_safety_flags tablosuna kayıt düş
+                await _log_safety_flag_to_db(
+                    flag_type=", ".join(flagged),
+                    confidence="high",
+                    message=f"Moderation API engelledi: {', '.join(flagged)}",
+                    image_url=image_url,
+                )
             
             return {
                 "safe": is_safe,
@@ -126,11 +165,18 @@ class VisionService:
             }
         
         except Exception as e:
-            # Fail-open: allow content if moderation fails
-            logger.error(f"Moderation API error (fail-open): {e}")
+            # FAIL-CLOSED: Block content if moderation check fails.
+            # This is critical — fail-open would allow weapons/illegal content through.
+            logger.error(f"Moderation API error (fail-CLOSED, blocking content): {e}")
+            await _log_safety_flag_to_db(
+                flag_type="moderation_api_error",
+                confidence="unknown",
+                message=f"Moderation API hatası (fail-closed): {str(e)[:200]}",
+                image_url=image_url,
+            )
             return {
-                "safe": True,
-                "flagged_categories": [],
+                "safe": False,
+                "flagged_categories": ["moderation_api_error"],
                 "error": str(e),
             }
     
