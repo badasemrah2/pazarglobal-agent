@@ -107,6 +107,22 @@ class Guardrails:
             if re.search(pattern, msg_lower):
                 return True
         return False
+
+    @classmethod
+    def response_indicates_cancel(cls, response_text: str) -> bool:
+        """Model cevabı iptal/sonlandırma bildiriyor mu? (son emniyet katmanı)"""
+        text = (response_text or "").lower().strip()
+        if not text:
+            return False
+        return any(
+            phrase in text
+            for phrase in [
+                "işlem iptal edildi",
+                "ilanınız iptal",
+                "iptal edilmiştir",
+                "vazgeçildi",
+            ]
+        )
     
     @classmethod
     def detect_confirmation(cls, message: str) -> bool:
@@ -153,12 +169,15 @@ class Guardrails:
     @classmethod
     def sanitize(cls, llm_response: Dict[str, Any], user_message: str) -> BrainOutput:
         """LLM çıktısını sanitize et"""
+
+        raw_response_text = str(llm_response.get("response_text", ""))[:2000]
         
         # Önce iptal kontrolü
-        if cls.detect_cancel(user_message):
+        if cls.detect_cancel(user_message) or cls.response_indicates_cancel(raw_response_text):
+            cancel_text = raw_response_text.strip() or "✅ İşlem iptal edildi. Yeni bir işlem için hazırım."
             return BrainOutput(
                 intent=Intent.CANCEL,
-                response_text="✅ İşlem iptal edildi. Yeni bir işlem için hazırım.",
+                response_text=cancel_text,
                 listing_data={},
                 missing_fields=[],
                 ready_for_fsm=False,
@@ -258,7 +277,7 @@ class Guardrails:
         
         return BrainOutput(
             intent=intent,
-            response_text=str(llm_response.get("response_text", ""))[:2000],
+            response_text=raw_response_text,
             listing_data=sanitized_data,
             missing_fields=missing,
             ready_for_fsm=ready_for_fsm,
@@ -323,6 +342,7 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
    - CREATE: "satmak istiyorum", "satıyorum", "ilan ver", "satılık"
    - SEARCH: "var mı", "arıyorum", "bul", "ara"
    - REPORT: "şikayetim var", "ihbar", "yasadışı", "şika yet et", "bu ilanı şikayete vereyim", "dolandırıcı", "sahte ilan"
+    - CANCEL: "iptal", "vazgeç", "durdur", "istemiyorum"
    - CHAT: merhaba, teşekkürler, yardım, diğer sohbet
    - Not: İptal tespiti Guardrails tarafından yapılır
 
@@ -380,7 +400,7 @@ Kullanıcı schema dışı bilgi verirse VEYA görsellerden tespit edersen, bunl
 
 ```json
 {
-  "intent": "CREATE|SEARCH|CHAT|REPORT",
+    "intent": "CREATE|SEARCH|CHAT|REPORT|CANCEL",
   "response_text": "Türkçe, samimi kullanıcı mesajı + HER ZAMAN preview göster",
   "listing_data": {
     "title": "...",
@@ -400,6 +420,7 @@ Kullanıcı schema dışı bilgi verirse VEYA görsellerden tespit edersen, bunl
 ```
 
 **REPORT intent kullanıldığında:** liste_data boş olabilir, report_data doldurul-MALIDIR.
+**CANCEL intent kullanıldığında:** `listing_data` boş obje (`{}`) dönmelidir.
 
 ## PERPLEXITY FİYAT ARAŞTIRMASI
 

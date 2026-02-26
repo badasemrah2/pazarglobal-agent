@@ -1,6 +1,19 @@
-# PazarGlobal Agent v2
+# PazarGlobal Agent API
 
-Türkiye'nin ilk **konuşarak ilan veren** pazar yeri platformu.
+PazarGlobal'in AI backend servisidir. WhatsApp bridge ve web frontend trafiğini yönetir; ilan oluşturma,
+arama, yayınlama ve moderasyon akışlarını yürütür.
+
+## ✅ Production Readiness (Şu Anki Durum)
+
+- ✅ Canlı endpoint aktif (Railway)
+- ✅ Admin health endpoint + JWT yetkilendirme
+- ✅ Vision safety gate fail-closed davranışı
+- ✅ Illegal report akışı ve admin moderasyon araçları
+- ✅ Redis + Supabase bağlantı kontrolleri
+- ⚠️ Yük/perf testleri ve otomatik canary rollout henüz sınırlı
+
+> Özet: Çekirdek fonksiyonlar production'da çalışır durumda, ancak ölçekleme ve operasyonel sertleştirme
+> adımlarıyla daha da güçlendirilmeli.
 
 ## 🎯 Özellikler
 
@@ -39,20 +52,17 @@ SUPABASE_SERVICE_KEY=eyJ...
 REDIS_URL=redis://localhost:6379  # Optional
 ```
 
-## 📡 API
+## 📡 Temel Endpointler
 
 ```bash
-# Health
-GET /health
+# Agent run (bridge üzerinden)
+POST /agent/run
 
-# Message
-POST /api/v1/message
-{
-    "user_id": "uuid",
-    "message": "iPhone 14 satmak istiyorum",
-    "media_urls": [],
-    "channel": "webchat"
-}
+# Admin health
+GET /api/admin/health
+
+# Admin redis clear
+POST /api/admin/redis/clear
 ```
 
 ## 🧪 Test
@@ -60,6 +70,22 @@ POST /api/v1/message
 ```bash
 pytest tests/ -v
 ```
+
+## 🚀 Go-Live Checklist
+
+- [ ] Railway env değişkenleri güncel (`OPENAI_*`, `SUPABASE_*`, `REDIS_URL`)
+- [ ] `CORS_ALLOWED_ORIGINS` production origin'leri ile sınırlandırıldı
+- [ ] `/api/admin/health` canlı doğrulandı
+- [ ] Vision safety + illegal report akışı smoke test edildi
+- [ ] Redis erişimi ve Supabase latency gözlemlendi
+
+## 🗺️ Gelecek Özellikler
+
+- Concurrency-safe Redis session update (Lua/WATCH-MULTI)
+- Daha detaylı moderasyon telemetry dashboard'u
+- Safety flag review otomasyonları
+- Rate-limit ve abuse tespiti için gelişmiş kurallar
+- E2E test + load test pipeline
 
 ## 📖 Dokümantasyon
 
