@@ -29,6 +29,9 @@ from services.jwt_auth import get_user_id_from_request
 from core.brain import brain, BrainOutput, Intent
 from services.redis_client import redis_client
 from services.supabase_client import supabase_client
+from agents.vision_safety_gate import vision_safety_gate
+from services.vision_service import vision_service
+from services.text_normalization import normalize_for_match
 from services.logger import get_logger
 
 logger = get_logger(__name__)
@@ -128,6 +131,25 @@ def _filter_valid_images(images: Optional[List[Any]]) -> List[str]:
             valid.append(norm)
 
     return valid
+
+
+PROHIBITED_LISTING_TERMS = {
+    "silah", "tabanca", "tufek", "tüfek", "pistol", "gun", "firearm", "revolver", "shotgun",
+    "mermi", "cephane", "bomba", "patlayici", "patlayıcı", "explosive", "uyusturucu", "uyuşturucu",
+    "kokain", "eroin", "esrar", "meth", "amfetamin", "cocaine", "heroin",
+}
+
+
+def _detect_prohibited_listing_term(listing_data: Dict[str, Any]) -> Optional[str]:
+    title = str(listing_data.get("title") or "")
+    description = str(listing_data.get("description") or "")
+    normalized = normalize_for_match(f"{title} {description}")
+    if not normalized:
+        return None
+    for term in PROHIBITED_LISTING_TERMS:
+        if term in normalized:
+            return term
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -460,6 +482,10 @@ class FSMEngine:
             is_valid, missing = cls.validate(listing_data)
             if not is_valid:
                 return False, f"Eksik alanlar: {', '.join(missing)}", None
+
+            prohibited_term = _detect_prohibited_listing_term(listing_data)
+            if prohibited_term:
+                return False, "🚫 Bu içerik platform politikalarına aykırı olduğu için yayınlanamaz.", None
             
             # 2. Wallet check
             has_enough, balance = await cls.check_wallet(user_id)
@@ -994,11 +1020,37 @@ async def handle_message(
                 await save_session(user_id, request.channel, session)
 
         # 1.0 Attach WhatsApp media paths to listing_data (if provided)
-        if request.channel == "whatsapp" and request.media_urls:
+        incoming_images: List[str] = []
+        if request.media_urls:
             normalized_media = _normalize_media_urls(request.media_urls)
             if normalized_media:
+                media_safety = await vision_safety_gate.check_media(normalized_media, user_id=user_id)
+                if not media_safety.get("safe", False):
+                    return MessageResponse(
+                        success=False,
+                        text=f"🚫 {media_safety.get('block_reason') or 'Görsel güvenlik politikalarına uygun değil.'}",
+                        metadata={
+                            "intent": "SAFETY_BLOCK",
+                            "flagged_categories": media_safety.get("flagged_categories", []),
+                        },
+                    )
+
+                for url in normalized_media[:3]:
+                    analysis = await vision_service.analyze_product(url)
+                    prohibited_term = vision_service.detect_prohibited_product(analysis)
+                    if prohibited_term:
+                        return MessageResponse(
+                            success=False,
+                            text="🚫 Bu görselde platformda yayınlanmasına izin verilmeyen bir ürün tespit edildi.",
+                            metadata={
+                                "intent": "SAFETY_BLOCK",
+                                "flagged_categories": ["illicit_item", prohibited_term],
+                            },
+                        )
+
+                incoming_images = normalized_media
                 listing_data = session.get("listing_data", {})
-                existing_images = listing_data.get("images", [])
+                existing_images = _filter_valid_images(listing_data.get("images", []))
                 for url in normalized_media:
                     if url not in existing_images:
                         existing_images.append(url)
@@ -1079,6 +1131,7 @@ async def handle_message(
         current_listing = session.get("listing_data", {})
         fsm_state = session.get("state", "IDLE")
         last_intent = session.get("last_intent")
+        context_images = _filter_valid_images(current_listing.get("images", [])) or incoming_images
         
         # NOTE: Deterministik price detection kaldırıldı!
         # Artık Brain (LLM) native function calling ile Perplexity tool'unu çağırıyor.
@@ -1091,7 +1144,7 @@ async def handle_message(
         brain_output = await brain.process(
             message=request.message,
             current_listing=current_listing,
-            images=request.media_urls,
+            images=context_images,
             conversation_history=session.get("conversation_history"),
             # Zengin context
             fsm_state=fsm_state,
@@ -1822,8 +1875,6 @@ async def analyze_media(
         )
     
     try:
-        from services.vision_service import vision_service
-        
         # Process each image
         all_descriptions = []
         analyzed_products = []
@@ -1847,6 +1898,14 @@ async def analyze_media(
             if analysis.get("error"):
                 logger.warning(f"Analysis error for image {i+1}: {analysis.get('error')}")
                 all_descriptions.append(f"Görsel {i+1}: Analiz edilemedi.")
+                continue
+
+            prohibited_term = vision_service.detect_prohibited_product(analysis)
+            if prohibited_term:
+                blocked_images.append({
+                    "index": i,
+                    "reason": f"illicit_item:{prohibited_term}",
+                })
                 continue
             
             # Build description

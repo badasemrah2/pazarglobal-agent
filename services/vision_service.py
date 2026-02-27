@@ -14,6 +14,13 @@ from services.logger import get_logger
 logger = get_logger(__name__)
 
 
+PROHIBITED_PRODUCT_TERMS = {
+    "silah", "tabanca", "tufek", "tüfek", "pistol", "gun", "firearm", "revolver", "shotgun",
+    "mermi", "cephane", "bomba", "patlayici", "patlayıcı", "explosive", "uyusturucu", "uyuşturucu",
+    "kokain", "eroin", "esrar", "meth", "amfetamin", "cocaine", "heroin",
+}
+
+
 @dataclass
 class SafetyResult:
     """Safety check result"""
@@ -92,6 +99,39 @@ class VisionService:
             from services.openai_client import get_openai_client
             self.openai_client = await get_openai_client()
         return self.openai_client
+
+    async def _is_allowed_apparel_exception(self, image_url: str) -> bool:
+        """Allow underwear/swimwear product photos when moderation only flags soft sexual content."""
+        try:
+            client = await self._get_client()
+            prompt = (
+                "Bu görsel e-ticaret ürün istisnasına giriyor mu? "
+                "Sadece iç çamaşırı/mayo/bikini gibi legal giyim ürünü satışı için uygun ürün fotoğrafıysa true döndür. "
+                "Reşit olmayan kişi, pornografik çıplaklık, şiddet, silah/bomba veya yasa dışı içerik varsa false döndür. "
+                "Emin değilsen false döndür. "
+                "Sadece JSON döndür: {\"allow_exception\": true|false, \"reason\": \"...\"}"
+            )
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                        ],
+                    }
+                ],
+                temperature=0,
+                max_tokens=120,
+            )
+            content = (response.choices[0].message.content or "{}").strip()
+            payload = json.loads(content)
+            return bool(payload.get("allow_exception") is True)
+        except Exception as e:
+            logger.warning(f"Apparel exception check failed: {e}")
+            return False
     
     async def check_safety(self, image_url: str) -> Dict[str, Any]:
         """
@@ -145,6 +185,14 @@ class VisionService:
                 
                 if getattr(categories, attr_name, False):
                     flagged.append(category)
+
+            if set(flagged) == {"sexual"}:
+                if await self._is_allowed_apparel_exception(image_url):
+                    logger.info("Vision safety exception applied: underwear/swimwear product image allowed")
+                    return {
+                        "safe": True,
+                        "flagged_categories": [],
+                    }
             
             is_safe = len(flagged) == 0
             
@@ -258,6 +306,25 @@ Sadece JSON döndür, açıklama ekleme."""
         except Exception as e:
             logger.error(f"Vision analysis error: {e}")
             return {"error": str(e)}
+
+    def detect_prohibited_product(self, analysis: Dict[str, Any]) -> Optional[str]:
+        from services.text_normalization import normalize_for_match
+
+        if not isinstance(analysis, dict):
+            return None
+
+        haystack = " ".join(
+            str(analysis.get(key) or "")
+            for key in ("product", "category", "brand", "raw_response")
+        )
+        normalized = normalize_for_match(haystack)
+        if not normalized:
+            return None
+
+        for term in PROHIBITED_PRODUCT_TERMS:
+            if term in normalized:
+                return term
+        return None
     
     async def get_price_suggestion(
         self,

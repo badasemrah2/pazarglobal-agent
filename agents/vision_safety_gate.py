@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
 from loguru import logger
 import httpx
 import os
+import json
 from openai import AsyncOpenAI
 
 
@@ -31,6 +32,46 @@ class VisionSafetyGate:
             self.client = None
         else:
             self.client = AsyncOpenAI(api_key=api_key)
+
+    async def _is_allowed_apparel_exception(self, image_url: str) -> bool:
+        """
+        Allow-list exception for commerce-safe apparel products.
+        Example: underwear/swimwear product shots (iç çamaşırı, mayo, bikini).
+        """
+        client = self.client
+        if client is None:
+            return False
+
+        prompt = (
+            "Bu görsel e-ticaret ürünü istisnasına giriyor mu? "
+            "Sadece iç çamaşırı/mayo/bikini gibi LEGAL giyim ürünü satışı için güvenli ürün fotoğrafıysa true döndür. "
+            "Reşit olmayan kişi, çıplaklık odaklı cinsel içerik, pornografik poz, şiddet, silah, bomba veya yasa dışı unsur varsa false döndür. "
+            "Emin değilsen false döndür. "
+            "Sadece JSON döndür: {\"allow_exception\": true|false, \"reason\": \"...\"}"
+        )
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                        ],
+                    }
+                ],
+                temperature=0,
+                max_tokens=120,
+            )
+            content = (response.choices[0].message.content or "{}").strip()
+            payload = json.loads(content)
+            return bool(payload.get("allow_exception") is True)
+        except Exception as e:
+            logger.warning(f"Apparel exception check failed for image: {e}")
+            return False
         
     async def check_media(self, media_urls: List[str], user_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -159,6 +200,8 @@ class VisionSafetyGate:
             flagged_categories = []
             if result.categories.sexual:
                 flagged_categories.append("sexual")
+            if getattr(result.categories, "sexual_minors", False) is True:
+                flagged_categories.append("sexual/minors")
             if result.categories.violence:
                 flagged_categories.append("violence")
             if result.categories.hate:
@@ -167,8 +210,21 @@ class VisionSafetyGate:
                 flagged_categories.append("harassment")
             if result.categories.self_harm:
                 flagged_categories.append("self-harm")
-            if hasattr(result.categories, 'illicit') and result.categories.illicit:
+            if getattr(result.categories, "illicit", False) is True:
                 flagged_categories.append("illicit")
+
+            only_soft_sexual = set(flagged_categories) == {"sexual"}
+            if only_soft_sexual:
+                if await self._is_allowed_apparel_exception(image_url):
+                    return {
+                        "safe": True,
+                        "categories": [],
+                        "scores": {
+                            "sexual": result.category_scores.sexual,
+                            "violence": result.category_scores.violence,
+                            "hate": result.category_scores.hate
+                        }
+                    }
             
             # Block if ANY critical category flagged
             is_safe = len(flagged_categories) == 0
