@@ -118,10 +118,12 @@ async def get_user_id_from_request(
         if not is_valid:
             return False, None, error
         
-        # Extra security: if request also has user_id, it MUST match token
+        # Extra security: if request also has user_id and differs, trust JWT subject.
+        # This avoids false "security violation" responses when stale client state sends
+        # an old/local/custom id while Authorization token belongs to the real Supabase user.
         if request_user_id and request_user_id != user_id:
             logger.warning(f"⚠️ user_id mismatch! Token: {user_id}, Request: {request_user_id}")
-            return False, None, "user_id uyuşmazlığı - güvenlik ihlali"
+            return True, user_id, None
         
         return True, user_id, None
     

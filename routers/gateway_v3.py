@@ -151,6 +151,23 @@ PROHIBITED_LISTING_TERMS = {
 }
 
 
+def _contains_prohibited_term(normalized_text: str, term: str) -> bool:
+    from services.text_normalization import normalize_for_match
+
+    term_norm = normalize_for_match(term)
+    if not normalized_text or not term_norm:
+        return False
+
+    # Multi-word phrase match with token boundaries
+    if " " in term_norm:
+        padded = f" {normalized_text} "
+        return f" {term_norm} " in padded
+
+    # Single word match with regex word boundaries to avoid false positives
+    # Example false-positive prevented: "gun" matching "uygun"
+    return re.search(rf"\b{re.escape(term_norm)}\b", normalized_text) is not None
+
+
 def _detect_prohibited_listing_term(listing_data: Dict[str, Any]) -> Optional[str]:
     title = str(listing_data.get("title") or "")
     description = str(listing_data.get("description") or "")
@@ -158,7 +175,7 @@ def _detect_prohibited_listing_term(listing_data: Dict[str, Any]) -> Optional[st
     if not normalized:
         return None
     for term in PROHIBITED_LISTING_TERMS:
-        if term in normalized:
+        if _contains_prohibited_term(normalized, term):
             return term
     return None
 

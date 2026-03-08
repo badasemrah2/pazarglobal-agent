@@ -6,6 +6,7 @@ Components:
 2. Product Analyzer - GPT-4 Vision for product recognition
 """
 import json
+import re
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
@@ -19,6 +20,20 @@ PROHIBITED_PRODUCT_TERMS = {
     "mermi", "cephane", "bomba", "patlayici", "patlayıcı", "explosive", "uyusturucu", "uyuşturucu",
     "kokain", "eroin", "esrar", "meth", "amfetamin", "cocaine", "heroin",
 }
+
+
+def _contains_prohibited_term(normalized_text: str, term: str) -> bool:
+    from services.text_normalization import normalize_for_match
+
+    term_norm = normalize_for_match(term)
+    if not normalized_text or not term_norm:
+        return False
+
+    if " " in term_norm:
+        padded = f" {normalized_text} "
+        return f" {term_norm} " in padded
+
+    return re.search(rf"\b{re.escape(term_norm)}\b", normalized_text) is not None
 
 
 @dataclass
@@ -322,7 +337,7 @@ Sadece JSON döndür, açıklama ekleme."""
             return None
 
         for term in PROHIBITED_PRODUCT_TERMS:
-            if term in normalized:
+            if _contains_prohibited_term(normalized, term):
                 return term
         return None
     
