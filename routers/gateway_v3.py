@@ -36,6 +36,17 @@ from services.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _safe_exception_text(exc: Exception) -> str:
+    """Return exception text safely; some SDK exceptions can fail during str()."""
+    try:
+        return str(exc)
+    except Exception:
+        try:
+            return repr(exc)
+        except Exception:
+            return f"<{type(exc).__name__}>"
+
 router = APIRouter(prefix="/api/v3", tags=["gateway-v3"])
 
 
@@ -1215,11 +1226,12 @@ async def handle_message(
             return await _handle_chat(user_id, request.channel, session, brain_output)
     
     except Exception as e:
-        logger.error(f"V3 error: {e}", exc_info=True)
+        error_text = _safe_exception_text(e)
+        logger.error(f"V3 error: {error_text}", exc_info=True)
         return MessageResponse(
             success=False,
             text="⚠️ Bir hata oluştu. Lütfen tekrar deneyin.",
-            error=str(e),
+            error=error_text,
         )
 
 

@@ -27,6 +27,17 @@ from config import settings
 logger = get_logger(__name__)
 
 
+def _safe_exception_text(exc: Exception) -> str:
+    """Return exception text without triggering secondary errors from buggy __str__."""
+    try:
+        return str(exc)
+    except Exception:
+        try:
+            return repr(exc)
+        except Exception:
+            return f"<{type(exc).__name__}>"
+
+
 class Intent(Enum):
     CREATE = "CREATE"
     SEARCH = "SEARCH"
@@ -601,11 +612,13 @@ class Brain:
         
         except Exception as e:
             error_type = type(e).__name__
-            logger.error(f"Brain error ({error_type}): {e}", exc_info=True)
+            error_text = _safe_exception_text(e)
+            logger.error(f"Brain error ({error_type}): {error_text}", exc_info=True)
+            lower_error_text = error_text.lower()
             # More helpful error message for debugging
-            if "rate_limit" in str(e).lower():
+            if "rate_limit" in lower_error_text:
                 return self._fallback_response("API rate limit - biraz bekleyin")
-            elif "timeout" in str(e).lower():
+            elif "timeout" in lower_error_text:
                 return self._fallback_response("API timeout - tekrar deneyin")
             return self._fallback_response(f"Sistem hatası: {error_type}")
     
