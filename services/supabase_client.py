@@ -1899,12 +1899,15 @@ class SupabaseClient:
             return None
 
     async def get_owner_inbox(self, owner_user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return conversation summaries for listing owner inbox."""
+        """Return conversation summaries for authenticated participant inbox.
+
+        Backward compatible name: returns rows where user is owner OR sender.
+        """
         try:
             result = (
                 self.client.table("listing_conversations")
-                .select("id,listing_id,sender_name,source_channel,last_message_preview,last_message_at,owner_unread_count,created_at")
-                .eq("owner_user_id", owner_user_id)
+                .select("id,listing_id,owner_user_id,sender_user_id,sender_name,source_channel,last_message_preview,last_message_at,owner_unread_count,buyer_unread_count,created_at")
+                .or_(f"owner_user_id.eq.{owner_user_id},sender_user_id.eq.{owner_user_id}")
                 .order("last_message_at", desc=True)
                 .limit(max(1, min(limit, 100)))
                 .execute()
@@ -1931,13 +1934,13 @@ class SupabaseClient:
             return []
 
     async def owner_can_access_conversation(self, owner_user_id: str, conversation_id: str) -> bool:
-        """Check ownership for inbox conversation access."""
+        """Check participant access for inbox conversation access."""
         try:
             result = (
                 self.client.table("listing_conversations")
                 .select("id")
                 .eq("id", conversation_id)
-                .eq("owner_user_id", owner_user_id)
+                .or_(f"owner_user_id.eq.{owner_user_id},sender_user_id.eq.{owner_user_id}")
                 .limit(1)
                 .execute()
             )
@@ -1945,6 +1948,29 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error checking conversation ownership: {e}")
             return False
+
+    async def get_conversation_participant_role(self, user_id: str, conversation_id: str) -> Optional[str]:
+        """Return participant role in conversation: 'owner', 'buyer' or None."""
+        try:
+            result = (
+                self.client.table("listing_conversations")
+                .select("owner_user_id,sender_user_id")
+                .eq("id", conversation_id)
+                .limit(1)
+                .execute()
+            )
+            row = self._first_dict(result.data)
+            if not row:
+                return None
+
+            if str(row.get("owner_user_id") or "") == str(user_id):
+                return "owner"
+            if str(row.get("sender_user_id") or "") == str(user_id):
+                return "buyer"
+            return None
+        except Exception as e:
+            logger.error(f"Error determining participant role: {e}")
+            return None
 
     async def mark_owner_read(self, conversation_id: str) -> bool:
         """Mark conversation as read by owner."""
@@ -1954,6 +1980,25 @@ class SupabaseClient:
             return True
         except Exception as e:
             logger.error(f"Error marking owner read: {e}")
+            return False
+
+    async def mark_conversation_read_for_user(self, user_id: str, conversation_id: str) -> bool:
+        """Mark conversation as read for the given participant side."""
+        try:
+            role = await self.get_conversation_participant_role(user_id, conversation_id)
+            if role == "owner":
+                self.client.table("listing_messages").update({"read_by_owner": True}).eq("conversation_id", conversation_id).execute()
+                self.client.table("listing_conversations").update({"owner_unread_count": 0, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", conversation_id).execute()
+                return True
+
+            if role == "buyer":
+                self.client.table("listing_messages").update({"read_by_buyer": True}).eq("conversation_id", conversation_id).execute()
+                self.client.table("listing_conversations").update({"buyer_unread_count": 0, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", conversation_id).execute()
+                return True
+
+            return False
+        except Exception as e:
+            logger.error(f"Error marking conversation read for user: {e}")
             return False
     
     # Wallet Operations

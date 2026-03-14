@@ -169,7 +169,7 @@ async def get_owner_conversation_messages(
         raise HTTPException(status_code=403, detail="forbidden")
 
     rows = await supabase_client.get_conversation_messages(conversation_id, limit=limit)
-    await supabase_client.mark_owner_read(conversation_id)
+    await supabase_client.mark_conversation_read_for_user(owner_user_id, conversation_id)
 
     return {
         "success": True,
@@ -189,6 +189,10 @@ async def owner_reply(
     if not can_access:
         raise HTTPException(status_code=403, detail="forbidden")
 
+    participant_role = await supabase_client.get_conversation_participant_role(owner_user_id, payload.conversation_id)
+    if participant_role not in {"owner", "buyer"}:
+        raise HTTPException(status_code=403, detail="forbidden")
+
     conv = (
         supabase_client.client
         .table("listing_conversations")
@@ -206,7 +210,7 @@ async def owner_reply(
     msg = await supabase_client.add_message_to_conversation(
         conversation_id=payload.conversation_id,
         listing_id=listing_id,
-        sender_role="owner",
+        sender_role="owner" if participant_role == "owner" else "buyer",
         body=payload.message,
     )
     if not msg:
