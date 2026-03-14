@@ -201,6 +201,7 @@ async def load_session(user_id: str, channel: str) -> Dict[str, Any]:
         "last_intent": session.get("last_intent"),
         "draft_updated_at": session.get("draft_updated_at"),
         "search_cache": session.get("search_cache", []),
+        "search_cursor": session.get("search_cursor", 0),
         # FSM 2-step confirmation state
         "fsm_state": session.get("fsm_state", FSM_STATE_IDLE),
         "pending_publish_balance": session.get("pending_publish_balance"),
@@ -222,6 +223,62 @@ async def clear_session(user_id: str, channel: str):
     """Clear session - reset (scoped by channel)"""
     session_id = _session_key(user_id, channel)
     await redis_client.delete_session(session_id)
+
+
+def _is_show_more_command(lower_msg: str) -> bool:
+    msg = (lower_msg or "").strip().lower()
+    triggers = [
+        "daha fazla göster",
+        "daha fazla",
+        "devamını göster",
+        "devamini goster",
+        "devamını",
+        "devamini",
+        "devam",
+    ]
+    return any(trigger in msg for trigger in triggers)
+
+
+async def _format_search_continuation_page(listings: List[Dict[str, Any]], start_idx: int, page_size: int = 5) -> str:
+    total = len(listings or [])
+    if total == 0 or start_idx >= total:
+        return "📄 Gösterilecek başka ilan kalmadı."
+
+    end_idx = min(start_idx + page_size, total)
+    chunk = listings[start_idx:end_idx]
+
+    lines: List[str] = [f"📄 {start_idx + 1}-{end_idx}. ilanlar:", ""]
+    for i, listing in enumerate(chunk, start=start_idx + 1):
+        title = listing.get("title") or "Başlıksız"
+        price = listing.get("price")
+        price_txt = f"{price} TL" if price is not None else "Fiyat belirtilmemiş"
+        category = listing.get("category") or "Kategori yok"
+
+        lines.append(f"{i}. {title} - {price_txt} - {category}")
+
+        short_desc = str(listing.get("description") or "")[:120].strip()
+        if short_desc:
+            lines.append(short_desc + "...")
+
+        listing_id = str(listing.get("id") or "").strip()
+        if listing_id:
+            try:
+                token_row = await supabase_client.ensure_contact_token_for_listing(listing_id)
+                token = str((token_row or {}).get("token") or "").strip() if isinstance(token_row, dict) else ""
+                if token:
+                    frontend_base = (getattr(settings, "frontend_base_url", None) or "https://pazarglobal.com").strip().rstrip("/")
+                    lines.append(f"Mesaj Gönder: {frontend_base}/contact/{token}")
+            except Exception as e:
+                logger.warning(f"Failed to attach contact link in search pagination (listing_id={listing_id}): {e}")
+
+        lines.append("")
+
+    if end_idx < total:
+        lines.append(f"Toplam {total} ilanın {end_idx} tanesini gösterdim. Devamı için 'daha fazla göster' yazabilirsiniz.")
+    else:
+        lines.append("Tüm ilanları gösterdim. Detay için: '6 nolu ilanın detayını göster' yazabilirsiniz.")
+
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1160,8 +1217,33 @@ async def handle_message(
             search_cache = session.get("search_cache") or []
             if 0 <= idx < len(search_cache):
                 return await _format_listing_detail_response(search_cache[idx])
+
+        # 1.4 Pagination command handling (uses last search cache)
+        if _is_show_more_command(lower_msg):
+            search_cache = session.get("search_cache") or []
+            if search_cache:
+                cursor = int(session.get("search_cursor", 0) or 0)
+                if cursor < len(search_cache):
+                    page_text = await _format_search_continuation_page(search_cache, cursor, page_size=5)
+                    session["search_cursor"] = min(cursor + 5, len(search_cache))
+                    await save_session(user_id, request.channel, session)
+                    return MessageResponse(
+                        success=True,
+                        text=page_text,
+                        metadata={
+                            "intent": "SEARCH",
+                            "count": len(search_cache),
+                            "shown_until": session.get("search_cursor", 0),
+                        },
+                    )
+
+                return MessageResponse(
+                    success=True,
+                    text="📄 Tüm arama sonuçlarını zaten gösterdim. Yeni arama yapmak ister misiniz?",
+                    metadata={"intent": "SEARCH", "count": len(search_cache)},
+                )
         
-        # 1.4 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
+        # 1.5 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
         preview_keywords = ["son hal", "önizleme", "preview", "göster bana", "goster bana"]
         if any(kw in lower_msg for kw in preview_keywords) and session.get("listing_data"):
             current_listing = session.get("listing_data", {})
@@ -1456,17 +1538,21 @@ async def _handle_search(user_id: str, channel: str, session: Dict, query: str) 
         if isinstance(result, dict):
             message = result.get("message", "")
             listings = result.get("listings", [])
+            listings_full = result.get("listings_full", []) if isinstance(result.get("listings_full", []), list) else []
+            cache_list = listings_full or listings or []
             
             if message:
-                session["search_cache"] = listings or []
+                session["search_cache"] = cache_list
+                session["search_cursor"] = min(len(listings or []), len(cache_list))
                 await save_session(user_id, channel, session)
                 return MessageResponse(
                     success=True,
                     text=message,
-                    metadata={"intent": "SEARCH", "count": result.get("count", len(listings))},
+                    metadata={"intent": "SEARCH", "count": result.get("count", len(cache_list))},
                 )
             elif listings:
-                session["search_cache"] = listings
+                session["search_cache"] = cache_list
+                session["search_cursor"] = min(5, len(cache_list))
                 await save_session(user_id, channel, session)
                 results_text = f"🔍 **{len(listings)} sonuç bulundu:**\n\n"
                 for i, listing in enumerate(listings[:5], 1):
@@ -1491,6 +1577,7 @@ async def _handle_search(user_id: str, channel: str, session: Dict, query: str) 
                 )
             else:
                 session["search_cache"] = []
+                session["search_cursor"] = 0
                 await save_session(user_id, channel, session)
                 return MessageResponse(
                     success=True,
