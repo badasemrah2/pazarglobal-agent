@@ -4,11 +4,12 @@ Supabase client for database operations
 from supabase import create_client, Client
 from config import settings
 from typing import Optional, Dict, List, Any, cast
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from loguru import logger
 import httpx
 import re
 import json
+import secrets
 
 from .metadata_keywords import generate_listing_keywords
 from services.text_normalization import violates_listing_content_guard
@@ -51,6 +52,47 @@ class SupabaseClient:
             return str(value)
         except Exception:
             return ""
+
+    def _mask_phone(self, phone_value: Any) -> str:
+        """Return masked phone format for public-safe responses.
+
+        Example: +90531xxxxxxx
+        """
+        raw = self._coerce_str(phone_value).strip()
+        if not raw:
+            return ""
+
+        if raw.startswith("+"):
+            prefix = raw[:6] if len(raw) >= 6 else raw
+            rest_len = max(len(raw) - len(prefix), 7)
+            return f"{prefix}{'x' * rest_len}"
+
+        # digits-only fallback
+        digits = re.sub(r"\D", "", raw)
+        if not digits:
+            return ""
+        prefix = digits[:5] if len(digits) >= 5 else digits
+        rest_len = max(len(digits) - len(prefix), 6)
+        return f"{prefix}{'x' * rest_len}"
+
+    def _apply_public_contact_visibility(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply visibility policy for public/search outputs.
+
+        - If phone_visibility=hidden => expose masked phone only
+        - Always provide user_phone_masked for UI consistency
+        """
+        if not isinstance(row, dict):
+            return row
+
+        phone_visibility = self._coerce_str(row.get("phone_visibility")).strip().lower() or "public"
+        raw_phone = self._coerce_str(row.get("user_phone")).strip()
+        masked_phone = self._mask_phone(raw_phone)
+
+        row["user_phone_masked"] = masked_phone
+        if phone_visibility == "hidden":
+            row["user_phone"] = masked_phone or "+90xxxxxxxxxx"
+
+        return row
 
     def _first_dict(self, data: Any) -> Optional[Dict[str, Any]]:
         if isinstance(data, list) and data:
@@ -1342,9 +1384,32 @@ class SupabaseClient:
             if not user_phone and isinstance(listing_data, dict):
                 user_phone = self._coerce_str(listing_data.get("contact_phone")).strip() or None
 
+            phone_visibility = "public"
+            name_visibility = "public"
+            try:
+                profile_res = (
+                    self.client.table("profiles")
+                    .select("phone_visibility,name_visibility")
+                    .eq("id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                profile_row = self._first_dict(profile_res.data)
+                if profile_row:
+                    if self._coerce_str(profile_row.get("phone_visibility")).strip().lower() == "hidden":
+                        phone_visibility = "hidden"
+                    if self._coerce_str(profile_row.get("name_visibility")).strip().lower() == "hidden":
+                        name_visibility = "hidden"
+            except Exception:
+                pass
+
             # Metadata already initialized with standard format above
             
             # Insert into listings
+            _listing_expires_at = (
+                datetime.now(timezone.utc) + timedelta(days=30)
+            ).isoformat()
+
             result = self.client.table("listings").insert({
                 "id": draft_id,
                 "user_id": user_id,
@@ -1361,6 +1426,9 @@ class SupabaseClient:
                 "images": image_urls,
                 "metadata": listing_metadata,
                 "market_price_at_publish": market_price_at_publish,
+                "expires_at": _listing_expires_at,
+                "phone_visibility": phone_visibility,
+                "name_visibility": name_visibility,
             }).execute()
             
             result_row = self._first_dict(result.data)
@@ -1614,12 +1682,279 @@ class SupabaseClient:
                     # Keep a consistent type for callers
                     row["images"] = []
 
+                row = self._apply_public_contact_visibility(row)
+
                 normalized_rows.append(row)
 
             return normalized_rows
         except Exception as e:
             logger.error(f"Error searching listings: {e}")
             return []
+
+    # Listing Contact & Messaging Operations
+    async def get_listing_contact_meta(self, listing_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch listing contact metadata needed for contact-link and visibility flow."""
+        try:
+            result = (
+                self.client.table("listings")
+                .select("id,user_id,title,status,expires_at,user_name,user_phone,phone_visibility,name_visibility")
+                .eq("id", listing_id)
+                .limit(1)
+                .execute()
+            )
+            return self._first_dict(result.data)
+        except Exception as e:
+            logger.error(f"Error fetching listing contact meta: {e}")
+            return None
+
+    async def ensure_contact_token_for_listing(self, listing_id: str) -> Optional[Dict[str, Any]]:
+        """Return existing active token for listing or create a new one."""
+        try:
+            listing = await self.get_listing_contact_meta(listing_id)
+            if not listing:
+                return None
+
+            status = (listing.get("status") or "").strip().lower()
+            blocked_statuses = {"deleted", "removed", "rejected", "blocked", "banned", "expired"}
+            if status in blocked_statuses:
+                return None
+
+            existing = (
+                self.client.table("contact_tokens")
+                .select("id,token,listing_id,owner_user_id,expires_at,revoked")
+                .eq("listing_id", listing_id)
+                .eq("revoked", False)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            existing_row = self._first_dict(existing.data)
+            if existing_row:
+                return existing_row
+
+            expires_at = listing.get("expires_at")
+            if not expires_at:
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+            token = secrets.token_urlsafe(24)
+            created = (
+                self.client.table("contact_tokens")
+                .insert({
+                    "listing_id": listing_id,
+                    "owner_user_id": listing.get("user_id"),
+                    "token": token,
+                    "expires_at": expires_at,
+                    "revoked": False,
+                })
+                .execute()
+            )
+            return self._first_dict(created.data)
+        except Exception as e:
+            logger.error(f"Error ensuring contact token: {e}")
+            return None
+
+    async def resolve_contact_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Resolve contact token to listing + owner context if still valid."""
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            result = (
+                self.client.table("contact_tokens")
+                .select("id,token,listing_id,owner_user_id,expires_at,revoked")
+                .eq("token", token)
+                .eq("revoked", False)
+                .gte("expires_at", now_iso)
+                .limit(1)
+                .execute()
+            )
+            token_row = self._first_dict(result.data)
+            if not token_row:
+                return None
+
+            listing = await self.get_listing_contact_meta(self._coerce_str(token_row.get("listing_id")))
+            if not listing:
+                return None
+
+            return {
+                "token": token_row,
+                "listing": listing,
+            }
+        except Exception as e:
+            logger.error(f"Error resolving contact token: {e}")
+            return None
+
+    async def find_or_create_conversation(
+        self,
+        *,
+        listing_id: str,
+        owner_user_id: str,
+        contact_token_id: Optional[str],
+        sender_user_id: Optional[str],
+        sender_session_id: Optional[str],
+        sender_name: Optional[str],
+        source_channel: str,
+        first_message_preview: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Find existing conversation for sender or create a new conversation row."""
+        try:
+            query = (
+                self.client.table("listing_conversations")
+                .select("*")
+                .eq("listing_id", listing_id)
+                .eq("owner_user_id", owner_user_id)
+            )
+
+            if sender_user_id:
+                query = query.eq("sender_user_id", sender_user_id)
+            elif sender_session_id:
+                query = query.eq("sender_session_id", sender_session_id)
+            else:
+                query = query.is_("sender_user_id", "null").is_("sender_session_id", "null")
+
+            existing = query.order("updated_at", desc=True).limit(1).execute()
+            row = self._first_dict(existing.data)
+            if row:
+                return row
+
+            payload: Dict[str, Any] = {
+                "listing_id": listing_id,
+                "owner_user_id": owner_user_id,
+                "source_channel": source_channel or "web",
+                "last_message_preview": first_message_preview,
+                "last_message_at": datetime.now(timezone.utc).isoformat(),
+                "owner_unread_count": 0,
+                "buyer_unread_count": 0,
+            }
+            if contact_token_id:
+                payload["contact_token_id"] = contact_token_id
+            if sender_user_id:
+                payload["sender_user_id"] = sender_user_id
+            if sender_session_id:
+                payload["sender_session_id"] = sender_session_id
+            if sender_name:
+                payload["sender_name"] = sender_name[:120]
+
+            created = self.client.table("listing_conversations").insert(payload).execute()
+            return self._first_dict(created.data)
+        except Exception as e:
+            logger.error(f"Error creating conversation: {e}")
+            return None
+
+    async def add_message_to_conversation(
+        self,
+        *,
+        conversation_id: str,
+        listing_id: str,
+        sender_role: str,
+        body: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Insert message and update conversation summary counters."""
+        try:
+            text = (body or "").strip()
+            if not text:
+                return None
+
+            message = (
+                self.client.table("listing_messages")
+                .insert({
+                    "conversation_id": conversation_id,
+                    "listing_id": listing_id,
+                    "sender_role": sender_role,
+                    "body": text,
+                    "read_by_owner": sender_role == "owner",
+                    "read_by_buyer": sender_role == "buyer",
+                })
+                .execute()
+            )
+            message_row = self._first_dict(message.data)
+            if not message_row:
+                return None
+
+            conv_res = (
+                self.client.table("listing_conversations")
+                .select("owner_unread_count,buyer_unread_count")
+                .eq("id", conversation_id)
+                .limit(1)
+                .execute()
+            )
+            conv = self._first_dict(conv_res.data) or {}
+            owner_unread = int(conv.get("owner_unread_count") or 0)
+            buyer_unread = int(conv.get("buyer_unread_count") or 0)
+
+            if sender_role == "buyer":
+                owner_unread += 1
+            elif sender_role == "owner":
+                buyer_unread += 1
+
+            self.client.table("listing_conversations").update({
+                "last_message_preview": text[:200],
+                "last_message_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "owner_unread_count": owner_unread,
+                "buyer_unread_count": buyer_unread,
+            }).eq("id", conversation_id).execute()
+
+            return message_row
+        except Exception as e:
+            logger.error(f"Error adding message to conversation: {e}")
+            return None
+
+    async def get_owner_inbox(self, owner_user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return conversation summaries for listing owner inbox."""
+        try:
+            result = (
+                self.client.table("listing_conversations")
+                .select("id,listing_id,sender_name,source_channel,last_message_preview,last_message_at,owner_unread_count,created_at")
+                .eq("owner_user_id", owner_user_id)
+                .order("last_message_at", desc=True)
+                .limit(max(1, min(limit, 100)))
+                .execute()
+            )
+            return self._list_of_dicts(result.data)
+        except Exception as e:
+            logger.error(f"Error fetching owner inbox: {e}")
+            return []
+
+    async def get_conversation_messages(self, conversation_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Return messages for a conversation in chronological order."""
+        try:
+            result = (
+                self.client.table("listing_messages")
+                .select("id,conversation_id,sender_role,body,created_at,read_by_owner,read_by_buyer")
+                .eq("conversation_id", conversation_id)
+                .order("created_at", desc=False)
+                .limit(max(1, min(limit, 300)))
+                .execute()
+            )
+            return self._list_of_dicts(result.data)
+        except Exception as e:
+            logger.error(f"Error fetching conversation messages: {e}")
+            return []
+
+    async def owner_can_access_conversation(self, owner_user_id: str, conversation_id: str) -> bool:
+        """Check ownership for inbox conversation access."""
+        try:
+            result = (
+                self.client.table("listing_conversations")
+                .select("id")
+                .eq("id", conversation_id)
+                .eq("owner_user_id", owner_user_id)
+                .limit(1)
+                .execute()
+            )
+            return bool(self._first_dict(result.data))
+        except Exception as e:
+            logger.error(f"Error checking conversation ownership: {e}")
+            return False
+
+    async def mark_owner_read(self, conversation_id: str) -> bool:
+        """Mark conversation as read by owner."""
+        try:
+            self.client.table("listing_messages").update({"read_by_owner": True}).eq("conversation_id", conversation_id).execute()
+            self.client.table("listing_conversations").update({"owner_unread_count": 0, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", conversation_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error marking owner read: {e}")
+            return False
     
     # Wallet Operations
     async def get_wallet_balance(self, user_id: str) -> Optional[float]:

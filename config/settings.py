@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     
     # Webhook Configuration
     webhook_base_url: Optional[str] = None
+    frontend_base_url: Optional[str] = "https://pazarglobal.com"
     
     # Application Settings
     debug: bool = False

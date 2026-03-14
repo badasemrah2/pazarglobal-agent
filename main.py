@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from routers.gateway_v3 import router as gateway_v3_router
 from routers.admin import router as admin_router
+from routers.contact import router as contact_router
 from services.logger import get_logger
 from services.monitoring import monitoring_router
 from services.alerting import get_alerting_service
@@ -46,6 +47,7 @@ app.add_middleware(
 app.include_router(gateway_v3_router)  # V3 - Single LLM Brain
 app.include_router(monitoring_router)
 app.include_router(admin_router)
+app.include_router(contact_router)
 
 
 @app.post("/agent/run")

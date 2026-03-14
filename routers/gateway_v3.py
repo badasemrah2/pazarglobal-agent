@@ -589,8 +589,30 @@ class FSMEngine:
                 if isinstance(raw_phone, str) and raw_phone.strip():
                     user_phone = raw_phone.strip()
 
+            phone_visibility = "public"
+            name_visibility = "public"
+            try:
+                profile_res = (
+                    supabase_client.client
+                    .table("profiles")
+                    .select("phone_visibility,name_visibility")
+                    .eq("id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                profile_row = profile_res.data[0] if profile_res.data else None
+                if isinstance(profile_row, dict):
+                    if str(profile_row.get("phone_visibility") or "").strip().lower() == "hidden":
+                        phone_visibility = "hidden"
+                    if str(profile_row.get("name_visibility") or "").strip().lower() == "hidden":
+                        name_visibility = "hidden"
+            except Exception:
+                pass
+
             final_listing["user_name"] = user_name
             final_listing["user_phone"] = user_phone
+            final_listing["phone_visibility"] = phone_visibility
+            final_listing["name_visibility"] = name_visibility
             
             # 5. Insert to Supabase
             logger.info(f"Inserting listing to Supabase: {listing_id}")
@@ -1451,6 +1473,16 @@ async def _handle_search(user_id: str, channel: str, session: Dict, query: str) 
                     title = listing.get("title", "İsimsiz")
                     price = listing.get("price", 0)
                     results_text += f"{i}. **{title}**\n   💰 {price:,.0f} TL\n\n"
+                    listing_id = str(listing.get("id") or "").strip()
+                    if listing_id:
+                        try:
+                            token_row = await supabase_client.ensure_contact_token_for_listing(listing_id)
+                            token = str((token_row or {}).get("token") or "").strip() if isinstance(token_row, dict) else ""
+                            if token:
+                                frontend_base = (getattr(settings, "frontend_base_url", None) or "https://pazarglobal.com").strip().rstrip("/")
+                                results_text += f"   ✉️ Mesaj Gönder: {frontend_base}/contact/{token}\n\n"
+                        except Exception as e:
+                            logger.warning(f"Failed to attach contact link in search fallback (listing_id={listing_id}): {e}")
                 
                 return MessageResponse(
                     success=True,
@@ -1635,6 +1667,10 @@ async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageRes
     description = listing.get("description") or ""
     condition = listing.get("condition") or "2. El"
     location = listing.get("location") or ""
+    listing_id = str(listing.get("id") or "").strip()
+
+    phone_visibility = str(listing.get("phone_visibility") or "public").strip().lower()
+    name_visibility = str(listing.get("name_visibility") or "public").strip().lower()
     
     # Get primary image
     image_url = listing.get("image_url")
@@ -1644,6 +1680,11 @@ async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageRes
     # Get owner info
     owner_name = listing.get("user_name")
     owner_phone = listing.get("user_phone")
+
+    if name_visibility == "hidden":
+        owner_name = "İlan Sahibi"
+    if phone_visibility == "hidden":
+        owner_phone = supabase_client._mask_phone(owner_phone) or "+90xxxxxxxxxx"
     
     if not owner_name or not owner_phone:
         owner_id = listing.get("owner_id") or listing.get("user_id")
@@ -1686,6 +1727,22 @@ async def _format_listing_detail_response(listing: Dict[str, Any]) -> MessageRes
         seller_parts.append(f"Telefon: {owner_phone}")
     if seller_parts:
         lines.append(" | ".join(seller_parts))
+
+    # Always provide site-internal contact link in detail mode.
+    # This is especially important for WhatsApp where inline UI actions are limited.
+    try:
+        contact_url = None
+        if listing_id:
+            token_row = await supabase_client.ensure_contact_token_for_listing(listing_id)
+            token = str((token_row or {}).get("token") or "").strip() if isinstance(token_row, dict) else ""
+            if token:
+                frontend_base = (getattr(settings, "frontend_base_url", None) or "https://pazarglobal.com").strip().rstrip("/")
+                contact_url = f"{frontend_base}/contact/{token}"
+        if contact_url:
+            lines.append("")
+            lines.append(f"Mesaj göndermek için: {contact_url}")
+    except Exception as e:
+        logger.warning(f"Failed to attach contact link for detail response: {e}")
     
     # Description
     if description:

@@ -16,6 +16,7 @@ from loguru import logger
 import re
 from config import settings
 from services.text_normalization import normalize_for_match
+from services.supabase_client import supabase_client
 
 
 class CategorySearchAgent(BaseAgent):
@@ -641,6 +642,7 @@ class SearchComposerAgent(BaseAgent):
                     price = listing.get("price")
                     price_txt = f"{price} TL" if price is not None else "Fiyat belirtilmemiş"
                     category = listing.get("category") or "Kategori yok"
+                    listing_id = str(listing.get("id") or "").strip()
                     image_url = None
                     if listing.get("image_url"):
                         image_url = listing["image_url"]
@@ -657,6 +659,17 @@ class SearchComposerAgent(BaseAgent):
                         msg_lines.append(f"![{title}]({image_url})")
                     if short_desc:
                         msg_lines.append(short_desc + "...")
+
+                    if listing_id:
+                        try:
+                            token_row = await supabase_client.ensure_contact_token_for_listing(listing_id)
+                            token = str((token_row or {}).get("token") or "").strip() if isinstance(token_row, dict) else ""
+                            if token:
+                                frontend_base = (getattr(settings, "frontend_base_url", None) or "https://pazarglobal.com").strip().rstrip("/")
+                                msg_lines.append(f"Mesaj Gönder: {frontend_base}/contact/{token}")
+                        except Exception as e:
+                            logger.warning(f"Failed to attach contact link in search preview (listing_id={listing_id}): {e}")
+
                     msg_lines.append("")
             if remaining > 0:
                 msg_lines.append(f"İlk {len(preview_listings)} tanesi gösterildi. Daha fazlası için söyleyin.")
