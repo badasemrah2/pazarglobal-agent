@@ -5,9 +5,11 @@ FastAPI application with WhatsApp and WebChat integration
 v3.0.0 - Single LLM Brain architecture
 Updated: 2026-02-02 17:00
 """
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from config import settings
 from routers.gateway_v3 import router as gateway_v3_router
 from routers.admin import router as admin_router
@@ -15,6 +17,7 @@ from routers.contact import router as contact_router
 from services.logger import get_logger
 from services.monitoring import monitoring_router
 from services.alerting import get_alerting_service
+from services.supabase_client import supabase_client
 
 # Shared logger instance for this module
 logger = get_logger(__name__)
@@ -48,6 +51,110 @@ app.include_router(gateway_v3_router)  # V3 - Single LLM Brain
 app.include_router(monitoring_router)
 app.include_router(admin_router)
 app.include_router(contact_router)
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+@app.get("/seo/sitemap-live.xml")
+async def seo_sitemap_live() -> Response:
+    """Live sitemap endpoint: returns listing URLs from DB without requiring redeploy."""
+    site_url = "https://pazarglobal.com"
+    now = datetime.now(timezone.utc)
+
+    static_urls = [
+        (f"{site_url}/", "daily", "1.0", None),
+        (f"{site_url}/listings", "hourly", "0.9", None),
+        (f"{site_url}/create-listing", "weekly", "0.7", None),
+        (f"{site_url}/about", "monthly", "0.6", None),
+        (f"{site_url}/reviews", "weekly", "0.7", None),
+    ]
+
+    listing_rows = []
+    try:
+        # 5000 cap keeps endpoint predictable while covering common marketplace scale.
+        result = (
+            supabase_client.client
+            .table("listings")
+            .select("id,status,expires_at,created_at,updated_at")
+            .eq("status", "active")
+            .order("created_at", desc=True)
+            .limit(5000)
+            .execute()
+        )
+        listing_rows = result.data if isinstance(result.data, list) else []
+    except Exception as e:
+        logger.error(f"Live sitemap query error: {e}")
+        listing_rows = []
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+
+    for loc, changefreq, priority, lastmod in static_urls:
+        lines.append("  <url>")
+        lines.append(f"    <loc>{_xml_escape(loc)}</loc>")
+        if lastmod:
+            lines.append(f"    <lastmod>{_xml_escape(lastmod)}</lastmod>")
+        lines.append(f"    <changefreq>{_xml_escape(changefreq)}</changefreq>")
+        lines.append(f"    <priority>{_xml_escape(priority)}</priority>")
+        lines.append("  </url>")
+
+    for row in listing_rows:
+        listing_id = str((row or {}).get("id") or "").strip()
+        if not listing_id:
+            continue
+
+        expires_at = (row or {}).get("expires_at")
+        if expires_at:
+            try:
+                exp_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if exp_dt < now:
+                    continue
+            except Exception:
+                pass
+
+        lastmod_raw = (row or {}).get("updated_at") or (row or {}).get("created_at")
+        lastmod = None
+        if lastmod_raw:
+            try:
+                lm = datetime.fromisoformat(str(lastmod_raw).replace("Z", "+00:00"))
+                if lm.tzinfo is None:
+                    lm = lm.replace(tzinfo=timezone.utc)
+                lastmod = lm.isoformat()
+            except Exception:
+                lastmod = None
+
+        lines.append("  <url>")
+        lines.append(f"    <loc>{_xml_escape(f'{site_url}/listing/{listing_id}')}</loc>")
+        if lastmod:
+            lines.append(f"    <lastmod>{_xml_escape(lastmod)}</lastmod>")
+        lines.append("    <changefreq>daily</changefreq>")
+        lines.append("    <priority>0.8</priority>")
+        lines.append("  </url>")
+
+    lines.append("</urlset>")
+    xml = "\n".join(lines) + "\n"
+
+    return Response(
+        content=xml,
+        media_type="application/xml",
+        headers={
+            # Keep cache short so new listings appear quickly without aggressive origin load.
+            "Cache-Control": "public, max-age=120",
+        },
+    )
 
 
 @app.post("/agent/run")
