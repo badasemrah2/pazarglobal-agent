@@ -2185,15 +2185,48 @@ class SupabaseClient:
             return False
 
     async def get_market_price_data(self, product_key: Optional[str] = None, category: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
-        """Fetch market price snapshots for search composer."""
+        """Fetch fresh market price snapshots for search composer.
+
+        Freshness policy:
+        - Return only rows updated within the last 31 days.
+        - If no fresh row exists for a product query, trigger a cached refresh flow.
+        """
         try:
-            query = self.client.table("market_price_snapshots").select("*")
+            freshness_cutoff = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+
+            def _build_query():
+                q = (
+                    self.client
+                    .table("market_price_snapshots")
+                    .select("*")
+                    .gte("last_updated_at", freshness_cutoff)
+                    .order("last_updated_at", desc=True)
+                )
+                if product_key:
+                    q = q.ilike("product_key", f"%{product_key}%")
+                if category:
+                    q = q.eq("category", category)
+                return q
+
+            result = _build_query().limit(limit).execute()
+            snapshots = self._list_of_dicts(result.data)
+            if snapshots:
+                return snapshots
+
+            # If no fresh snapshot exists, try to refresh via cached edge pipeline.
             if product_key:
-                query = query.ilike("product_key", f"%{product_key}%")
-            if category:
-                query = query.eq("category", category)
-            result = query.limit(limit).execute()
-            return self._list_of_dicts(result.data)
+                try:
+                    await self.suggest_price_cached(
+                        title=product_key,
+                        category=category or "Diğer",
+                        condition="2. El",
+                    )
+                    refreshed = _build_query().limit(limit).execute()
+                    return self._list_of_dicts(refreshed.data)
+                except Exception as refresh_err:
+                    logger.warning(f"Market snapshot refresh failed: {refresh_err}")
+
+            return []
         except Exception as e:
             logger.error(f"Error fetching market price data: {e}")
             return []

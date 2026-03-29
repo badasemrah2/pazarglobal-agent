@@ -239,6 +239,46 @@ def _is_show_more_command(lower_msg: str) -> bool:
     return any(trigger in msg for trigger in triggers)
 
 
+def _normalize_intent_text(text: str) -> str:
+    value = (text or "").lower().strip()
+    tr_map = str.maketrans({
+        "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u",
+    })
+    value = value.translate(tr_map)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _looks_like_price_research_request(message: str) -> bool:
+    """Soft fallback for flexible price-research utterances.
+
+    This is intentionally permissive and only used when LLM returned CHAT
+    without a tool_call. It should not override CREATE/SEARCH/REPORT flows.
+    """
+    msg = _normalize_intent_text(message)
+    if not msg:
+        return False
+
+    strong_phrases = [
+        "kac para", "kac lira", "ne kadar", "ne kadara", "fiyati ne", "fiyati nedir",
+        "fiyat arast", "piyasa arast", "piyasa degeri", "ortalama fiyat", "ederi ne",
+        "neye gider", "kaca gider", "ne kadara satilir", "fiyatini ogren",
+    ]
+    typo_phrases = [
+        "fiyta", "fiytai", "fiyati nekadar", "fiyat nekadar", "fiyat nekdr",
+    ]
+
+    if any(p in msg for p in strong_phrases):
+        return True
+    if any(p in msg for p in typo_phrases):
+        return True
+
+    # Fallback token logic for colloquial variants
+    has_price_signal = any(t in msg for t in ["fiyat", "piyasa", "deger", "eder", "ortalama"])
+    has_question_signal = any(t in msg for t in ["?", "nedir", "ne", "kac", "kaca", "ne kadar", "arastir", "soyler misin"])
+    return has_price_signal and has_question_signal
+
+
 async def _format_search_continuation_page(listings: List[Dict[str, Any]], start_idx: int, page_size: int = 5) -> str:
     total = len(listings or [])
     if total == 0 or start_idx >= total:
@@ -1283,6 +1323,15 @@ async def handle_message(
             missing_fields=missing_fields,
             last_intent=last_intent,
         )
+
+        # Soft fallback: keep LLM-first, but recover missed flexible price requests.
+        if (
+            not brain_output.tool_call
+            and brain_output.intent == Intent.CHAT
+            and _looks_like_price_research_request(request.message)
+        ):
+            logger.info("Price research fallback detector triggered from CHAT message")
+            brain_output.tool_call = {"name": "perplexity", "query": request.message}
         
         # 3.5. PERPLEXITY TOOL CALL - Handle BEFORE intent routing!
         # "kaç para eder" / "fiyat araştır" queries should call Perplexity regardless of intent
@@ -1878,14 +1927,73 @@ async def _call_perplexity(query: str) -> Optional[float]:
 
 
 async def _call_perplexity_with_response(query: str) -> Dict[str, Any]:
-    """Perplexity API - doğrudan fiyat araştırması (Edge Function bypass)"""
+    """Price research response builder.
+
+    Flow:
+    1) Edge cached pipeline (ai-assistant-cached) - preferred, writes/reads snapshots
+    2) Direct Perplexity fallback - only if edge path fails
+    """
     import httpx
     import json as json_module
     
     try:
-        logger.info(f"Calling Perplexity API directly for: {query}")
-        
-        # Check if API key is configured
+        logger.info(f"Price research requested: query={query}")
+
+        # 1) Preferred path: Edge cached function (consistent with listing flow)
+        try:
+            edge_result = await supabase_client.suggest_price_cached(
+                title=query,
+                category="Diğer",
+                condition="2. El",
+            )
+
+            if isinstance(edge_result, dict):
+                # Edge outputs may vary by deployment: normalize common shapes
+                success = bool(edge_result.get("success", True))
+                payload = edge_result.get("data") if isinstance(edge_result.get("data"), dict) else edge_result
+
+                if success and isinstance(payload, dict):
+                    suggested_price = payload.get("suggested_price")
+                    if suggested_price is None:
+                        suggested_price = payload.get("price")
+
+                    min_price = payload.get("min_price")
+                    max_price = payload.get("max_price")
+                    reasoning = payload.get("reasoning") or payload.get("result") or ""
+                    cached = bool(payload.get("cached", False))
+
+                    if suggested_price is not None:
+                        price_float = float(suggested_price)
+                        min_price = float(min_price) if min_price is not None else price_float * 0.8
+                        max_price = float(max_price) if max_price is not None else price_float * 1.2
+
+                        freshness_note = "(cache)" if cached else "(guncel)"
+                        response_text = f"""🔍 **{query}** için fiyat araştırması {freshness_note}:
+
+💰 **Önerilen Fiyat:** {price_float:,.0f} TL
+
+📊 **Fiyat Aralığı:**
+• Minimum: {min_price:,.0f} TL
+• Maksimum: {max_price:,.0f} TL
+
+{f"📝 {reasoning}" if reasoning else ""}
+
+Bu fiyatlar Türkiye 2. el piyasa verilerine göre hesaplanmıştır. İlan vermek isterseniz "ilan ver" yazabilirsiniz!"""
+
+                        return {
+                            "suggested_price": price_float,
+                            "min_price": min_price,
+                            "max_price": max_price,
+                            "response": response_text,
+                            "source": "edge_cached",
+                            "cached": cached,
+                        }
+        except Exception as edge_err:
+            logger.warning(f"Edge cached price research failed, falling back to direct Perplexity: {edge_err}")
+
+        # 2) Fallback path: direct Perplexity call
+        logger.info(f"Calling Perplexity API directly for fallback: {query}")
+
         if not settings.perplexity_api_key:
             logger.error("PERPLEXITY_API_KEY not configured")
             return {
@@ -1893,8 +2001,14 @@ async def _call_perplexity_with_response(query: str) -> Dict[str, Any]:
                 "response": f"🔍 Fiyat araştırması yapılandırılmamış.\n\n**{query}** için ilan vermek ister misiniz?",
             }
         
-        # Build Perplexity prompt for Turkish market price research
-        prompt = f"""Türkiye'de "{query}" ürününün 2. el piyasa fiyatını araştır.
+        # Build Perplexity prompt for strict Turkey market price research
+        prompt = f"""SADECE Türkiye piyasasında \"{query}\" ürününün 2. el fiyatını araştır.
+
+    Kurallar:
+    - Yalnız Türkiye içi piyasa verileri kullan (sahibinden, letgo, trendyol ikinci el vb. Türkiye odaklı kaynak mantığı).
+    - Yurt dışı fiyatlarını, USD/EUR dönüşümlerini ve global pazar verilerini kullanma.
+    - Fiyatları sadece TL olarak değerlendir.
+    - Mümkünse son 30 gün verisini esas al; veri yetersizse bunu reasoning alanında belirt.
 
 Sadece aşağıdaki JSON formatında yanıt ver, başka bir şey yazma:
 {{
@@ -1912,7 +2026,7 @@ Eğer fiyat bulamazsan: {{"suggested_price": null, "reasoning": "Fiyat bilgisi b
                 json={
                     "model": "sonar",
                     "messages": [
-                        {"role": "system", "content": "Sen Türkiye'deki 2. el ürün fiyatları konusunda uzman bir asistansın. Sadece JSON formatında yanıt ver."},
+                        {"role": "system", "content": "Sen SADECE Türkiye 2. el piyasası fiyat araştırma asistanısın. Global pazarları dahil etme. Çıktıyı yalnız JSON ver."},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.1,
