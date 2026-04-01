@@ -279,6 +279,43 @@ def _looks_like_price_research_request(message: str) -> bool:
     return has_price_signal and has_question_signal
 
 
+def _detect_enrichment_action(message: str) -> Optional[str]:
+    """Detect title/description improvement requests from natural language.
+
+    This is a soft, semantic guard for hybrid flow:
+    - user keeps chatting naturally
+    - deterministic enrichment action is selected in background
+    """
+    msg = _normalize_intent_text(message)
+    if not msg:
+        return None
+
+    verbs = [
+        "iyilestir", "duzelt", "gelistir", "guzellestir", "guncelle", "oner", "onerir misin", "yazar misin",
+    ]
+    has_verb = any(v in msg for v in verbs)
+    if not has_verb:
+        return None
+
+    title_terms = ["baslik", "title", "ilan basligi"]
+    desc_terms = ["aciklama", "description", "metin", "ilan metni", "ilan aciklamasi"]
+
+    has_title = any(t in msg for t in title_terms)
+    has_desc = any(t in msg for t in desc_terms)
+
+    if has_title:
+        return "suggest_title"
+
+    if has_desc:
+        # "sablon", "olustur" gibi taleplerde yeni aciklama olustur;
+        # aksi durumda mevcut aciklamayi iyilestir.
+        if any(t in msg for t in ["sablon", "olustur", "yeni", "sifirdan"]):
+            return "suggest_description"
+        return "improve_text"
+
+    return None
+
+
 async def _format_search_continuation_page(listings: List[Dict[str, Any]], start_idx: int, page_size: int = 5) -> str:
     total = len(listings or [])
     if total == 0 or start_idx >= total:
@@ -426,38 +463,53 @@ class FSMEngine:
     @classmethod
     def generate_keywords(cls, listing_data: Dict[str, Any]) -> str:
         """
-        Keywords üret - arama için metadata.keywords_text
+        Deterministic keywords for metadata.keywords_text.
+        Uses synonym expansion so broad queries (araba/otomobil/araç) do not miss listings.
         """
-        parts = []
-        
-        # Title words
-        title = listing_data.get("title", "")
-        if title:
-            parts.extend(title.lower().split())
-        
-        # Description words (ilk 100 karakter)
-        desc = listing_data.get("description", "")
-        if desc:
-            parts.extend(desc[:100].lower().split())
-        
-        # Category
-        category = listing_data.get("category", "")
-        if category:
-            parts.append(category.lower())
-        
-        # Location
-        location = listing_data.get("location", "")
-        if location:
-            parts.append(location.lower())
-        
-        # Condition
-        condition = listing_data.get("condition", "")
-        if condition:
-            parts.append(condition.lower())
-        
-        # Dedupe and clean
-        keywords = list(set(parts))
-        return " ".join(keywords[:50])
+        title = str(listing_data.get("title") or "")
+        desc = str(listing_data.get("description") or "")
+        category = str(listing_data.get("category") or "")
+        condition = str(listing_data.get("condition") or "")
+        location = str(listing_data.get("location") or "")
+
+        haystack = normalize_for_match(f"{category} {title} {desc}")
+        tokens: List[str] = []
+
+        stop = {
+            "satilik", "kiralik", "urun", "esya", "temiz", "kullanilmis",
+            "fiyat", "tl", "acil", "hemen", "durumda",
+        }
+
+        # Category-level recall helpers
+        if any(k in haystack for k in ["otomotiv", "vasita", "arac"]):
+            tokens.extend(["araba", "otomobil", "arac", "otomotiv"])
+        if any(k in haystack for k in ["emlak", "konut", "gayrimenkul"]):
+            tokens.extend(["emlak", "ev", "daire", "konut"])
+        if any(k in haystack for k in ["elektronik", "telefon", "bilgisayar"]):
+            tokens.extend(["elektronik"])
+        if any(k in haystack for k in ["iphone", "samsung", "xiaomi", "telefon", "akilli telefon"]):
+            tokens.extend(["telefon", "cep telefonu", "akilli telefon"])
+        if any(k in haystack for k in ["laptop", "notebook", "lenovo", "dell", "asus", "hp", "macbook"]):
+            tokens.extend(["bilgisayar", "laptop", "notebook"])
+
+        for src in [title, desc, category, condition, location]:
+            for t in re.findall(r"[0-9a-zçğıöşü\+]{2,}", (src or "").lower(), flags=re.IGNORECASE):
+                w = t.strip("+").strip()
+                if not w or w in stop:
+                    continue
+                tokens.append(w)
+
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for w in tokens:
+            if w in seen:
+                continue
+            seen.add(w)
+            deduped.append(w)
+            if len(deduped) >= 20:
+                break
+
+        return " ".join(deduped)
     
     @classmethod
     async def check_wallet(cls, user_id: str, required_amount: float = 55.0) -> tuple[bool, float]:
@@ -1357,6 +1409,25 @@ async def handle_message(
                 ],
                 metadata={"intent": "PRICE_RESEARCH", "tool": "perplexity", "price": price_result.get("suggested_price")},
             )
+
+        # 3.6. Hybrid enrichment bridge (title/description improvement)
+        # Keep user in free conversation while using deterministic edge action behind the scenes.
+        enrichment_action = _detect_enrichment_action(request.message)
+        if (
+            enrichment_action
+            and not brain_output.tool_call
+            and brain_output.intent in (Intent.CHAT, Intent.CREATE)
+            and isinstance(session.get("listing_data"), dict)
+            and session.get("listing_data")
+        ):
+            improved = await _handle_enrichment_action(
+                user_id=user_id,
+                channel=request.channel,
+                session=session,
+                action=enrichment_action,
+            )
+            if improved is not None:
+                return improved
         
         # 4. Handle by intent
         if brain_output.intent == Intent.CANCEL:
@@ -1651,21 +1722,109 @@ async def _handle_search(user_id: str, channel: str, session: Dict, query: str) 
 
 async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: BrainOutput) -> MessageResponse:
     """CHAT intent - Genel sohbet"""
+    response_text = (brain_output.response_text or "").strip()
+    if not response_text:
+        response_text = "Size yardımcı olmak için buradayım. İsterseniz ilan vermeye başlayabiliriz veya ürün arayabiliriz."
     
     session.setdefault("conversation_history", []).append({
         "role": "assistant",
-        "content": brain_output.response_text,
+        "content": response_text,
     })
     await save_session(user_id, channel, session)
     
     return MessageResponse(
         success=True,
-        text=brain_output.response_text,
+        text=response_text,
         buttons=[
             ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
             ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
         ],
         metadata={"intent": "CHAT"},
+    )
+
+
+async def _handle_enrichment_action(
+    user_id: str,
+    channel: str,
+    session: Dict[str, Any],
+    action: str,
+) -> Optional[MessageResponse]:
+    listing = session.get("listing_data") or {}
+    if not isinstance(listing, dict) or not listing:
+        return None
+
+    title = str(listing.get("title") or "").strip()
+    description = str(listing.get("description") or "").strip()
+    category = str(listing.get("category") or "Diğer").strip() or "Diğer"
+    condition = str(listing.get("condition") or "2. El").strip() or "2. El"
+
+    if action == "suggest_title" and len(title) < 2:
+        return MessageResponse(
+            success=True,
+            text="Başlık iyileştirmesi için önce kısa bir başlık yazın. Örn: 'Citroen C3 2017'.",
+            metadata={"intent": "CREATE", "enrichment_action": action, "missing": ["title"]},
+        )
+
+    if action in ("improve_text", "suggest_description") and len(title) < 2:
+        return MessageResponse(
+            success=True,
+            text="Açıklamayı iyileştirmem için önce kısa bir başlık yazın. Örn: 'Citroen C3 2017'.",
+            metadata={"intent": "CREATE", "enrichment_action": action, "missing": ["title"]},
+        )
+
+    if action == "improve_text" and len(description) < 5:
+        # If description is absent, switch to template generation.
+        action = "suggest_description"
+
+    payload = {
+        "action": action,
+        "category": category,
+        "title": title,
+        "description": description,
+        "condition": condition,
+    }
+
+    edge_result = await supabase_client._call_edge_function("ai-assistant", payload)
+    if not edge_result.get("success"):
+        logger.warning(f"Enrichment edge call failed: action={action}, error={edge_result.get('error')}")
+        return None
+
+    result_text = str(edge_result.get("result") or "").strip()
+    if not result_text:
+        return None
+
+    if action == "suggest_title":
+        listing["title"] = result_text
+        ack = "✅ Başlığı iyileştirdim."
+    else:
+        listing["description"] = result_text
+        ack = "✅ Açıklamayı güncelledim."
+
+    # Re-validate and update deterministic state in background.
+    is_valid, missing = FSMEngine.validate(listing)
+    session["listing_data"] = listing
+    session["state"] = "READY" if is_valid else "DRAFTING"
+    session["fsm_state"] = FSM_STATE_DRAFTING
+    session["last_intent"] = "CREATE"
+    session["draft_updated_at"] = datetime.utcnow().isoformat()
+    await save_session(user_id, channel, session)
+
+    text = f"{ack}\n\n{_format_preview(listing)}"
+    return MessageResponse(
+        success=True,
+        text=text,
+        listing_preview=listing,
+        buttons=[
+            ButtonResponse(text="✅ Yayınla", payload="yayınla") if is_valid else ButtonResponse(text="✏️ Devam Et", payload="devam"),
+            ButtonResponse(text="❌ İptal", payload="iptal"),
+        ],
+        metadata={
+            "intent": "CREATE",
+            "enrichment_action": action,
+            "state": session["state"],
+            "missing_fields": missing,
+            "ready_for_publish": is_valid,
+        },
     )
 
 
