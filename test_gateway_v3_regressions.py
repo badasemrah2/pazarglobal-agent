@@ -5,9 +5,12 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 from routers.gateway_v3 import (  # noqa: E402
     _detect_enrichment_action,
     _detect_prohibited_listing_term,
+    _format_search_continuation_page,
     _parse_edit_updates,
     _should_try_direct_edit,
 )
+from agents.search_agents import SearchComposerAgent  # noqa: E402
+from services.example_listings import EXAMPLE_LISTING_OWNER_ID  # noqa: E402
 from services.vision_service import vision_service  # noqa: E402
 
 
@@ -60,3 +63,86 @@ def test_vision_prohibited_product_still_flags_real_weapon_terms():
     analysis = {"product": "Tabanca seti", "category": "Diğer"}
 
     assert vision_service.detect_prohibited_product(analysis) == "tabanca"
+
+
+async def test_format_search_continuation_page_marks_example_listing(monkeypatch):
+    async def fake_ensure_contact_token_for_listing(_: str):
+        return None
+
+    monkeypatch.setattr(
+        "routers.gateway_v3.supabase_client.ensure_contact_token_for_listing",
+        fake_ensure_contact_token_for_listing,
+    )
+
+    text = await _format_search_continuation_page(
+        [
+            {
+                "id": "example-1",
+                "title": "Demo Telefon",
+                "price": 18000,
+                "category": "Elektronik",
+                "description": "Temiz cihaz",
+                "user_id": EXAMPLE_LISTING_OWNER_ID,
+            },
+            {
+                "id": "normal-1",
+                "title": "Normal Telefon",
+                "price": 17500,
+                "category": "Elektronik",
+                "description": "Normal cihaz",
+                "user_id": "11111111-1111-1111-1111-111111111111",
+            },
+        ],
+        start_idx=0,
+        page_size=2,
+    )
+
+    assert "1. [Örnek İlan] Demo Telefon - 18000 TL - Elektronik" in text
+    assert "2. Normal Telefon - 17500 TL - Elektronik" in text
+
+
+async def test_search_agent_message_marks_example_listing(monkeypatch):
+    async def fake_search_execute(**_: object):
+        return {
+            "success": True,
+            "data": {
+                "listings": [
+                    {
+                        "id": "example-1",
+                        "title": "Demo Telefon",
+                        "price": 18000,
+                        "category": "Elektronik",
+                        "description": "Temiz cihaz",
+                        "user_id": EXAMPLE_LISTING_OWNER_ID,
+                    },
+                    {
+                        "id": "normal-1",
+                        "title": "Normal Telefon",
+                        "price": 17500,
+                        "category": "Elektronik",
+                        "description": "Normal cihaz",
+                        "user_id": "11111111-1111-1111-1111-111111111111",
+                    },
+                ]
+            },
+        }
+
+    async def fake_market_execute(**_: object):
+        return {"success": False, "data": {}}
+
+    async def fake_ensure_contact_token_for_listing(_: str):
+        return None
+
+    monkeypatch.setattr("agents.search_agents.search_listings_tool.execute", fake_search_execute)
+    monkeypatch.setattr("agents.search_agents.market_price_tool.execute", fake_market_execute)
+    monkeypatch.setattr(
+        "agents.search_agents.supabase_client.ensure_contact_token_for_listing",
+        fake_ensure_contact_token_for_listing,
+    )
+
+    agent = SearchComposerAgent()
+    result = await agent.orchestrate_search("iphone")
+
+    assert result["success"] is True
+    assert "1️⃣ [Örnek İlan] Demo Telefon - 18000 TL - Elektronik" in result["message"]
+    assert "2️⃣ Normal Telefon - 17500 TL - Elektronik" in result["message"]

@@ -29,6 +29,7 @@ from services.jwt_auth import get_user_id_from_request
 from core.brain import brain, BrainOutput, Intent
 from services.redis_client import redis_client
 from services.supabase_client import supabase_client
+from services.example_listings import prefix_example_listing_title
 from agents.vision_safety_gate import vision_safety_gate
 from services.vision_service import vision_service
 from services.text_normalization import normalize_for_match
@@ -335,7 +336,7 @@ async def _format_search_continuation_page(listings: List[Dict[str, Any]], start
 
     lines: List[str] = [f"📄 {start_idx + 1}-{end_idx}. ilanlar:", ""]
     for i, listing in enumerate(chunk, start=start_idx + 1):
-        title = listing.get("title") or "Başlıksız"
+        title = prefix_example_listing_title(listing.get("title") or "Başlıksız", listing)
         price = listing.get("price")
         price_txt = f"{price} TL" if price is not None else "Fiyat belirtilmemiş"
         category = listing.get("category") or "Kategori yok"
@@ -1914,7 +1915,7 @@ async def _handle_search(user_id: str, channel: str, session: Dict, query: str) 
                 await save_session(user_id, channel, session)
                 results_text = f"🔍 **{len(listings)} sonuç bulundu:**\n\n"
                 for i, listing in enumerate(listings[:5], 1):
-                    title = listing.get("title", "İsimsiz")
+                    title = prefix_example_listing_title(listing.get("title", "İsimsiz"), listing)
                     price = listing.get("price", 0)
                     results_text += f"{i}. **{title}**\n   💰 {price:,.0f} TL\n\n"
                     listing_id = str(listing.get("id") or "").strip()

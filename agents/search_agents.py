@@ -16,6 +16,7 @@ from loguru import logger
 import re
 from config import settings
 from services.text_normalization import normalize_for_match
+from services.example_listings import prefix_example_listing_title
 from services.supabase_client import supabase_client
 
 
@@ -638,7 +639,7 @@ class SearchComposerAgent(BaseAgent):
             
             if preview_listings:
                 for idx, listing in enumerate(preview_listings, 1):
-                    title = listing.get("title") or "Başlıksız"
+                    title = prefix_example_listing_title(listing.get("title") or "Başlıksız", listing)
                     price = listing.get("price")
                     price_txt = f"{price} TL" if price is not None else "Fiyat belirtilmemiş"
                     category = listing.get("category") or "Kategori yok"
