@@ -175,7 +175,8 @@ async def agent_run(request: Request):
             user_id=data.get("user_id") or data.get("phone") or "unknown",
             message=data.get("message", ""),
             media_urls=data.get("media_paths"),
-            channel="whatsapp"
+            channel="whatsapp",
+            prefill_listing_data=data.get("prefill_listing_data") if isinstance(data.get("prefill_listing_data"), dict) else None,
         )
         
         result = await handle_message(v3_request)

@@ -67,6 +67,7 @@ class MessageRequest(BaseModel):
     message: str = Field("", description="User message")
     media_urls: Optional[List[str]] = Field(default=None)
     channel: str = Field("webchat")
+    prefill_listing_data: Optional[Dict[str, Any]] = Field(default=None)
 
 
 class ButtonResponse(BaseModel):
@@ -378,7 +379,7 @@ class FSMEngine:
     """
     
     # Category FSM tarafından otomatik belirlenir - missing fields'a dahil değil!
-    REQUIRED_FIELDS = ["title", "price", "description"]
+    REQUIRED_FIELDS = ["title", "price", "description", "location"]
     
     # Import from category_library - single source of truth
     from services.category_library import SUPPORTED_CATEGORIES, classify_category, normalize_category_id
@@ -429,6 +430,11 @@ class FSMEngine:
                     missing.append("price")
             except (ValueError, TypeError):
                 missing.append("price")
+
+        # Location - now required for publish readiness
+        location = listing_data.get("location", "")
+        if not location or len(str(location).strip()) < 2:
+            missing.append("location")
 
         # Category - FSM OTOMATİK BELİRLER (LLM sorumluluğunda değil!)
         category = listing_data.get("category")
@@ -876,11 +882,20 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
     # Split by lines or semicolons for multi-field edits
     parts = re.split(r"[\n;]+", message)
     for part in parts:
-        if ":" not in part:
-            continue
-        raw_key, raw_value = part.split(":", 1)
-        key = raw_key.strip().lower()
-        value = (raw_value or "").strip()
+        key = ""
+        value = ""
+
+        if ":" in part:
+            raw_key, raw_value = part.split(":", 1)
+            key = raw_key.strip().lower()
+            value = (raw_value or "").strip()
+        else:
+            # Support compact edits like "konum kadikoy" or "fiyat 12500"
+            compact = re.match(r"^\s*(başlık|baslik|title|açıklama|aciklama|description|fiyat|price|durum|condition|lokasyon|konum|location|kategori|category)\s+(.+?)\s*$", part, flags=re.IGNORECASE)
+            if compact:
+                key = compact.group(1).strip().lower()
+                value = compact.group(2).strip()
+
         if not value:
             continue
 
@@ -904,6 +919,119 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
             updates[field] = value
 
     return updates, errors
+
+
+def _apply_structured_prefill_to_listing(listing_data: Dict[str, Any], prefill: Dict[str, Any]) -> bool:
+    """Merge structured prefill into listing data for faster slot completion."""
+    changed = False
+
+    raw_title = prefill.get("title")
+    if isinstance(raw_title, str):
+        title = raw_title.strip()
+        if title and len(str(listing_data.get("title") or "").strip()) < 3:
+            listing_data["title"] = title[:200]
+            changed = True
+
+    raw_condition = prefill.get("condition")
+    if isinstance(raw_condition, str) and raw_condition.strip():
+        parsed_condition = _parse_condition_value(raw_condition)
+        if parsed_condition:
+            existing_condition = str(listing_data.get("condition") or "").strip()
+            if not existing_condition or existing_condition == "2. El":
+                listing_data["condition"] = parsed_condition
+                changed = True
+
+    raw_desc = prefill.get("description_start") or prefill.get("description")
+    if isinstance(raw_desc, str):
+        desc_seed = raw_desc.strip()
+        if desc_seed:
+            existing_desc = str(listing_data.get("description") or "").strip()
+            if not existing_desc:
+                listing_data["description"] = desc_seed[:2000]
+                changed = True
+            elif desc_seed.lower() not in existing_desc.lower():
+                listing_data["description"] = f"{existing_desc}\n\n{desc_seed}"[:2000]
+                changed = True
+
+    return changed
+
+
+def _should_try_direct_edit(message: str) -> bool:
+    """Return True only when user message likely carries direct field update intent."""
+    if not message:
+        return False
+
+    lower = message.lower().strip()
+    if ":" in lower:
+        return True
+
+    if re.match(r"^\s*(başlık|baslik|title|açıklama|aciklama|description|fiyat|price|durum|condition|lokasyon|konum|location|kategori|category)\b", lower, flags=re.IGNORECASE):
+        # Keep price-research requests away from deterministic field parser.
+        if re.search(r"fiyat\s*(araştır|arastir|öğren|ogren)|kaç\s*para|piyasa\s*değeri|fiyat[ıi]\s*ne\s*kadar", lower, flags=re.IGNORECASE):
+            return False
+        return True
+
+    return False
+
+
+async def _apply_drafting_edit_request(user_id: str, channel: str, session: Dict, message: str) -> Optional[MessageResponse]:
+    """Apply deterministic field updates while drafting and keep session/listing in sync."""
+    if not _should_try_direct_edit(message):
+        return None
+
+    updates, errors = _parse_edit_updates(message)
+    if errors:
+        return MessageResponse(
+            success=False,
+            text=(
+                "❌ Geçersiz değer girdiniz.\n\n"
+                "Geçerli alanlar: başlık, açıklama, fiyat, durum, lokasyon.\n"
+                "Örnek: `başlık: Yeni Başlık` veya `fiyat: 12500`"
+            ),
+            metadata={"error": "invalid_edit_value", "fields": errors},
+        )
+
+    if not updates:
+        return None
+
+    listing = session.get("listing_data", {})
+    if not isinstance(listing, dict):
+        listing = {}
+
+    listing.update(updates)
+    is_valid, missing = FSMEngine.validate(listing)
+
+    session["listing_data"] = listing
+    session["state"] = "READY" if is_valid else "DRAFTING"
+    session["fsm_state"] = FSM_STATE_DRAFTING
+    session["last_intent"] = "CREATE"
+    session["draft_updated_at"] = datetime.utcnow().isoformat()
+    await save_session(user_id, channel, session)
+
+    text = f"✅ İlan bilgilerini güncelledim.\n\n{_format_preview(listing)}"
+    if missing:
+        text += f"\n\nEksik zorunlu alanlar: {', '.join(missing)}"
+    else:
+        text += "\n\nİlan hazır görünüyor. İsterseniz `yayınla` yazabilirsiniz."
+
+    buttons = [
+        ButtonResponse(text="✅ Yayınla", payload="yayınla") if is_valid else ButtonResponse(text="✏️ Devam Et", payload="devam"),
+        ButtonResponse(text="❌ İptal", payload="iptal"),
+    ]
+
+    return MessageResponse(
+        success=True,
+        text=text,
+        listing_preview=listing,
+        buttons=buttons,
+        metadata={
+            "intent": "CREATE",
+            "state": session["state"],
+            "missing_fields": missing,
+            "ready_for_publish": is_valid,
+            "update_source": "deterministic_edit",
+        },
+    )
 
 
 async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Dict) -> MessageResponse:
@@ -1218,6 +1346,21 @@ async def handle_message(
                 session["listing_data"] = listing_data
                 await save_session(user_id, request.channel, session)
 
+        # 0.9 Structured prefill injection (channel-agnostic, currently fed by WhatsApp vision bridge)
+        if isinstance(request.prefill_listing_data, dict) and request.prefill_listing_data:
+            listing_data = session.get("listing_data", {})
+            if not isinstance(listing_data, dict):
+                listing_data = {}
+
+            if _apply_structured_prefill_to_listing(listing_data, request.prefill_listing_data):
+                session["listing_data"] = listing_data
+                session["state"] = "DRAFTING"
+                session["fsm_state"] = FSM_STATE_DRAFTING
+                session["last_intent"] = "CREATE"
+                session["draft_updated_at"] = datetime.utcnow().isoformat()
+                await save_session(user_id, request.channel, session)
+                logger.info("Applied structured prefill to listing_data before routing")
+
         # 1.0 Attach WhatsApp media paths to listing_data (if provided)
         incoming_images: List[str] = []
         if request.media_urls:
@@ -1297,12 +1440,30 @@ async def handle_message(
                 # Deterministic command - LLM BYPASSED
                 logger.info(f"FSM: PENDING_CONFIRMATION state, command={fsm_command}, bypassing LLM")
                 return await _fsm_handle_confirmation(user_id, request.channel, session, fsm_command)
-            # Not a command - allow free-form edits via LLM
+
+            # Try deterministic field edit handling first (e.g. "konum: Kadikoy" / "konum Kadikoy")
+            if _should_try_direct_edit(request.message or ""):
+                logger.info("FSM: PENDING_CONFIRMATION state, deterministic edit detected, bypassing LLM")
+                return await _fsm_handle_edit_request(user_id, request.channel, session, request.message or "")
+
+            # Not a command or deterministic edit - allow free-form edits via LLM
             session["fsm_state"] = FSM_STATE_DRAFTING
             await save_session(user_id, request.channel, session)
             logger.info("FSM: PENDING_CONFIRMATION state, non-command received, routing to LLM for edits")
         
-        # 1.3 Detail command handling (uses last search cache)
+        # 1.3 Drafting-stage deterministic edit updates (LLM bypass)
+        if session.get("listing_data") and fsm_state in {FSM_STATE_DRAFTING, FSM_STATE_IDLE}:
+            deterministic_edit_response = await _apply_drafting_edit_request(
+                user_id,
+                request.channel,
+                session,
+                request.message or "",
+            )
+            if deterministic_edit_response is not None:
+                logger.info("FSM: DRAFTING deterministic edit handled before LLM")
+                return deterministic_edit_response
+
+        # 1.4 Detail command handling (uses last search cache)
         detail_match = re.search(r"(\d+)\s*nolu\s*ilan", lower_msg)
         if detail_match and ("detay" in lower_msg or "goster" in lower_msg or "göster" in lower_msg):
             idx = int(detail_match.group(1)) - 1
@@ -1310,7 +1471,7 @@ async def handle_message(
             if 0 <= idx < len(search_cache):
                 return await _format_listing_detail_response(search_cache[idx])
 
-        # 1.4 Pagination command handling (uses last search cache)
+        # 1.5 Pagination command handling (uses last search cache)
         if _is_show_more_command(lower_msg):
             search_cache = session.get("search_cache") or []
             if search_cache:
@@ -1335,7 +1496,7 @@ async def handle_message(
                     metadata={"intent": "SEARCH", "count": len(search_cache)},
                 )
         
-        # 1.5 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
+        # 1.6 Preview/Son hal shortcut - skip LLM if user just wants to see current draft
         preview_keywords = ["son hal", "önizleme", "preview", "göster bana", "goster bana"]
         if any(kw in lower_msg for kw in preview_keywords) and session.get("listing_data"):
             current_listing = session.get("listing_data", {})
@@ -1362,7 +1523,7 @@ async def handle_message(
         # LLM "kaç para eder" gibi sorguları algılayıp tool_call döndürüyor.
         
         # Pre-calculate missing fields
-        _, missing_fields = FSMEngine.validate(current_listing) if current_listing else (False, ["title", "price", "category"])
+        _, missing_fields = FSMEngine.validate(current_listing) if current_listing else (False, FSMEngine.REQUIRED_FIELDS.copy())
         
         # 3. Call Brain with rich context
         brain_output = await brain.process(
@@ -1393,20 +1554,30 @@ async def handle_message(
             
             price_result = await _call_perplexity_with_response(query)
             
-            # Save to session for future reference
-            session["last_intent"] = "CHAT"
+            # Save to session for future reference and preserve active draft workflow when present.
+            has_active_draft = bool(session.get("listing_data"))
+            session["last_intent"] = "CREATE" if has_active_draft else "CHAT"
             session["last_price_query"] = query
             if price_result.get("suggested_price"):
                 session["last_suggested_price"] = price_result["suggested_price"]
             await save_session(user_id, request.channel, session)
+
+            response_text = price_result["response"]
+            buttons = [
+                ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
+                ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
+            ]
+            if has_active_draft:
+                response_text = f"{response_text}\n\n🧩 Taslağınız korunuyor. İsterseniz bilgileri güncellemeye devam edebilir veya `yayınla` yazabilirsiniz."
+                buttons = [
+                    ButtonResponse(text="✏️ İlana Devam Et", payload="devam"),
+                    ButtonResponse(text="✅ Yayınla", payload="yayınla"),
+                ]
             
             return MessageResponse(
                 success=True,
-                text=price_result["response"],
-                buttons=[
-                    ButtonResponse(text="📸 İlan Ver", payload="ilan vermek istiyorum"),
-                    ButtonResponse(text="🔍 Ürün Ara", payload="aramak istiyorum"),
-                ],
+                text=response_text,
+                buttons=buttons,
                 metadata={"intent": "PRICE_RESEARCH", "tool": "perplexity", "price": price_result.get("suggested_price")},
             )
 
@@ -1751,7 +1922,14 @@ async def _handle_enrichment_action(
 ) -> Optional[MessageResponse]:
     listing = session.get("listing_data") or {}
     if not isinstance(listing, dict) or not listing:
-        return None
+        return MessageResponse(
+            success=True,
+            text=(
+                "Açıklama/başlık iyileştirmesi yapabilmem için önce temel ilan bilgilerini alalım.\n"
+                "Örn: `başlık: Citroen C3 2017`, `fiyat: 650000`, `lokasyon: İstanbul`"
+            ),
+            metadata={"intent": "CREATE", "enrichment_action": action, "missing": FSMEngine.REQUIRED_FIELDS.copy()},
+        )
 
     title = str(listing.get("title") or "").strip()
     description = str(listing.get("description") or "").strip()
@@ -2280,6 +2458,18 @@ class MediaAnalyzeResponse(BaseModel):
     data: Optional[Dict[str, Any]] = None
 
 
+class MediaPrecheckRequest(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    media_data_url: str = Field(..., description="data:image/...;base64,... payload")
+
+
+class MediaPrecheckResponse(BaseModel):
+    success: bool = True
+    safe: bool = True
+    message: str = ""
+    flagged_categories: List[str] = Field(default_factory=list)
+
+
 @router.post("/webchat/media/analyze", response_model=MediaAnalyzeResponse)
 async def analyze_media(
     request: MediaAnalyzeRequest,
@@ -2431,3 +2621,60 @@ async def analyze_media(
             success=False,
             message=f"Görsel analiz hatası: {str(e)}",
         )
+
+
+@router.post("/webchat/media/precheck", response_model=MediaPrecheckResponse)
+async def precheck_media_before_upload(
+    request: MediaPrecheckRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+) -> MediaPrecheckResponse:
+    """Run moderation on image bytes/data-url before storage upload."""
+    is_valid, verified_user_id, auth_error = await get_user_id_from_request(
+        authorization=authorization,
+        request_user_id=request.user_id,
+        channel="webchat"
+    )
+    if not is_valid:
+        return MediaPrecheckResponse(
+            success=False,
+            safe=False,
+            message=f"🔐 Kimlik doğrulama hatası: {auth_error}",
+            flagged_categories=["auth_error"],
+        )
+
+    media_data_url = (request.media_data_url or "").strip()
+    if not media_data_url.startswith("data:image/"):
+        return MediaPrecheckResponse(
+            success=False,
+            safe=False,
+            message="Geçersiz görsel formatı. Lütfen tekrar deneyin.",
+            flagged_categories=["invalid_media_data"],
+        )
+
+    safety = await vision_service.check_safety(media_data_url)
+    if not safety.get("safe", False):
+        flagged = safety.get("flagged_categories", []) or []
+        return MediaPrecheckResponse(
+            success=True,
+            safe=False,
+            message="🚫 Bu görsel içerik politikaları nedeniyle yüklenemez.",
+            flagged_categories=[str(c) for c in flagged],
+        )
+
+    analysis = await vision_service.analyze_product(media_data_url)
+    prohibited_term = vision_service.detect_prohibited_product(analysis if isinstance(analysis, dict) else {})
+    if prohibited_term:
+        return MediaPrecheckResponse(
+            success=True,
+            safe=False,
+            message="🚫 Bu görselde platformda yayınlanmasına izin verilmeyen bir ürün tespit edildi.",
+            flagged_categories=["illicit_item", prohibited_term],
+        )
+
+    logger.info(f"Webchat media precheck passed for user={verified_user_id}")
+    return MediaPrecheckResponse(
+        success=True,
+        safe=True,
+        message="Görsel güvenlik kontrolünden geçti.",
+        flagged_categories=[],
+    )

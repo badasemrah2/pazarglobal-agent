@@ -81,12 +81,12 @@ LISTING_SCHEMA = {
         "required": False,
         "default": "2. El"
     },
-    "location": {"type": "string", "max_length": 100, "required": False},
+    "location": {"type": "string", "max_length": 100, "required": True},
     "images": {"type": "array", "required": False},  # FSM zorunlu tutmaz
 }
 
 # Category FSM tarafından otomatik belirlenir - LLM sorumlu değil!
-REQUIRED_FIELDS = ["title", "price", "description"]
+REQUIRED_FIELDS = ["title", "price", "description", "location"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -391,7 +391,7 @@ Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir
   "category": "Sistem (FSM otomatik belirler - SEN TAHMİN YAPMA!)",
   "price": "number, 1-100000000 arası TL, ZORUNLU",
   "condition": "Sıfır|Az Kullanılmış|2. El, default: 2. El",
-  "location": "string, şehir, opsiyonel",
+    "location": "string, şehir, ZORUNLU",
   "images": "array of URLs, opsiyonel (FSM resim zorunlu tutmaz)"
 }
 ```
