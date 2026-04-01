@@ -16,7 +16,9 @@ logger = get_logger(__name__)
 
 
 PROHIBITED_PRODUCT_TERMS = {
-    "silah", "tabanca", "tufek", "tüfek", "pistol", "gun", "firearm", "revolver", "shotgun",
+    # Do not include plain English "gun" here.
+    # Turkish "gün" normalizes to "gun" and caused false-positive policy blocks.
+    "silah", "tabanca", "tufek", "tüfek", "pistol", "firearm", "revolver", "shotgun",
     "mermi", "cephane", "bomba", "patlayici", "patlayıcı", "explosive", "uyusturucu", "uyuşturucu",
     "kokain", "eroin", "esrar", "meth", "amfetamin", "cocaine", "heroin",
 }

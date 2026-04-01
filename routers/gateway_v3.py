@@ -146,7 +146,9 @@ def _filter_valid_images(images: Optional[List[Any]]) -> List[str]:
 
 
 PROHIBITED_LISTING_TERMS = {
-    "silah", "tabanca", "tufek", "tüfek", "pistol", "gun", "firearm", "revolver", "shotgun",
+    # Do not include plain English "gun" here.
+    # Turkish "gün" normalizes to "gun" and caused false-positive publish blocks.
+    "silah", "tabanca", "tufek", "tüfek", "pistol", "firearm", "revolver", "shotgun",
     "mermi", "cephane", "bomba", "patlayici", "patlayıcı", "explosive", "uyusturucu", "uyuşturucu",
     "kokain", "eroin", "esrar", "meth", "amfetamin", "cocaine", "heroin",
 }
@@ -293,13 +295,19 @@ def _detect_enrichment_action(message: str) -> Optional[str]:
 
     verbs = [
         "iyilestir", "duzelt", "gelistir", "guzellestir", "guncelle", "oner", "onerir misin", "yazar misin",
+        "yaz", "yeniden yaz", "kisalt", "uzat", "parlat", "sadelestir",
+    ]
+    refinement_hints = [
+        "daha iyi", "daha guzel", "guzel", "profesyonel", "yeniden",
+        "kisalt", "uzat", "parlat", "akici", "detayli", "kisa", "sade",
     ]
     has_verb = any(v in msg for v in verbs)
-    if not has_verb:
+    has_refinement_hint = any(h in msg for h in refinement_hints)
+    if not (has_verb or has_refinement_hint):
         return None
 
-    title_terms = ["baslik", "title", "ilan basligi"]
-    desc_terms = ["aciklama", "description", "metin", "ilan metni", "ilan aciklamasi"]
+    title_terms = ["baslik", "baslig", "title", "ilan baslig"]
+    desc_terms = ["aciklama", "aciklam", "description", "metin", "metn", "ilan metni", "ilan aciklam"]
 
     has_title = any(t in msg for t in title_terms)
     has_desc = any(t in msg for t in desc_terms)
@@ -822,21 +830,73 @@ FSM_COMMANDS = {
 # FSM Edit commands (deterministic, LLM bypassed)
 EDIT_FIELD_MAP = {
     "başlık": "title",
+    "başlığı": "title",
+    "başlığını": "title",
     "baslik": "title",
+    "basligi": "title",
+    "basligini": "title",
     "title": "title",
     "açıklama": "description",
+    "açıklamayı": "description",
+    "açıklamasını": "description",
     "aciklama": "description",
+    "aciklamayi": "description",
+    "aciklamasini": "description",
     "description": "description",
     "fiyat": "price",
+    "fiyatı": "price",
+    "fiyatini": "price",
+    "fiyati": "price",
     "price": "price",
     "durum": "condition",
+    "durumu": "condition",
     "condition": "condition",
     "lokasyon": "location",
+    "lokasyonu": "location",
     "konum": "location",
+    "konumu": "location",
     "location": "location",
     "kategori": "category",
+    "kategoriyi": "category",
     "category": "category",
 }
+
+_EDIT_FIELD_PATTERN = "|".join(
+    sorted((re.escape(key) for key in EDIT_FIELD_MAP), key=len, reverse=True)
+)
+
+_EDIT_TRAILING_DIRECTIVE_PATTERNS = [
+    r"\s+(?:olarak\s+)?(?:değiştir|degistir|güncelle|guncelle|ayarla|belirle|olsun)\s*$",
+    r"\s+yap\s*$",
+]
+
+_ENRICHMENT_ONLY_VALUE_HINTS = [
+    "daha iyi", "daha guzel", "guzel", "profesyonel", "yeniden",
+    "kisalt", "uzat", "parlat", "sade", "akici", "detayli",
+    "duzelt", "iyilestir", "gelistir",
+]
+
+
+def _strip_trailing_edit_directives(value: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+
+    for pattern in _EDIT_TRAILING_DIRECTIVE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+    return cleaned.strip().strip("`'\"")
+
+
+def _looks_like_enrichment_only_value(field: str, value: str) -> bool:
+    if field not in {"title", "description"}:
+        return False
+
+    normalized = _normalize_intent_text(value)
+    if not normalized:
+        return True
+
+    return len(normalized.split()) <= 6 and any(hint in normalized for hint in _ENRICHMENT_ONLY_VALUE_HINTS)
 
 CONDITION_ALIASES = {
     "sıfır": "Sıfır",
@@ -884,6 +944,7 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
     for part in parts:
         key = ""
         value = ""
+        used_compact_pattern = False
 
         if ":" in part:
             raw_key, raw_value = part.split(":", 1)
@@ -891,16 +952,20 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
             value = (raw_value or "").strip()
         else:
             # Support compact edits like "konum kadikoy" or "fiyat 12500"
-            compact = re.match(r"^\s*(başlık|baslik|title|açıklama|aciklama|description|fiyat|price|durum|condition|lokasyon|konum|location|kategori|category)\s+(.+?)\s*$", part, flags=re.IGNORECASE)
+            compact = re.match(rf"^\s*(?P<field>{_EDIT_FIELD_PATTERN})\s+(?P<value>.+?)\s*$", part, flags=re.IGNORECASE)
             if compact:
-                key = compact.group(1).strip().lower()
-                value = compact.group(2).strip()
+                key = compact.group("field").strip().lower()
+                value = _strip_trailing_edit_directives(compact.group("value"))
+                used_compact_pattern = True
 
         if not value:
             continue
 
         field = EDIT_FIELD_MAP.get(key)
         if not field:
+            continue
+
+        if used_compact_pattern and _looks_like_enrichment_only_value(field, value):
             continue
 
         if field == "price":
@@ -962,13 +1027,15 @@ def _should_try_direct_edit(message: str) -> bool:
         return False
 
     lower = message.lower().strip()
-    if ":" in lower:
+    # Keep price-research requests away from deterministic field parser.
+    if re.search(r"fiyat\s*(araştır|arastir|öğren|ogren)|kaç\s*para|piyasa\s*değeri|fiyat[ıi]\s*ne\s*kadar", lower, flags=re.IGNORECASE):
+        return False
+
+    updates, errors = _parse_edit_updates(message)
+    if updates or errors:
         return True
 
-    if re.match(r"^\s*(başlık|baslik|title|açıklama|aciklama|description|fiyat|price|durum|condition|lokasyon|konum|location|kategori|category)\b", lower, flags=re.IGNORECASE):
-        # Keep price-research requests away from deterministic field parser.
-        if re.search(r"fiyat\s*(araştır|arastir|öğren|ogren)|kaç\s*para|piyasa\s*değeri|fiyat[ıi]\s*ne\s*kadar", lower, flags=re.IGNORECASE):
-            return False
+    if ":" in lower:
         return True
 
     return False
