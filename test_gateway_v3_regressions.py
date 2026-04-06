@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from routers.gateway_v3 import (  # noqa: E402
+    _apply_drafting_edit_request,
     _detect_enrichment_action,
     _detect_prohibited_listing_term,
     _format_search_continuation_page,
@@ -36,6 +37,49 @@ def test_title_refinement_phrase_stays_out_of_direct_edit_path():
     assert updates == {}
     assert errors == []
     assert _should_try_direct_edit("başlığı daha güzel yap") is False
+
+
+def test_parse_condition_edit_accepts_compact_second_hand_alias():
+    updates, errors = _parse_edit_updates("durum: 2.el")
+
+    assert updates == {"condition": "2. El"}
+    assert errors == []
+    assert _should_try_direct_edit("durum: 2.el") is True
+
+
+async def test_apply_drafting_edit_request_accepts_multi_line_bundle_with_second_hand_alias(monkeypatch):
+    async def fake_save_session(*_: object, **__: object):
+        return None
+
+    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
+
+    session = {
+        "listing_data": {
+            "title": "Citroen c3 benzinli otomatik 2020",
+            "price": 1150000,
+            "category": "Otomotiv",
+        },
+        "state": "DRAFTING",
+        "fsm_state": "DRAFTING",
+    }
+
+    response = await _apply_drafting_edit_request(
+        "user-1",
+        "webchat",
+        session,
+        (
+            "Açıklama: Citroen c3 benzinli otomatik 2020 model hatasız boyasız tramer yok.\n"
+            "Durum: 2.el\n"
+            "Konum: Ankara"
+        ),
+    )
+
+    assert response is not None
+    assert response.success is True
+    assert response.metadata["ready_for_publish"] is True
+    assert response.listing_preview is not None
+    assert response.listing_preview["condition"] == "2. El"
+    assert response.listing_preview["location"] == "Ankara"
 
 
 def test_detect_enrichment_action_handles_inflected_title_and_description():

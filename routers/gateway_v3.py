@@ -32,7 +32,7 @@ from services.supabase_client import supabase_client
 from services.example_listings import prefix_example_listing_title
 from agents.vision_safety_gate import vision_safety_gate
 from services.vision_service import vision_service
-from services.text_normalization import normalize_for_match
+from services.text_normalization import canonicalize_condition, normalize_for_match
 from services.logger import get_logger
 
 logger = get_logger(__name__)
@@ -906,6 +906,7 @@ CONDITION_ALIASES = {
     "az kullanilmis": "Az Kullanılmış",
     "az kullanilmis": "Az Kullanılmış",
     "2. el": "2. El",
+    "2.el": "2. El",
     "2 el": "2. El",
     "2el": "2. El",
     "ikinci el": "2. El",
@@ -923,13 +924,23 @@ def _parse_price_value(raw_value: str) -> Optional[int]:
 
 
 def _parse_condition_value(raw_value: str) -> Optional[str]:
-    normalized = (raw_value or "").strip().lower()
+    raw = (raw_value or "").strip()
+    if not raw:
+        return None
+
+    canonical = canonicalize_condition(raw)
+    if canonical:
+        return canonical
+
+    normalized = normalize_for_match(raw)
     if normalized in CONDITION_ALIASES:
         return CONDITION_ALIASES[normalized]
+
     # Allow exact matches if user already typed a valid condition
     for allowed in FSMEngine.ALLOWED_CONDITIONS:
-        if normalized == allowed.lower():
+        if normalized == normalize_for_match(allowed):
             return allowed
+
     return None
 
 
