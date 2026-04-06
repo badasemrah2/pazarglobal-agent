@@ -1580,7 +1580,7 @@ async def handle_message(
         if any(kw in lower_msg for kw in preview_keywords) and session.get("listing_data"):
             current_listing = session.get("listing_data", {})
             if current_listing.get("title"):  # At least title exists
-                preview = _format_preview(current_listing)
+                preview = _format_preview(current_listing, show_full_description=True)
                 return MessageResponse(
                     success=True,
                     text=f"{preview}\n\nİlanı yayınlamak için 'yayınla' yazabilirsiniz.",
@@ -2066,7 +2066,7 @@ async def _handle_enrichment_action(
     session["draft_updated_at"] = datetime.utcnow().isoformat()
     await save_session(user_id, channel, session)
 
-    text = f"{ack}\n\n{_format_preview(listing)}"
+    text = f"{ack}\n\n{_format_preview(listing, show_full_description=(action != 'suggest_title'))}"
     return MessageResponse(
         success=True,
         text=text,
@@ -2153,7 +2153,7 @@ def _detect_price_query(message: str) -> Optional[str]:
     return None
 
 
-def _format_preview(listing: Dict[str, Any]) -> str:
+def _format_preview(listing: Dict[str, Any], show_full_description: bool = False) -> str:
     """Format current draft as preview text."""
     lines = ["📋 İlan Önizleme:"]
 
@@ -2187,7 +2187,11 @@ def _format_preview(listing: Dict[str, Any]) -> str:
         lines.append("⏳ Kategori: (eksik)")
     
     if description:
-        lines.append(f"✅ Açıklama: {description[:100]}{'...' if len(description) > 100 else ''}")
+        if show_full_description:
+            lines.append("✅ Açıklama:")
+            lines.append(description)
+        else:
+            lines.append(f"✅ Açıklama: {description[:100]}{'...' if len(description) > 100 else ''}")
     else:
         lines.append("⏳ Açıklama: (opsiyonel)")
     
