@@ -1719,11 +1719,13 @@ class SupabaseClient:
             if status in blocked_statuses:
                 return None
 
+            now_iso = datetime.now(timezone.utc).isoformat()
             existing = (
                 self.client.table("contact_tokens")
                 .select("id,token,listing_id,owner_user_id,expires_at,revoked")
                 .eq("listing_id", listing_id)
                 .eq("revoked", False)
+                .gte("expires_at", now_iso)
                 .order("created_at", desc=True)
                 .limit(1)
                 .execute()
@@ -1732,9 +1734,9 @@ class SupabaseClient:
             if existing_row:
                 return existing_row
 
-            expires_at = listing.get("expires_at")
-            if not expires_at:
-                expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+            # Always issue a fresh 30-day token; never use listing.expires_at which
+            # may be in the past, which would produce an already-expired token.
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
             token = secrets.token_urlsafe(24)
             created = (
