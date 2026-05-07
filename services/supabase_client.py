@@ -1720,6 +1720,10 @@ class SupabaseClient:
                 return None
 
             now_iso = datetime.now(timezone.utc).isoformat()
+            self.client.table("contact_tokens").update({
+                "revoked": True,
+            }).eq("listing_id", listing_id).eq("revoked", False).lt("expires_at", now_iso).execute()
+
             existing = (
                 self.client.table("contact_tokens")
                 .select("id,token,listing_id,owner_user_id,expires_at,revoked")
