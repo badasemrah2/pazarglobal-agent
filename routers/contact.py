@@ -82,6 +82,7 @@ async def resolve_contact_link(token: str):
                 "title": listing.get("title"),
                 "status": listing.get("status"),
                 "expires_at": listing.get("expires_at"),
+                "owner_user_id": listing.get("user_id"),
                 "owner_name": owner_name,
                 "owner_phone": owner_phone,
                 "phone_visibility": phone_visibility,
@@ -106,13 +107,17 @@ async def send_message_via_contact_link(payload: ContactSendRequest):
     if not listing_id or not owner_user_id:
         raise HTTPException(status_code=500, detail="contact_resolution_failed")
 
+    sender_user_id = (payload.sender_user_id or "").strip() or None
+    if sender_user_id and sender_user_id == owner_user_id:
+        raise HTTPException(status_code=400, detail="self_contact_not_allowed")
+
     sender_name = (payload.sender_name or "").strip() or "İsimsiz Alıcı"
 
     conv = await supabase_client.find_or_create_conversation(
         listing_id=listing_id,
         owner_user_id=owner_user_id,
         contact_token_id=str(token_row.get("id") or "") or None,
-        sender_user_id=(payload.sender_user_id or "").strip() or None,
+        sender_user_id=sender_user_id,
         sender_session_id=(payload.sender_session_id or "").strip() or None,
         sender_name=sender_name,
         source_channel=(payload.channel or "web").strip().lower(),
