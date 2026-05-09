@@ -326,6 +326,256 @@ def _detect_enrichment_action(message: str) -> Optional[str]:
     return None
 
 
+_DESCRIPTION_PRICE_PATTERN = re.compile(
+    r"\b(?:fiyat[ıi]?\s*[:=-]?\s*)?\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d+)?\s*(?:tl|₺|lira)\b",
+    flags=re.IGNORECASE,
+)
+_DESCRIPTION_PRICE_WORD_PATTERN = re.compile(r"\bfiyat[ıi]?\b", flags=re.IGNORECASE)
+_DESCRIPTION_DAMAGE_PATTERN = re.compile(r"\bhasarl[ıi]\b", flags=re.IGNORECASE)
+_DESCRIPTION_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
+_DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS: Dict[str, re.Pattern] = {
+    "kutu": re.compile(r"\bkutu(?:lu|suz)?\b", flags=re.IGNORECASE),
+    "sertifika": re.compile(r"\bsertifika(?:l[ıi]|s[ıi]z)?\b", flags=re.IGNORECASE),
+    "sinirli": re.compile(r"\bs[ıi]n[ıi]rl[ıi](?:\s+[üu]retim)?\b", flags=re.IGNORECASE),
+}
+_DESCRIPTION_CONFIRMABLE_CLAIM_LABELS = {
+    "kutu": "kutu",
+    "sertifika": "sertifika",
+    "sinirli": "sınırlı",
+}
+_SESSION_DESCRIPTION_CLAIMS_KEY = "description_confirmed_claims"
+_DESCRIPTION_REMOVAL_PATTERNS = [
+    re.compile(
+        r"(?:açıklamadan|aciklamadan|metinden|ilan metninden)\s+[\"'“”]?(?P<phrase>.+?)[\"'“”]?\s+(?:ifadesini|kelimesini|bilgisini)?\s*(?:sil|kaldır|kaldir|çıkar|cikar)(?:\s+gitsin)?\s*$",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"[\"'“”]?(?P<phrase>.+?)[\"'“”]?\s+(?:ifadesini|kelimesini|bilgisini)\s+(?:açıklamadan|aciklamadan|metinden)\s+(?:sil|kaldır|kaldir|çıkar|cikar)\s*$",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:açıklamadaki|aciklamadaki|metindeki)\s+[\"'“”]?(?P<phrase>.+?)[\"'“”]?\s+(?:ifadesini|kelimesini|bilgisini)?\s*(?:sil|kaldır|kaldir|çıkar|cikar)\s*$",
+        flags=re.IGNORECASE,
+    ),
+]
+
+
+def _extract_confirmed_description_claims(text: str) -> set[str]:
+    claims: set[str] = set()
+    if not text:
+        return claims
+
+    normalized = normalize_for_match(text)
+    if re.search(r"\bkutu(?:lu|suz)?\b", normalized, flags=re.IGNORECASE):
+        claims.add("kutu")
+    if re.search(r"\bsertifika(?:li|siz)?\b", normalized, flags=re.IGNORECASE):
+        claims.add("sertifika")
+    if re.search(r"\bsinirli(?:\s+uretim)?\b", normalized, flags=re.IGNORECASE):
+        claims.add("sinirli")
+
+    for year in _DESCRIPTION_YEAR_PATTERN.findall(text):
+        claims.add(f"year:{year}")
+
+    return claims
+
+
+def _get_session_description_claims(session: Dict[str, Any]) -> set[str]:
+    raw_claims = session.get(_SESSION_DESCRIPTION_CLAIMS_KEY) or []
+    if not isinstance(raw_claims, list):
+        return set()
+    return {str(claim).strip() for claim in raw_claims if str(claim).strip()}
+
+
+def _remember_description_claims(session: Dict[str, Any], *texts: str) -> set[str]:
+    claims = _get_session_description_claims(session)
+    for text in texts:
+        claims.update(_extract_confirmed_description_claims(text))
+    if claims:
+        session[_SESSION_DESCRIPTION_CLAIMS_KEY] = sorted(claims)
+    return claims
+
+
+def _remove_description_claims(session: Dict[str, Any], *texts: str) -> None:
+    claims = _get_session_description_claims(session)
+    if not claims:
+        return
+
+    to_remove: set[str] = set()
+    for text in texts:
+        to_remove.update(_extract_confirmed_description_claims(text))
+
+    claims.difference_update(to_remove)
+    if claims:
+        session[_SESSION_DESCRIPTION_CLAIMS_KEY] = sorted(claims)
+    else:
+        session.pop(_SESSION_DESCRIPTION_CLAIMS_KEY, None)
+
+
+def _collect_confirmed_description_claims(
+    session: Dict[str, Any],
+    listing: Optional[Dict[str, Any]] = None,
+    message: str = "",
+) -> set[str]:
+    claims = _get_session_description_claims(session)
+    if listing and isinstance(listing, dict):
+        claims.update(_extract_confirmed_description_claims(str(listing.get("title") or "")))
+    if message:
+        claims.update(_extract_confirmed_description_claims(message))
+    return claims
+
+
+def _cleanup_description_text(text: str) -> str:
+    if not text:
+        return ""
+
+    cleaned_lines: List[str] = []
+    for raw_line in str(text).splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        line = re.sub(r"\s+([,.;:!?])", r"\1", line)
+        line = re.sub(r"([,.;:!?])(?:\s*[,.!?:;])+", r"\1", line)
+        line = re.sub(r",\s*,+", ", ", line)
+        line = line.strip(" ,;:-")
+        if line:
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def _collect_description_validation_errors(
+    listing: Dict[str, Any],
+    confirmed_claims: Optional[set[str]] = None,
+) -> List[str]:
+    description = str(listing.get("description") or "").strip()
+    if not description:
+        return []
+
+    claims = confirmed_claims or set()
+    errors: List[str] = []
+    normalized = normalize_for_match(description)
+
+    if _DESCRIPTION_PRICE_PATTERN.search(description) or _DESCRIPTION_PRICE_WORD_PATTERN.search(description):
+        errors.append("Açıklamada fiyat yazılamaz.")
+
+    if re.search(r"\bhasarli\b", normalized, flags=re.IGNORECASE):
+        errors.append("Açıklamada hasarlı bilgisi kullanılamaz; durum alanı bunu doğrulamıyor.")
+
+    for claim_key, label in _DESCRIPTION_CONFIRMABLE_CLAIM_LABELS.items():
+        if claim_key in claims:
+            continue
+        if _DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS[claim_key].search(description):
+            errors.append(f"Doğrulanmamış bilgi: {label}")
+
+    for year in sorted(set(_DESCRIPTION_YEAR_PATTERN.findall(description))):
+        if f"year:{year}" not in claims:
+            errors.append(f"Doğrulanmamış bilgi: {year}")
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for error in errors:
+        if error not in seen:
+            seen.add(error)
+            deduped.append(error)
+    return deduped
+
+
+def _sanitize_ai_generated_description(
+    description: str,
+    confirmed_claims: Optional[set[str]] = None,
+) -> tuple[str, List[str]]:
+    cleaned = str(description or "")
+    claims = confirmed_claims or set()
+    removed: List[str] = []
+
+    for pattern in (_DESCRIPTION_PRICE_PATTERN, _DESCRIPTION_PRICE_WORD_PATTERN):
+        cleaned, count = pattern.subn(" ", cleaned)
+        if count:
+            removed.append("price")
+
+    cleaned, count = _DESCRIPTION_DAMAGE_PATTERN.subn(" ", cleaned)
+    if count:
+        removed.append("hasarli")
+
+    for claim_key, pattern in _DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS.items():
+        if claim_key in claims:
+            continue
+        cleaned, count = pattern.subn(" ", cleaned)
+        if count:
+            removed.append(claim_key)
+
+    for year in sorted(set(_DESCRIPTION_YEAR_PATTERN.findall(cleaned))):
+        if f"year:{year}" in claims:
+            continue
+        cleaned, count = re.subn(rf"\b{re.escape(year)}\b", " ", cleaned)
+        if count:
+            removed.append(f"year:{year}")
+
+    return _cleanup_description_text(cleaned), removed
+
+
+def _apply_ai_description_guard(
+    listing: Dict[str, Any],
+    previous_listing: Optional[Dict[str, Any]],
+    confirmed_claims: Optional[set[str]] = None,
+) -> List[str]:
+    description = str(listing.get("description") or "").strip()
+    if not description:
+        return []
+
+    cleaned_description, removed_tokens = _sanitize_ai_generated_description(description, confirmed_claims)
+    if cleaned_description:
+        listing["description"] = cleaned_description[:2000]
+    else:
+        previous_description = str((previous_listing or {}).get("description") or "").strip()
+        listing["description"] = previous_description[:2000] if previous_description else ""
+
+    errors = _collect_description_validation_errors(listing, confirmed_claims)
+    if errors:
+        previous_description = str((previous_listing or {}).get("description") or "").strip()
+        if previous_description:
+            fallback = dict(listing)
+            fallback["description"] = previous_description
+            if not _collect_description_validation_errors(fallback, confirmed_claims):
+                listing["description"] = previous_description[:2000]
+                errors = []
+
+    if removed_tokens:
+        logger.info(f"Description guard removed generated claims: {sorted(set(removed_tokens))}")
+
+    return errors
+
+
+def _extract_description_removal_phrase(message: str) -> Optional[str]:
+    if not message:
+        return None
+
+    for pattern in _DESCRIPTION_REMOVAL_PATTERNS:
+        match = pattern.search(message.strip())
+        if not match:
+            continue
+        phrase = str(match.group("phrase") or "").strip().strip("`'\"“”")
+        if phrase:
+            return phrase
+    return None
+
+
+def _classify_draft_message_intent(message: str) -> Optional[str]:
+    if not message:
+        return None
+
+    from core.brain import Guardrails
+
+    if Guardrails.detect_confirmation(message):
+        return "publish"
+
+    if _extract_description_removal_phrase(message):
+        return "remove_description_text"
+
+    if _should_try_direct_edit(message):
+        return "field_update"
+
+    return _detect_enrichment_action(message)
+
+
 async def _format_search_continuation_page(listings: List[Dict[str, Any]], start_idx: int, page_size: int = 5) -> str:
     total = len(listings or [])
     if total == 0 or start_idx >= total:
@@ -397,7 +647,7 @@ class FSMEngine:
     ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "2. El"}
     
     @classmethod
-    def validate(cls, listing_data: Dict[str, Any]) -> tuple[bool, List[str]]:
+    def validate(cls, listing_data: Dict[str, Any], confirmed_claims: Optional[set[str]] = None) -> tuple[bool, List[str]]:
         """
         JSON validasyon - FSM'in beklediği formata uygun mu?
         
@@ -426,6 +676,8 @@ class FSMEngine:
         # Description - minimum 10 karakter (zorunlu alan)
         description = listing_data.get("description", "")
         if not description or len(str(description).strip()) < 10:
+            missing.append("description")
+        elif _collect_description_validation_errors(listing_data, confirmed_claims):
             missing.append("description")
 
         # Price
@@ -658,7 +910,12 @@ class FSMEngine:
             return False
     
     @classmethod
-    async def publish(cls, user_id: str, listing_data: Dict[str, Any]) -> tuple[bool, str, Optional[str]]:
+    async def publish(
+        cls,
+        user_id: str,
+        listing_data: Dict[str, Any],
+        confirmed_claims: Optional[set[str]] = None,
+    ) -> tuple[bool, str, Optional[str]]:
         """
         İlan yayınla
         
@@ -671,8 +928,11 @@ class FSMEngine:
                 return False, "Kullanıcı profili oluşturulamadı. Lütfen tekrar deneyin.", None
             
             # 1. Validate
-            is_valid, missing = cls.validate(listing_data)
+            is_valid, missing = cls.validate(listing_data, confirmed_claims)
             if not is_valid:
+                description_errors = _collect_description_validation_errors(listing_data, confirmed_claims)
+                if description_errors:
+                    return False, " | ".join(description_errors), None
                 return False, f"Eksik alanlar: {', '.join(missing)}", None
 
             prohibited_term = _detect_prohibited_listing_term(listing_data)
@@ -871,6 +1131,13 @@ _EDIT_TRAILING_DIRECTIVE_PATTERNS = [
     r"\s+yap\s*$",
 ]
 
+_EDIT_LEADING_CONTEXT_PATTERNS = [
+    re.compile(
+        r"^\s*(?:lütfen\s+)?(?:(?:açıklamayı|aciklamayi|açıklama|aciklama|ilanı|ilani|metni|ilan metnini)\s+(?:düzelt|duzelt|güncelle|guncelle|değiştir|degistir|yenile)\s+)+",
+        flags=re.IGNORECASE,
+    ),
+]
+
 _ENRICHMENT_ONLY_VALUE_HINTS = [
     "daha iyi", "daha guzel", "guzel", "profesyonel", "yeniden",
     "kisalt", "uzat", "parlat", "sade", "akici", "detayli",
@@ -887,6 +1154,13 @@ def _strip_trailing_edit_directives(value: str) -> str:
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
 
     return cleaned.strip().strip("`'\"")
+
+
+def _strip_leading_edit_context(part: str) -> str:
+    cleaned = (part or "").strip()
+    for pattern in _EDIT_LEADING_CONTEXT_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned.strip(" ,")
 
 
 def _looks_like_enrichment_only_value(field: str, value: str) -> bool:
@@ -954,6 +1228,7 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
     # Split by lines or semicolons for multi-field edits
     parts = re.split(r"[\n;]+", message)
     for part in parts:
+        part = _strip_leading_edit_context(part)
         key = ""
         value = ""
         used_compact_pattern = False
@@ -1077,14 +1352,31 @@ async def _apply_drafting_edit_request(user_id: str, channel: str, session: Dict
     if not isinstance(listing, dict):
         listing = {}
 
+    previous_listing = dict(listing)
+
     listing.update(updates)
-    is_valid, missing = FSMEngine.validate(listing)
+    confirmed_claims = _collect_confirmed_description_claims(session, listing, message)
+    if "description" in updates:
+        listing["description"] = _cleanup_description_text(str(listing.get("description") or ""))[:2000]
+        description_errors = _collect_description_validation_errors(listing, confirmed_claims)
+        if description_errors:
+            listing["description"] = previous_listing.get("description", "")
+            return MessageResponse(
+                success=False,
+                text="❌ Açıklama güncellenemedi.\n\n" + "\n".join(f"- {error}" for error in description_errors),
+                metadata={"error": "invalid_description", "description_errors": description_errors},
+            )
+
+    is_valid, missing = FSMEngine.validate(listing, confirmed_claims)
+    description_errors = _collect_description_validation_errors(listing, confirmed_claims)
 
     session["listing_data"] = listing
     session["state"] = "READY" if is_valid else "DRAFTING"
     session["fsm_state"] = FSM_STATE_DRAFTING
     session["last_intent"] = "CREATE"
     session["draft_updated_at"] = datetime.utcnow().isoformat()
+    if "description" in updates:
+        _remember_description_claims(session, message, str(listing.get("description") or ""))
     await save_session(user_id, channel, session)
 
     text = f"✅ İlan bilgilerini güncelledim.\n\n{_format_preview(listing)}"
@@ -1092,6 +1384,8 @@ async def _apply_drafting_edit_request(user_id: str, channel: str, session: Dict
         text += f"\n\nEksik zorunlu alanlar: {', '.join(missing)}"
     else:
         text += "\n\nİlan hazır görünüyor. İsterseniz `yayınla` yazabilirsiniz."
+    if description_errors:
+        text += "\n\nAçıklama düzeltmeleri gerekli:\n" + "\n".join(f"- {error}" for error in description_errors)
 
     buttons = [
         ButtonResponse(text="✅ Yayınla", payload="yayınla") if is_valid else ButtonResponse(text="✏️ Devam Et", payload="devam"),
@@ -1108,6 +1402,7 @@ async def _apply_drafting_edit_request(user_id: str, channel: str, session: Dict
             "state": session["state"],
             "missing_fields": missing,
             "ready_for_publish": is_valid,
+            "description_errors": description_errors,
             "update_source": "deterministic_edit",
         },
     )
@@ -1118,7 +1413,31 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
     listing = session.get("listing_data", {})
     
     # FSM validate - kategori otomatik belirlensin!
-    FSMEngine.validate(listing)
+    confirmed_claims = _collect_confirmed_description_claims(session, listing)
+    is_valid, missing = FSMEngine.validate(listing, confirmed_claims)
+    description_errors = _collect_description_validation_errors(listing, confirmed_claims)
+
+    if not is_valid:
+        text = "⚠️ İlan henüz yayınlanamaz."
+        if missing:
+            text += f"\n\nEksik/geçersiz alanlar: {', '.join(missing)}"
+        if description_errors:
+            text += "\n\nAçıklama sorunları:\n" + "\n".join(f"- {error}" for error in description_errors)
+        text += f"\n\n{_format_preview(listing, show_full_description=True)}"
+        return MessageResponse(
+            success=True,
+            text=text,
+            buttons=[
+                ButtonResponse(text="✏️ Düzenle", payload="düzenlemek istiyorum"),
+                ButtonResponse(text="❌ İptal", payload="iptal"),
+            ],
+            metadata={
+                "intent": "CREATE",
+                "state": "DRAFTING",
+                "missing_fields": missing,
+                "description_errors": description_errors,
+            },
+        )
     
     # Get user balance - use sync client
     try:
@@ -1242,6 +1561,26 @@ async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, co
         # Direct publish - no LLM involved
         listing = session.get("listing_data", {})
         cost = session.get("pending_publish_cost", 55)
+        confirmed_claims = _collect_confirmed_description_claims(session, listing)
+        description_errors = _collect_description_validation_errors(listing, confirmed_claims)
+        is_valid, missing = FSMEngine.validate(listing, confirmed_claims)
+
+        if not is_valid:
+            text = "❌ İlan yayınlanamaz."
+            if missing:
+                text += f"\n\nEksik/geçersiz alanlar: {', '.join(missing)}"
+            if description_errors:
+                text += "\n\nAçıklama sorunları:\n" + "\n".join(f"- {error}" for error in description_errors)
+            return MessageResponse(
+                success=False,
+                text=text,
+                buttons=[ButtonResponse(text="✏️ Düzenle", payload="düzenlemek istiyorum")],
+                metadata={
+                    "error": "listing_not_publishable",
+                    "missing_fields": missing,
+                    "description_errors": description_errors,
+                },
+            )
         
         # Get FRESH balance from DB (not from session - may be stale)
         try:
@@ -1282,7 +1621,7 @@ async def _fsm_handle_confirmation(user_id: str, channel: str, session: Dict, co
             )
         
         # Publish
-        success, message, listing_id = await FSMEngine.publish(user_id, listing)
+        success, message, listing_id = await FSMEngine.publish(user_id, listing, confirmed_claims)
         
         if success:
             # Clear session
@@ -1366,11 +1705,92 @@ async def _fsm_handle_edit_request(user_id: str, channel: str, session: Dict, me
         )
 
     listing = session.get("listing_data", {})
+    if not isinstance(listing, dict):
+        listing = {}
+
+    previous_listing = dict(listing)
     listing.update(updates)
+
+    confirmed_claims = _collect_confirmed_description_claims(session, listing, message)
+    if "description" in updates:
+        listing["description"] = _cleanup_description_text(str(listing.get("description") or ""))[:2000]
+        description_errors = _collect_description_validation_errors(listing, confirmed_claims)
+        if description_errors:
+            listing["description"] = previous_listing.get("description", "")
+            return MessageResponse(
+                success=False,
+                text="❌ Açıklama güncellenemedi.\n\n" + "\n".join(f"- {error}" for error in description_errors),
+                metadata={"error": "invalid_description", "description_errors": description_errors},
+            )
+
     session["listing_data"] = listing
     session["draft_updated_at"] = datetime.utcnow().isoformat()
+    if "description" in updates:
+        _remember_description_claims(session, message, str(listing.get("description") or ""))
 
     return await _fsm_show_confirmation_preview(user_id, channel, session)
+
+
+async def _apply_description_removal_request(user_id: str, channel: str, session: Dict, message: str) -> Optional[MessageResponse]:
+    phrase = _extract_description_removal_phrase(message)
+    if not phrase:
+        return None
+
+    listing = session.get("listing_data", {})
+    if not isinstance(listing, dict):
+        listing = {}
+
+    description = str(listing.get("description") or "").strip()
+    if not description:
+        return MessageResponse(
+            success=True,
+            text="Açıklamada düzenlenecek bir metin yok.",
+            metadata={"intent": "CREATE", "edit_intent": "remove_description_text"},
+        )
+
+    updated_description, removed_count = re.subn(re.escape(phrase), " ", description, flags=re.IGNORECASE)
+    if removed_count == 0:
+        return MessageResponse(
+            success=True,
+            text=f"Açıklamada '{phrase}' ifadesini bulamadım.",
+            metadata={"intent": "CREATE", "edit_intent": "remove_description_text", "matched": False},
+        )
+
+    listing["description"] = _cleanup_description_text(updated_description)[:2000]
+    confirmed_claims = _collect_confirmed_description_claims(session, listing)
+    is_valid, missing = FSMEngine.validate(listing, confirmed_claims)
+    description_errors = _collect_description_validation_errors(listing, confirmed_claims)
+
+    session["listing_data"] = listing
+    session["state"] = "READY" if is_valid else "DRAFTING"
+    session["fsm_state"] = FSM_STATE_DRAFTING
+    session["last_intent"] = "CREATE"
+    session["draft_updated_at"] = datetime.utcnow().isoformat()
+    _remove_description_claims(session, phrase)
+    await save_session(user_id, channel, session)
+
+    text = f"✅ Açıklamadan '{phrase}' ifadesini kaldırdım.\n\n{_format_preview(listing, show_full_description=True)}"
+    if description_errors:
+        text += "\n\nAçıklama düzeltmeleri gerekli:\n" + "\n".join(f"- {error}" for error in description_errors)
+    elif missing:
+        text += f"\n\nEksik/geçersiz alanlar: {', '.join(missing)}"
+
+    return MessageResponse(
+        success=True,
+        text=text,
+        listing_preview=listing,
+        buttons=[
+            ButtonResponse(text="✅ Yayınla", payload="yayınla") if is_valid else ButtonResponse(text="✏️ Devam Et", payload="devam"),
+            ButtonResponse(text="❌ İptal", payload="iptal"),
+        ],
+        metadata={
+            "intent": "CREATE",
+            "edit_intent": "remove_description_text",
+            "missing_fields": missing,
+            "description_errors": description_errors,
+            "ready_for_publish": is_valid,
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1507,6 +1927,7 @@ async def handle_message(
         lower_msg = (request.message or "").lower().strip()
         normalized_cmd = re.sub(r"[^\wşğıöçü]+", " ", lower_msg, flags=re.UNICODE).strip()
         fsm_state = session.get("fsm_state", FSM_STATE_IDLE)
+        draft_message_intent = _classify_draft_message_intent(request.message or "")
         
         # DEBUG: Log FSM state for troubleshooting
         logger.info(f"FSM state check: fsm_state={fsm_state}, msg={lower_msg}")
@@ -1520,10 +1941,34 @@ async def handle_message(
                 logger.info(f"FSM: PENDING_CONFIRMATION state, command={fsm_command}, bypassing LLM")
                 return await _fsm_handle_confirmation(user_id, request.channel, session, fsm_command)
 
+            if draft_message_intent == "remove_description_text":
+                logger.info("FSM: PENDING_CONFIRMATION state, description removal detected, bypassing LLM")
+                removal_response = await _apply_description_removal_request(
+                    user_id,
+                    request.channel,
+                    session,
+                    request.message or "",
+                )
+                if removal_response is not None:
+                    return removal_response
+
             # Try deterministic field edit handling first (e.g. "konum: Kadikoy" / "konum Kadikoy")
-            if _should_try_direct_edit(request.message or ""):
+            if draft_message_intent == "field_update":
                 logger.info("FSM: PENDING_CONFIRMATION state, deterministic edit detected, bypassing LLM")
                 return await _fsm_handle_edit_request(user_id, request.channel, session, request.message or "")
+
+            if draft_message_intent in {"suggest_title", "improve_text", "suggest_description"}:
+                session["fsm_state"] = FSM_STATE_DRAFTING
+                await save_session(user_id, request.channel, session)
+                logger.info("FSM: PENDING_CONFIRMATION state, deterministic enrichment detected, bypassing LLM")
+                improved = await _handle_enrichment_action(
+                    user_id=user_id,
+                    channel=request.channel,
+                    session=session,
+                    action=draft_message_intent,
+                )
+                if improved is not None:
+                    return improved
 
             # Not a command or deterministic edit - allow free-form edits via LLM
             session["fsm_state"] = FSM_STATE_DRAFTING
@@ -1532,6 +1977,28 @@ async def handle_message(
         
         # 1.3 Drafting-stage deterministic edit updates (LLM bypass)
         if session.get("listing_data") and fsm_state in {FSM_STATE_DRAFTING, FSM_STATE_IDLE}:
+            if draft_message_intent == "remove_description_text":
+                deterministic_remove_response = await _apply_description_removal_request(
+                    user_id,
+                    request.channel,
+                    session,
+                    request.message or "",
+                )
+                if deterministic_remove_response is not None:
+                    logger.info("FSM: DRAFTING deterministic description removal handled before LLM")
+                    return deterministic_remove_response
+
+            if draft_message_intent in {"suggest_title", "improve_text", "suggest_description"}:
+                deterministic_enrichment = await _handle_enrichment_action(
+                    user_id=user_id,
+                    channel=request.channel,
+                    session=session,
+                    action=draft_message_intent,
+                )
+                if deterministic_enrichment is not None:
+                    logger.info("FSM: DRAFTING deterministic enrichment handled before LLM")
+                    return deterministic_enrichment
+
             deterministic_edit_response = await _apply_drafting_edit_request(
                 user_id,
                 request.channel,
@@ -1781,6 +2248,9 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     """
     # Merge new data with existing - preserve images from session!
     current = session.get("listing_data", {})
+    if not isinstance(current, dict):
+        current = {}
+    previous_listing = dict(current)
     
     # First preserve existing images
     existing_images = current.get("images", [])
@@ -1798,12 +2268,16 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
         fallback_images = _filter_valid_images(existing_images)
         if fallback_images:
             current["images"] = fallback_images
+
+    confirmed_claims = _collect_confirmed_description_claims(session, current, user_message)
+    description_errors = _apply_ai_description_guard(current, previous_listing, confirmed_claims)
+    _remember_description_claims(session, user_message)
     
     logger.info(f"CREATE: current listing data: {current}")
     logger.info(f"CREATE: user_confirmed={brain_output.user_confirmed}, ready_for_fsm={brain_output.ready_for_fsm}")
     
     # FSM validates
-    is_valid, missing = FSMEngine.validate(current)
+    is_valid, missing = FSMEngine.validate(current, confirmed_claims)
     
     # Update session
     session["listing_data"] = current
@@ -1837,6 +2311,8 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     # Channels like WhatsApp may not render `listing_preview`; include a compact preview in text.
     if channel != "webchat" and current.get("title") and "📋" not in response_text:
         response_text = f"{response_text}\n\n{_format_preview(current)}"
+    if description_errors:
+        response_text += "\n\nNot: Doğrulanmamış açıklama ifadeleri kaydedilmedi."
     
     # Check if user wants to publish - use direct confirmation detection on user message
     from core.brain import Guardrails
@@ -1867,6 +2343,7 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
                 "state": "DRAFTING",
                 "missing_fields": missing,
                 "ready_for_publish": False,
+                "description_errors": description_errors,
             },
         )
     
@@ -1893,6 +2370,7 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
             "state": session["state"],
             "missing_fields": missing,
             "ready_for_publish": is_valid,
+            "description_errors": description_errors,
             "suggestions": brain_output.suggestions,
         },
     )
@@ -2053,12 +2531,17 @@ async def _handle_enrichment_action(
     if action == "suggest_title":
         listing["title"] = result_text
         ack = "✅ Başlığı iyileştirdim."
+        description_errors: List[str] = []
     else:
+        previous_listing = dict(listing)
         listing["description"] = result_text
+        confirmed_claims = _collect_confirmed_description_claims(session, listing)
+        description_errors = _apply_ai_description_guard(listing, previous_listing, confirmed_claims)
         ack = "✅ Açıklamayı güncelledim."
 
     # Re-validate and update deterministic state in background.
-    is_valid, missing = FSMEngine.validate(listing)
+    confirmed_claims = _collect_confirmed_description_claims(session, listing)
+    is_valid, missing = FSMEngine.validate(listing, confirmed_claims)
     session["listing_data"] = listing
     session["state"] = "READY" if is_valid else "DRAFTING"
     session["fsm_state"] = FSM_STATE_DRAFTING
@@ -2067,6 +2550,8 @@ async def _handle_enrichment_action(
     await save_session(user_id, channel, session)
 
     text = f"{ack}\n\n{_format_preview(listing, show_full_description=(action != 'suggest_title'))}"
+    if description_errors:
+        text += "\n\nNot: Doğrulanmamış açıklama ifadeleri kaydedilmedi."
     return MessageResponse(
         success=True,
         text=text,
@@ -2081,6 +2566,7 @@ async def _handle_enrichment_action(
             "state": session["state"],
             "missing_fields": missing,
             "ready_for_publish": is_valid,
+            "description_errors": description_errors,
         },
     )
 

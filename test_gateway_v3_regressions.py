@@ -3,7 +3,10 @@ import os
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from routers.gateway_v3 import (  # noqa: E402
+    _apply_description_removal_request,
     _apply_drafting_edit_request,
+    _classify_draft_message_intent,
+    _collect_description_validation_errors,
     _detect_enrichment_action,
     _detect_prohibited_listing_term,
     _format_preview,
@@ -31,6 +34,14 @@ def test_parse_natural_location_edit_phrase():
     assert updates == {"location": "Kadıköy"}
     assert errors == []
     assert _should_try_direct_edit("lokasyonu Kadıköy olarak değiştir") is True
+
+
+def test_parse_edit_with_leading_context_prefix_routes_to_field_update():
+    updates, errors = _parse_edit_updates("Açıklamayı düzelt fiyatı 750 TL yap")
+
+    assert updates == {"price": 750}
+    assert errors == []
+    assert _classify_draft_message_intent("Açıklamayı düzelt fiyatı 750 TL yap") == "field_update"
 
 
 def test_title_refinement_phrase_stays_out_of_direct_edit_path():
@@ -88,6 +99,26 @@ def test_detect_enrichment_action_handles_inflected_title_and_description():
     assert _detect_enrichment_action("başlığı daha güzel yap") == "suggest_title"
     assert _detect_enrichment_action("başlığı yeniden yaz") == "suggest_title"
     assert _detect_enrichment_action("açıklamayı daha profesyonel yaz") == "improve_text"
+
+
+def test_classify_description_removal_intent():
+    assert _classify_draft_message_intent("açıklamadan hasarlı kelimesini sil") == "remove_description_text"
+
+
+def test_description_validator_flags_price_and_unconfirmed_claims():
+    errors = _collect_description_validation_errors(
+        {
+            "title": "iPhone 13",
+            "description": "Temiz cihaz. 500 TL. Kutulu, sertifikalı ve 2021 sınırlı üretim.",
+            "condition": "2. El",
+        },
+        confirmed_claims=set(),
+    )
+
+    assert "Açıklamada fiyat yazılamaz." in errors
+    assert "Doğrulanmamış bilgi: kutu" in errors
+    assert "Doğrulanmamış bilgi: sertifika" in errors
+    assert "Doğrulanmamış bilgi: 2021" in errors
 
 
 def test_format_preview_can_show_full_description_when_requested():
@@ -149,10 +180,78 @@ async def test_handle_enrichment_action_returns_full_improved_description(monkey
 
     assert response is not None
     assert response.success is True
-    assert improved_description in response.text
+    assert "Tüm periyodik bakımları düzenli olarak yapıldı." in response.text
     assert "Detaylar ve görüşme için lütfen mesaj atın." in response.text
     assert response.listing_preview is not None
-    assert response.listing_preview["description"] == improved_description
+    assert response.listing_preview["description"] == improved_description.replace("\n\n", "\n")
+
+
+async def test_handle_enrichment_action_strips_unconfirmed_claims(monkeypatch):
+    async def fake_edge_call(*_: object, **__: object):
+        return {
+            "success": True,
+            "result": "Temiz cihaz. Uzun süre sorunsuz kullanıldı. 500 TL. Kutulu. Sertifikalı. 2021 sınırlı üretim.",
+        }
+
+    async def fake_save_session(*_: object, **__: object):
+        return None
+
+    monkeypatch.setattr("routers.gateway_v3.supabase_client._call_edge_function", fake_edge_call)
+    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
+
+    session = {
+        "listing_data": {
+            "title": "iPhone 13",
+            "description": "Temiz cihaz ve sorunsuz kullanım.",
+            "price": 18000,
+            "category": "Elektronik",
+            "condition": "2. El",
+            "location": "Bursa",
+        },
+        "state": "READY",
+        "fsm_state": "DRAFTING",
+    }
+
+    response = await _handle_enrichment_action("user-1", "webchat", session, "improve_text")
+
+    assert response is not None
+    assert response.listing_preview is not None
+    assert "500" not in response.listing_preview["description"]
+    assert "Kutulu" not in response.listing_preview["description"]
+    assert "Sertifikalı" not in response.listing_preview["description"]
+    assert "2021" not in response.listing_preview["description"]
+    assert "Temiz cihaz" in response.listing_preview["description"]
+
+
+async def test_apply_description_removal_request_removes_phrase(monkeypatch):
+    async def fake_save_session(*_: object, **__: object):
+        return None
+
+    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
+
+    session = {
+        "listing_data": {
+            "title": "iPhone 13",
+            "description": "Temiz cihaz, hasarlı değil, kutusuz gönderilecek.",
+            "price": 18000,
+            "category": "Elektronik",
+            "condition": "2. El",
+            "location": "Bursa",
+        },
+        "state": "READY",
+        "fsm_state": "DRAFTING",
+    }
+
+    response = await _apply_description_removal_request(
+        "user-1",
+        "webchat",
+        session,
+        "açıklamadan hasarlı değil ifadesini sil",
+    )
+
+    assert response is not None
+    assert response.listing_preview is not None
+    assert "hasarlı değil" not in response.listing_preview["description"].lower()
 
 
 def test_publish_text_guard_does_not_flag_turkish_gun_word():
