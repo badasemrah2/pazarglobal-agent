@@ -1702,7 +1702,47 @@ class SupabaseClient:
                 .limit(1)
                 .execute()
             )
-            return self._first_dict(result.data)
+            listing_row = self._first_dict(result.data)
+            if not listing_row:
+                return None
+
+            owner_id = self._coerce_str(listing_row.get("user_id")).strip()
+            if owner_id:
+                try:
+                    profile_res = (
+                        self.client.table("profiles")
+                        .select("phone,phone_visibility,name_visibility,display_name,full_name")
+                        .eq("id", owner_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    profile_row = self._first_dict(profile_res.data)
+                    if profile_row:
+                        profile_phone = self._coerce_str(profile_row.get("phone")).strip()
+                        profile_phone_visibility = self._coerce_str(profile_row.get("phone_visibility")).strip().lower()
+                        profile_name_visibility = self._coerce_str(profile_row.get("name_visibility")).strip().lower()
+                        profile_name = self._coerce_str(
+                            profile_row.get("display_name") or profile_row.get("full_name")
+                        ).strip()
+
+                        if profile_phone:
+                            listing_row["user_phone"] = profile_phone
+                        if profile_phone_visibility in {"public", "hidden"}:
+                            listing_row["phone_visibility"] = profile_phone_visibility
+                        if profile_name_visibility in {"public", "hidden"}:
+                            listing_row["name_visibility"] = profile_name_visibility
+                        if profile_name:
+                            listing_row["user_name"] = profile_name
+                except Exception as profile_err:
+                    logger.warning(f"Failed to merge profile visibility for listing contact meta: {profile_err}")
+
+            listing_row["user_phone"] = self._coerce_str(listing_row.get("user_phone")).strip()
+            phone_visibility = self._coerce_str(listing_row.get("phone_visibility")).strip().lower()
+            name_visibility = self._coerce_str(listing_row.get("name_visibility")).strip().lower()
+            listing_row["phone_visibility"] = phone_visibility if phone_visibility in {"public", "hidden"} else "public"
+            listing_row["name_visibility"] = name_visibility if name_visibility in {"public", "hidden"} else "public"
+
+            return listing_row
         except Exception as e:
             logger.error(f"Error fetching listing contact meta: {e}")
             return None

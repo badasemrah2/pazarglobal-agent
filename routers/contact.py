@@ -93,8 +93,13 @@ async def resolve_contact_link(token: str):
 
 
 @router.post("/send")
-async def send_message_via_contact_link(payload: ContactSendRequest):
-    """Public endpoint: send site-internal message to listing owner via token."""
+async def send_message_via_contact_link(
+    payload: ContactSendRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+):
+    """Authenticated endpoint: send site-internal message to listing owner via token."""
+    sender_user_id = await _require_auth_user_id(authorization)
+
     resolved = await supabase_client.resolve_contact_token(payload.token)
     if not resolved:
         raise HTTPException(status_code=404, detail="invalid_or_expired_token")
@@ -107,8 +112,7 @@ async def send_message_via_contact_link(payload: ContactSendRequest):
     if not listing_id or not owner_user_id:
         raise HTTPException(status_code=500, detail="contact_resolution_failed")
 
-    sender_user_id = (payload.sender_user_id or "").strip() or None
-    if sender_user_id and sender_user_id == owner_user_id:
+    if sender_user_id == owner_user_id:
         raise HTTPException(status_code=400, detail="self_contact_not_allowed")
 
     sender_name = (payload.sender_name or "").strip() or "İsimsiz Alıcı"
@@ -118,7 +122,7 @@ async def send_message_via_contact_link(payload: ContactSendRequest):
         owner_user_id=owner_user_id,
         contact_token_id=str(token_row.get("id") or "") or None,
         sender_user_id=sender_user_id,
-        sender_session_id=(payload.sender_session_id or "").strip() or None,
+        sender_session_id=None,
         sender_name=sender_name,
         source_channel=(payload.channel or "web").strip().lower(),
         first_message_preview=payload.message,
