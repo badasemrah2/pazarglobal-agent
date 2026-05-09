@@ -343,6 +343,41 @@ _DESCRIPTION_CONFIRMABLE_CLAIM_LABELS = {
     "sertifika": "sertifika",
     "sinirli": "sınırlı",
 }
+_DESCRIPTION_DELIVERY_CLAIM_PATTERNS: Dict[str, re.Pattern] = {
+    "delivery:kargo": re.compile(r"\bkargo(?:yla|yle|ile)?\b", flags=re.IGNORECASE),
+    "delivery:teslimat": re.compile(r"\bteslimat\b", flags=re.IGNORECASE),
+    "delivery:elden_teslim": re.compile(r"\belden\s+teslim\b", flags=re.IGNORECASE),
+    "delivery:kapida_odeme": re.compile(r"\bkap[ıi]da\s+[öo]deme\b", flags=re.IGNORECASE),
+}
+_DESCRIPTION_DELIVERY_CLAIM_LABELS = {
+    "delivery:kargo": "kargo",
+    "delivery:teslimat": "teslimat",
+    "delivery:elden_teslim": "elden teslim",
+    "delivery:kapida_odeme": "kapıda ödeme",
+}
+_DESCRIPTION_USAGE_COUNT_PATTERN = re.compile(
+    r"\b(?:sadece\s+)?(?P<count>\d+)\s*kez\s+(?P<verb>kullan(?:ı|i)ld(?:ı|i)|giyildi|takıldı|takildi)\b",
+    flags=re.IGNORECASE,
+)
+_DESCRIPTION_UNUSED_PATTERN = re.compile(r"\bhi[cç]\s+kullan(?:ı|i)lmad(?:ı|i)\b", flags=re.IGNORECASE)
+_DESCRIPTION_QUALITY_CLAIM_PATTERNS: Dict[str, re.Pattern] = {
+    "condition:cok_iyi_durumda": re.compile(r"\bçok\s+iyi\s+durum(?:da)?\b", flags=re.IGNORECASE),
+    "condition:mukemmel_durumda": re.compile(r"\bm[üu]kemmel\s+durum(?:da)?\b", flags=re.IGNORECASE),
+    "condition:kusursuz": re.compile(r"\bkusursuz\b", flags=re.IGNORECASE),
+}
+_DESCRIPTION_QUALITY_CLAIM_LABELS = {
+    "condition:cok_iyi_durumda": "çok iyi durumda",
+    "condition:mukemmel_durumda": "mükemmel durumda",
+    "condition:kusursuz": "kusursuz",
+}
+_DESCRIPTION_SEED_PREFIX_PATTERNS = [
+    re.compile(r"^(?:📷\s*)?(?:g[oö]rsel)\s*\d+\s*[:\-.]?\s*", flags=re.IGNORECASE),
+    re.compile(r"^durum\s*[:\-.]?\s*", flags=re.IGNORECASE),
+    re.compile(
+        r"^(?:(?:öne|one)\s+(?:çıkan|cikan)\s+(?:özellikler|ozellikler)|(?:özellikler|ozellikler)|detaylar)\s*[:\-.]\s*",
+        flags=re.IGNORECASE,
+    ),
+]
 _SESSION_DESCRIPTION_CLAIMS_KEY = "description_confirmed_claims"
 _DESCRIPTION_REMOVAL_PATTERNS = [
     re.compile(
@@ -360,6 +395,11 @@ _DESCRIPTION_REMOVAL_PATTERNS = [
 ]
 
 
+def _build_usage_claim_key(count: str, verb: str) -> str:
+    normalized_verb = normalize_for_match(verb).replace(" ", "")
+    return f"usage:{count}:{normalized_verb or 'unknown'}"
+
+
 def _extract_confirmed_description_claims(text: str) -> set[str]:
     claims: set[str] = set()
     if not text:
@@ -372,6 +412,16 @@ def _extract_confirmed_description_claims(text: str) -> set[str]:
         claims.add("sertifika")
     if re.search(r"\bsinirli(?:\s+uretim)?\b", normalized, flags=re.IGNORECASE):
         claims.add("sinirli")
+    for claim_key, pattern in _DESCRIPTION_DELIVERY_CLAIM_PATTERNS.items():
+        if pattern.search(text):
+            claims.add(claim_key)
+    for match in _DESCRIPTION_USAGE_COUNT_PATTERN.finditer(text):
+        claims.add(_build_usage_claim_key(str(match.group("count") or ""), str(match.group("verb") or "")))
+    if _DESCRIPTION_UNUSED_PATTERN.search(text):
+        claims.add("usage:none")
+    for claim_key, pattern in _DESCRIPTION_QUALITY_CLAIM_PATTERNS.items():
+        if pattern.search(text):
+            claims.add(claim_key)
 
     for year in _DESCRIPTION_YEAR_PATTERN.findall(text):
         claims.add(f"year:{year}")
@@ -441,6 +491,63 @@ def _cleanup_description_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def _strip_description_seed_prefixes(text: str) -> str:
+    cleaned = str(text or "").strip()
+    previous = None
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        for pattern in _DESCRIPTION_SEED_PREFIX_PATTERNS:
+            cleaned = pattern.sub("", cleaned).strip()
+    return cleaned.strip(" ,;:-")
+
+
+def _looks_like_description_seed(text: str) -> bool:
+    if not text:
+        return False
+
+    raw_text = str(text)
+    if re.search(
+        r"(?:g[oö]rsel\s*\d+\s*[:\-.]|durum\s*[:\-.]|(?:öne|one)\s+(?:çıkan|cikan)\s+(?:özellikler|ozellikler)\s*[:\-.])",
+        raw_text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(pattern.search(line) for pattern in _DESCRIPTION_SEED_PREFIX_PATTERNS):
+            return True
+
+    return False
+
+
+def _normalize_description_seed(text: str) -> str:
+    if not text:
+        return ""
+
+    if not _looks_like_description_seed(text):
+        return _cleanup_description_text(text)
+
+    fragments: List[str] = []
+    seen: set[str] = set()
+    for raw_part in re.split(r"[\r\n]+|(?<=[.!?])\s+", str(text)):
+        part = _strip_description_seed_prefixes(raw_part)
+        part = re.sub(r"\s+", " ", part).strip(" ,;:-")
+        normalized_part = normalize_for_match(part)
+        if not normalized_part or normalized_part in seen:
+            continue
+        seen.add(normalized_part)
+        if len(part) > 1:
+            part = part[0].upper() + part[1:]
+        if part[-1] not in ".!?":
+            part += "."
+        fragments.append(part)
+
+    return _cleanup_description_text(" ".join(fragments))
+
+
 def _collect_description_validation_errors(
     listing: Dict[str, Any],
     confirmed_claims: Optional[set[str]] = None,
@@ -465,6 +572,26 @@ def _collect_description_validation_errors(
         if _DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS[claim_key].search(description):
             errors.append(f"Doğrulanmamış bilgi: {label}")
 
+    for claim_key, label in _DESCRIPTION_DELIVERY_CLAIM_LABELS.items():
+        if claim_key in claims:
+            continue
+        if _DESCRIPTION_DELIVERY_CLAIM_PATTERNS[claim_key].search(description):
+            errors.append(f"Doğrulanmamış bilgi: {label}")
+
+    for match in _DESCRIPTION_USAGE_COUNT_PATTERN.finditer(description):
+        claim_key = _build_usage_claim_key(str(match.group("count") or ""), str(match.group("verb") or ""))
+        if claim_key not in claims:
+            errors.append(f"Doğrulanmamış bilgi: {match.group(0).strip()}")
+
+    if _DESCRIPTION_UNUSED_PATTERN.search(description) and "usage:none" not in claims:
+        errors.append("Doğrulanmamış bilgi: hiç kullanılmadı")
+
+    for claim_key, label in _DESCRIPTION_QUALITY_CLAIM_LABELS.items():
+        if claim_key in claims:
+            continue
+        if _DESCRIPTION_QUALITY_CLAIM_PATTERNS[claim_key].search(description):
+            errors.append(f"Doğrulanmamış bilgi: {label}")
+
     for year in sorted(set(_DESCRIPTION_YEAR_PATTERN.findall(description))):
         if f"year:{year}" not in claims:
             errors.append(f"Doğrulanmamış bilgi: {year}")
@@ -482,7 +609,7 @@ def _sanitize_ai_generated_description(
     description: str,
     confirmed_claims: Optional[set[str]] = None,
 ) -> tuple[str, List[str]]:
-    cleaned = str(description or "")
+    cleaned = _normalize_description_seed(str(description or ""))
     claims = confirmed_claims or set()
     removed: List[str] = []
 
@@ -496,6 +623,34 @@ def _sanitize_ai_generated_description(
         removed.append("hasarli")
 
     for claim_key, pattern in _DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS.items():
+        if claim_key in claims:
+            continue
+        cleaned, count = pattern.subn(" ", cleaned)
+        if count:
+            removed.append(claim_key)
+
+    for claim_key, pattern in _DESCRIPTION_DELIVERY_CLAIM_PATTERNS.items():
+        if claim_key in claims:
+            continue
+        cleaned, count = pattern.subn(" ", cleaned)
+        if count:
+            removed.append(claim_key)
+
+    def _strip_unconfirmed_usage(match: re.Match[str]) -> str:
+        claim_key = _build_usage_claim_key(str(match.group("count") or ""), str(match.group("verb") or ""))
+        if claim_key in claims:
+            return match.group(0)
+        removed.append(claim_key)
+        return " "
+
+    cleaned = _DESCRIPTION_USAGE_COUNT_PATTERN.sub(_strip_unconfirmed_usage, cleaned)
+
+    if "usage:none" not in claims:
+        cleaned, count = _DESCRIPTION_UNUSED_PATTERN.subn(" ", cleaned)
+        if count:
+            removed.append("usage:none")
+
+    for claim_key, pattern in _DESCRIPTION_QUALITY_CLAIM_PATTERNS.items():
         if claim_key in claims:
             continue
         cleaned, count = pattern.subn(" ", cleaned)
@@ -556,6 +711,33 @@ def _extract_description_removal_phrase(message: str) -> Optional[str]:
         if phrase:
             return phrase
     return None
+
+
+def _split_description_removal_targets(phrase: str) -> List[str]:
+    if not phrase:
+        return []
+
+    raw_targets = re.split(r"\s+(?:ve|ile|ya da|yada)\s+|[,/;]", phrase, flags=re.IGNORECASE)
+    targets: List[str] = []
+    seen: set[str] = set()
+    for raw_target in raw_targets:
+        target = str(raw_target or "").strip().strip("`'\"“”")
+        target = re.sub(r"\b(?:yaz[ıi]s[ıi]n[ıi]|kelimesini|ifadesini|bilgisini)\b", " ", target, flags=re.IGNORECASE)
+        target = re.sub(r"\s+", " ", target).strip(" ,;:-")
+        normalized_target = normalize_for_match(target)
+        if not normalized_target or normalized_target in seen:
+            continue
+        seen.add(normalized_target)
+        targets.append(target)
+    return targets
+
+
+def _build_description_removal_pattern(phrase: str) -> re.Pattern:
+    tokens = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü]+|\d+", phrase)
+    if not tokens:
+        return re.compile(re.escape(phrase), flags=re.IGNORECASE)
+    joined = r"[\s_-]*".join(re.escape(token) for token in tokens)
+    return re.compile(rf"\b{joined}\b\s*[:=-]?", flags=re.IGNORECASE)
 
 
 def _classify_draft_message_intent(message: str) -> Optional[str]:
@@ -1295,7 +1477,7 @@ def _apply_structured_prefill_to_listing(listing_data: Dict[str, Any], prefill: 
 
     raw_desc = prefill.get("description_start") or prefill.get("description")
     if isinstance(raw_desc, str):
-        desc_seed = raw_desc.strip()
+        desc_seed, _ = _sanitize_ai_generated_description(raw_desc.strip(), confirmed_claims=set())
         if desc_seed:
             existing_desc = str(listing_data.get("description") or "").strip()
             if not existing_desc:
@@ -1736,6 +1918,8 @@ async def _apply_description_removal_request(user_id: str, channel: str, session
     if not phrase:
         return None
 
+    removal_targets = _split_description_removal_targets(phrase) or [phrase]
+
     listing = session.get("listing_data", {})
     if not isinstance(listing, dict):
         listing = {}
@@ -1748,7 +1932,16 @@ async def _apply_description_removal_request(user_id: str, channel: str, session
             metadata={"intent": "CREATE", "edit_intent": "remove_description_text"},
         )
 
-    updated_description, removed_count = re.subn(re.escape(phrase), " ", description, flags=re.IGNORECASE)
+    updated_description = description
+    removed_targets: List[str] = []
+    removed_count = 0
+    for target in removal_targets:
+        pattern = _build_description_removal_pattern(target)
+        updated_description, target_count = pattern.subn(" ", updated_description)
+        if target_count:
+            removed_targets.append(target)
+            removed_count += target_count
+
     if removed_count == 0:
         return MessageResponse(
             success=True,
@@ -1766,10 +1959,11 @@ async def _apply_description_removal_request(user_id: str, channel: str, session
     session["fsm_state"] = FSM_STATE_DRAFTING
     session["last_intent"] = "CREATE"
     session["draft_updated_at"] = datetime.utcnow().isoformat()
-    _remove_description_claims(session, phrase)
+    _remove_description_claims(session, *removed_targets)
     await save_session(user_id, channel, session)
 
-    text = f"✅ Açıklamadan '{phrase}' ifadesini kaldırdım.\n\n{_format_preview(listing, show_full_description=True)}"
+    removed_label = ", ".join(f"'{target}'" for target in removed_targets) if removed_targets else f"'{phrase}'"
+    text = f"✅ Açıklamadan {removed_label} ifadesini kaldırdım.\n\n{_format_preview(listing, show_full_description=True)}"
     if description_errors:
         text += "\n\nAçıklama düzeltmeleri gerekli:\n" + "\n".join(f"- {error}" for error in description_errors)
     elif missing:

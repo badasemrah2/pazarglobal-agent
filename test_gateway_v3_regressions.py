@@ -5,6 +5,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 from routers.gateway_v3 import (  # noqa: E402
     _apply_description_removal_request,
     _apply_drafting_edit_request,
+    _apply_structured_prefill_to_listing,
     _classify_draft_message_intent,
     _collect_description_validation_errors,
     _detect_enrichment_action,
@@ -121,6 +122,36 @@ def test_description_validator_flags_price_and_unconfirmed_claims():
     assert "Doğrulanmamış bilgi: 2021" in errors
 
 
+def test_description_validator_flags_delivery_and_usage_claims():
+    errors = _collect_description_validation_errors(
+        {
+            "title": "Dekoratif dünya globu",
+            "description": "Sadece 1 kez kullanıldı. Çok iyi durumda. Kargo ile teslimat yapılacaktır.",
+            "condition": "2. El",
+        },
+        confirmed_claims=set(),
+    )
+
+    assert any("1 kez kullanıldı" in error for error in errors)
+    assert "Doğrulanmamış bilgi: çok iyi durumda" in errors
+    assert "Doğrulanmamış bilgi: kargo" in errors
+    assert "Doğrulanmamış bilgi: teslimat" in errors
+
+
+def test_apply_structured_prefill_normalizes_vision_seed():
+    listing = {}
+
+    changed = _apply_structured_prefill_to_listing(
+        listing,
+        {
+            "description_start": "Görsel 1: dekoratif dünya globu. Durum: Öne çıkan özellikler: metal yapı, altın rengi detaylar.",
+        },
+    )
+
+    assert changed is True
+    assert listing["description"] == "Dekoratif dünya globu. Metal yapı, altın rengi detaylar."
+
+
 def test_format_preview_can_show_full_description_when_requested():
     description = (
         "Satılık citroen c3 benzinli otomatik - 2020 model\n\n"
@@ -223,6 +254,51 @@ async def test_handle_enrichment_action_strips_unconfirmed_claims(monkeypatch):
     assert "Temiz cihaz" in response.listing_preview["description"]
 
 
+async def test_handle_enrichment_action_strips_delivery_usage_and_seed_labels(monkeypatch):
+    async def fake_edge_call(*_: object, **__: object):
+        return {
+            "success": True,
+            "result": (
+                "Görsel 1: dekoratif dünya globu. Durum: çok iyi durumda. "
+                "Öne çıkan özellikler: metal yapı, altın rengi detaylar. "
+                "Sadece 1 kez kullanıldı. ✅📦 Teslimat kargo ile yapılacaktır."
+            ),
+        }
+
+    async def fake_save_session(*_: object, **__: object):
+        return None
+
+    monkeypatch.setattr("routers.gateway_v3.supabase_client._call_edge_function", fake_edge_call)
+    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
+
+    session = {
+        "listing_data": {
+            "title": "Dekoratif dünya globu",
+            "description": "Dekoratif dünya globu.",
+            "price": 1800,
+            "category": "Ev & Yaşam",
+            "condition": "2. El",
+            "location": "Bursa",
+        },
+        "state": "READY",
+        "fsm_state": "DRAFTING",
+    }
+
+    response = await _handle_enrichment_action("user-1", "webchat", session, "improve_text")
+
+    assert response is not None
+    assert response.listing_preview is not None
+    description = response.listing_preview["description"]
+    assert "Görsel" not in description
+    assert "Durum" not in description
+    assert "Öne çıkan özellikler" not in description
+    assert "1 kez" not in description
+    assert "teslimat" not in description.lower()
+    assert "kargo" not in description.lower()
+    assert "çok iyi durumda" not in description.lower()
+    assert "Metal yapı, altın rengi detaylar." in description
+
+
 async def test_apply_description_removal_request_removes_phrase(monkeypatch):
     async def fake_save_session(*_: object, **__: object):
         return None
@@ -252,6 +328,39 @@ async def test_apply_description_removal_request_removes_phrase(monkeypatch):
     assert response is not None
     assert response.listing_preview is not None
     assert "hasarlı değil" not in response.listing_preview["description"].lower()
+
+
+async def test_apply_description_removal_request_handles_multiple_targets_and_flexible_spacing(monkeypatch):
+    async def fake_save_session(*_: object, **__: object):
+        return None
+
+    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
+
+    session = {
+        "listing_data": {
+            "title": "Dekoratif dünya globu",
+            "description": "Görsel 1: dekoratif dünya globu. Durum: metal yapı ve altın rengi detaylar.",
+            "price": 1800,
+            "category": "Ev & Yaşam",
+            "condition": "2. El",
+            "location": "Bursa",
+        },
+        "state": "READY",
+        "fsm_state": "DRAFTING",
+    }
+
+    response = await _apply_description_removal_request(
+        "user-1",
+        "webchat",
+        session,
+        'Açıklamadan "Görsel1" ve "Durum" yazısını çıkar',
+    )
+
+    assert response is not None
+    assert response.listing_preview is not None
+    description = response.listing_preview["description"]
+    assert "Görsel" not in description
+    assert "Durum" not in description
 
 
 def test_publish_text_guard_does_not_flag_turkish_gun_word():

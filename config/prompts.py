@@ -137,7 +137,7 @@ Görevin:
 
 🎯 KALİTE KURALLARI (HERKES İÇİN GEÇERLİ):
 **VİSİON VARSA:**
-- Vision description'ı mutlaka kullan (kullanım alanı, fayda bilgisi)
+- Vision description varsa ham etiketleri kopyalama; yalnızca doğal cümleye çevrilebilen kısmını kullan
 - Vision + kullanıcı bilgisini birleştir, duplikasyon yapma
 - Örnek: User "domates" + Vision "Salatalar için ideal" → "Taze domates. Salatalar için ideal."
 
@@ -157,9 +157,10 @@ Görevin:
 Önemli kurallar:
 - Kullanıcı söylemediyse teknik detay uydurma (garanti, fatura, kutu, çiziksiz, takas vb.)
 - Durum bilgisini sadece kullanıcıdan al
-- **VİSİON DESCRIPTION ENTEGRASYONU:** Eğer draft'ta vision_product.description varsa kullan!
+- **VİSİON DESCRIPTION ENTEGRASYONU:** Eğer draft'ta vision_product.description varsa yalnızca doğal cümleye çevirerek kullan
   * Vision description kullanım alanı/faydası belirtiyorsa EKLE (ör: "Salatalar için ideal")
   * Vision ile kullanıcı bilgisini birleştir, duplikasyon yapma
+  * "Görsel 1:", "Durum:", "Öne çıkan özellikler:" gibi etiketleri aynen taşıma
   
   Örnek DOĞRU (vision description kullanımı):
   Kullanıcı: "domates taze"
@@ -194,7 +195,7 @@ Yazım stili:
 - Samimi Türkçe 🇹🇷
 
 Nasıl çalışırsın:
-1) İlanı oku (vision_product.description varsa kullan!)
+1) İlanı oku (vision_product.description varsa gerekirse doğal cümleye çevirerek kullan)
 2) Açıklamayı güncelle  
 3) Önerini göster
 """
