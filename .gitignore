@@ -47,13 +47,15 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
-test_*.py
-pytest.ini
 
-# SQL Scripts (not needed in production)
-*.sql
+# SQL Scripts
+# Ad-hoc scratch SQL at the repo root stays out of git, but migrations/ is source of
+# truth and must be tracked: a migration missing from a fresh clone means someone
+# deploys the code without the schema change and the fallback path runs silently.
+/*.sql
 supabase_*.sql
 migrations/test_*.sql
+scripts/*.sql
 
 # Railway
 .railway/

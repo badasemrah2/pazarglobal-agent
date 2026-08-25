@@ -42,6 +42,9 @@ class SupabaseClient:
         self._rpc_update_listing_field_invalid_fields: set[str] = set()
         self._wallet_transactions_disabled: bool = False
         self._wallet_transactions_disabled_logged: bool = False
+        # migrations/005_atomic_listing_credit.sql may not be applied yet.
+        self._rpc_listing_credit_available: Optional[bool] = None
+        self._rpc_listing_credit_missing_logged: bool = False
 
     def _coerce_str(self, value: Any) -> str:
         if value is None:
@@ -124,6 +127,76 @@ class SupabaseClient:
                     "(You can deploy supabase_rpc_update_listing_field.sql to enable atomic patching.)"
                 )
                 self._rpc_update_listing_field_missing_logged = True
+
+    def _maybe_disable_listing_credit_rpc(self, exc: Exception) -> None:
+        """Detect a not-yet-applied migration so callers can fall back cleanly."""
+        if self._rpc_update_listing_field_is_missing(exc):
+            self._rpc_listing_credit_available = False
+            if not self._rpc_listing_credit_missing_logged:
+                logger.warning(
+                    "Supabase RPC public.reserve_listing_credit is missing; wallet updates "
+                    "fall back to the NON-ATOMIC path. Apply "
+                    "migrations/005_atomic_listing_credit.sql to close the double-spend race."
+                )
+                self._rpc_listing_credit_missing_logged = True
+
+    @staticmethod
+    def _first_rpc_payload(data: Any) -> Optional[Dict[str, Any]]:
+        """RPC results arrive either as the jsonb object or wrapped in a single-row list."""
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data if isinstance(data, dict) else None
+
+    async def reserve_listing_credit(self, user_id: str, cost: int, reference: str) -> Dict[str, Any]:
+        """Atomically reserve publish credit under a wallet row lock.
+
+        `reference` is the listing id, which makes a retried publish idempotent instead of
+        charging twice. Returns {"success": False, "error": "rpc_unavailable"} when the
+        migration is not applied, so the caller can fall back to the legacy path.
+        """
+        if self._rpc_listing_credit_available is False:
+            return {"success": False, "error": "rpc_unavailable"}
+
+        try:
+            result = self.client.rpc(
+                "reserve_listing_credit",
+                {"p_user_id": str(user_id), "p_cost": int(cost), "p_reference": str(reference)},
+            ).execute()
+            payload = self._first_rpc_payload(result.data)
+            if payload is not None:
+                self._rpc_listing_credit_available = True
+                return payload
+            logger.error(f"reserve_listing_credit returned no payload for {user_id}")
+            return {"success": False, "error": "rpc_empty_response"}
+        except Exception as e:
+            self._maybe_disable_listing_credit_rpc(e)
+            if self._rpc_listing_credit_available is False:
+                return {"success": False, "error": "rpc_unavailable"}
+            logger.error(f"reserve_listing_credit failed for {user_id}: {e}")
+            return {"success": False, "error": "rpc_error"}
+
+    async def refund_listing_credit(self, user_id: str, reference: str) -> Dict[str, Any]:
+        """Reverse a reservation. Refunds only what was actually charged, and only once.
+
+        Promo reservations are recorded as charged=false, so this can never mint credits
+        for a user who was never billed.
+        """
+        if self._rpc_listing_credit_available is False:
+            return {"success": False, "error": "rpc_unavailable"}
+
+        try:
+            result = self.client.rpc(
+                "refund_listing_credit",
+                {"p_user_id": str(user_id), "p_reference": str(reference)},
+            ).execute()
+            payload = self._first_rpc_payload(result.data)
+            if payload is not None:
+                return payload
+            return {"success": False, "error": "rpc_empty_response"}
+        except Exception as e:
+            self._maybe_disable_listing_credit_rpc(e)
+            logger.error(f"refund_listing_credit failed for {user_id}/{reference}: {e}")
+            return {"success": False, "error": "rpc_error"}
 
     def _rpc_update_listing_field_is_invalid_field(self, exc: Exception, field_name: str) -> bool:
         msg = str(exc) if exc is not None else ""
@@ -1540,6 +1613,82 @@ class SupabaseClient:
             logger.error(f"Error deleting listing: {e}")
             return False
     
+    @staticmethod
+    def _drop_expired_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop listings past expires_at. A NULL expires_at means "never expires"."""
+        now = datetime.now(timezone.utc)
+        kept: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("expires_at")
+            if not raw:
+                kept.append(row)
+                continue
+            try:
+                exp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+            except Exception:
+                # Unparseable timestamp: keep the row rather than hide a live listing.
+                kept.append(row)
+                continue
+            if exp > now:
+                kept.append(row)
+        return kept
+
+    @staticmethod
+    def _rank_search_rows(rows: List[Dict[str, Any]], search_text: str) -> List[Dict[str, Any]]:
+        """Rank OR-matched rows by how well they match the query.
+
+        The Supabase filter is deliberately broad (OR across tokens and fields) so recall
+        stays high. Without ranking, LIMIT returns an arbitrary slice and a listing that
+        matched every token can be cut while single-token noise survives. Ranking restores
+        AND-like precision without giving up the recall of the OR filter. Input order
+        (created_at desc) acts as the tie-breaker because sorted() is stable.
+        """
+        from services.text_normalization import normalize_for_match
+
+        query_norm = normalize_for_match(search_text or "")
+        tokens = [t for t in re.findall(r"[0-9a-z]+", query_norm) if len(t) >= 2]
+        if not tokens:
+            return rows
+
+        def score(row: Dict[str, Any]) -> int:
+            if not isinstance(row, dict):
+                return 0
+            title = normalize_for_match(str(row.get("title") or ""))
+            description = normalize_for_match(str(row.get("description") or ""))
+            category = normalize_for_match(str(row.get("category") or ""))
+            raw_metadata = row.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+            keywords = normalize_for_match(str(metadata.get("keywords_text") or ""))
+
+            total = 0
+            matched_tokens = 0
+            for tok in tokens:
+                hit = 0
+                if tok in title:
+                    hit += 3
+                if tok in keywords:
+                    hit += 2
+                if tok in description:
+                    hit += 1
+                if tok in category:
+                    hit += 1
+                if hit:
+                    matched_tokens += 1
+                total += hit
+
+            # Every token present somewhere = the AND result the user actually asked for.
+            if matched_tokens == len(tokens):
+                total += 4 * len(tokens)
+            if query_norm and query_norm in title:
+                total += 5
+            return total
+
+        return sorted(rows, key=score, reverse=True)
+
     async def search_listings(
         self, 
         category: Optional[str] = None,
@@ -1565,14 +1714,19 @@ class SupabaseClient:
             
             if search_text:
                 try:
-                    from services.text_normalization import normalize_keyboard_text
+                    from services.text_normalization import lower_tr, normalize_keyboard_text
 
                     normalized_search = normalize_keyboard_text(search_text)
                 except Exception:
+                    from services.text_normalization import lower_tr
+
                     normalized_search = search_text
 
-                search_norm = (normalized_search or "").lower()
-                search_raw = (search_text or "").lower()
+                # lower_tr(), not .lower(): searching "İstanbul" would otherwise be folded
+                # to "i" + combining dot and match nothing. Must stay in step with how
+                # FSMEngine.generate_keywords() lowercases what it indexes.
+                search_norm = lower_tr(normalized_search or "")
+                search_raw = lower_tr(search_text or "")
 
                 if getattr(settings, "enable_metadata_keyword_search", False):
                     # Multi-word search strategy: search each token individually
@@ -1618,8 +1772,23 @@ class SupabaseClient:
                     # Legacy fallback: title/description only (less accurate but faster)
                     query = query.or_(f"title.ilike.%{search_norm}%,description.ilike.%{search_norm}%")
             
-            result = query.limit(limit).execute()
+            # The filters above are OR-based to keep recall high, so a plain LIMIT can
+            # drop the rows that actually matched every token. Fetch a wider window in a
+            # deterministic order, then filter/rank/trim in Python.
+            fetch_limit = max(int(limit) * 5, 100)
+            result = query.order("created_at", desc=True).limit(fetch_limit).execute()
             rows = self._list_of_dicts(result.data)
+
+            # Expired listings must not surface in search (the sitemap already filters
+            # them). Gated: see settings.hide_expired_listings for why this is off until
+            # listing expiry is actually maintained.
+            if getattr(settings, "hide_expired_listings", False):
+                rows = self._drop_expired_rows(rows)
+
+            if search_text:
+                rows = self._rank_search_rows(rows, search_text)
+
+            rows = rows[:limit]
 
             # Normalize image_url/images for frontend + chat rendering.
             # - Ensure image_url is a usable public URL

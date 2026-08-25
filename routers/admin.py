@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException
 
+from config.settings import settings
 from services.jwt_auth import verify_supabase_token
 from services.redis_client import redis_client
 from services.supabase_client import supabase_client
@@ -96,6 +97,66 @@ async def admin_health(authorization: Optional[str] = Header(default=None, alias
         })
     except Exception as e:
         payload["data"]["supabase"].update({"status": "error", "error": str(e)})
+
+    # Publishing capability.
+    # The 90-day launch promo expired on 2026-05-15 and nobody noticed for three months;
+    # every user was silently unable to publish. Surface it here so it cannot repeat.
+    try:
+        from datetime import datetime, timezone
+
+        cost = int(getattr(settings, "listing_credit_cost", 55) or 55)
+        res = (
+            supabase_client.client
+            .table("wallets")
+            .select("user_id, balance_bigint, free_unlimited_until")
+            .limit(5000)
+            .execute()
+        )
+        wallets = getattr(res, "data", None) or []
+        now = datetime.now(timezone.utc)
+
+        promo_active = 0
+        blocked = 0
+        soonest_expiry = None
+
+        for wallet in wallets:
+            raw = wallet.get("free_unlimited_until")
+            expiry = None
+            if raw:
+                try:
+                    expiry = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                except Exception:
+                    expiry = None
+
+            if expiry and expiry > now:
+                promo_active += 1
+                if soonest_expiry is None or expiry < soonest_expiry:
+                    soonest_expiry = expiry
+            elif float(wallet.get("balance_bigint") or 0) < cost:
+                # No promo and not enough credit: this user cannot publish at all.
+                blocked += 1
+
+        days_left = int((soonest_expiry - now).days) if soonest_expiry else None
+
+        if blocked:
+            status = "error"
+        elif days_left is not None and days_left <= 30:
+            status = "warning"
+        else:
+            status = "ok"
+
+        payload["data"]["publishing"] = {
+            "status": status,
+            "wallets": len(wallets),
+            "promo_active": promo_active,
+            "blocked_users": blocked,
+            "promo_days_left": days_left,
+            "listing_cost": cost,
+        }
+    except Exception as e:
+        payload["data"]["publishing"] = {"status": "error", "error": str(e)}
 
     payload["data"]["total_ms"] = round((time.perf_counter() - started) * 1000, 2)
     return payload

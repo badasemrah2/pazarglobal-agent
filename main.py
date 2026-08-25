@@ -170,16 +170,26 @@ async def agent_run(request: Request):
         # Import V3 handler
         from routers.gateway_v3 import handle_message, MessageRequest
         
-        # Convert Edge Function format to V3 format
+        # Convert Edge Function format to V3 format.
+        # Channel comes from the payload (this endpoint is the WhatsApp bridge path, so
+        # whatsapp stays the default) instead of being hardcoded, so a webchat caller
+        # routed through here is not silently granted the JWT-free whatsapp trust path.
+        raw_channel = str(data.get("channel") or data.get("source") or "whatsapp").strip().lower()
+        channel = raw_channel if raw_channel in ("whatsapp", "webchat") else "whatsapp"
+
         v3_request = MessageRequest(
             user_id=data.get("user_id") or data.get("phone") or "unknown",
             message=data.get("message", ""),
             media_urls=data.get("media_paths"),
-            channel="whatsapp",
+            channel=channel,
             prefill_listing_data=data.get("prefill_listing_data") if isinstance(data.get("prefill_listing_data"), dict) else None,
         )
-        
-        result = await handle_message(v3_request)
+
+        result = await handle_message(
+            v3_request,
+            authorization=request.headers.get("Authorization"),
+            internal_secret=request.headers.get("X-Internal-Secret"),
+        )
         
         # Return in format Edge Function expects
         return {

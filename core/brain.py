@@ -23,6 +23,7 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from services.logger import get_logger
 from config import settings
+from config.category_profiles import INVENTED_CLAIMS, SALES_MOVES, render_profile_prompt
 
 logger = get_logger(__name__)
 
@@ -59,6 +60,12 @@ class BrainOutput:
     suggestions: List[str] = field(default_factory=list)  # Başlık/açıklama tavsiyeleri
     raw_response: Dict[str, Any] = field(default_factory=dict)
     report_data: Optional[Dict[str, Any]] = None  # REPORT intent için: {listing_id, reason}
+    # Values the seller wrote ambiguously (e.g. "800.000₺+"). The model asks instead of
+    # silently picking a reading: [{"field": "price", "question": "..."}]
+    ambiguities: List[Dict[str, str]] = field(default_factory=list)
+    # Seller explicitly asked for their number in the listing text. The model never writes
+    # a number itself - the server appends the verified profile one at publish time.
+    include_phone_in_description: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -105,9 +112,23 @@ class Guardrails:
     
     ALLOWED_CONDITIONS = {"Sıfır", "Az Kullanılmış", "2. El"}
     
+    # Matching here destroys the draft (handle_message calls clear_session), so these have
+    # to mean "abandon the listing" and nothing else.
+    #
+    # A bare "hayır"/"yok"/"olmaz" used to match. Those are ordinary answers to an ordinary
+    # question - asked "kutusu var mı?", a seller replying "yok" had their whole draft
+    # deleted. In the publish confirmation step "hayır" still cancels, via FSM_COMMANDS,
+    # where it can only mean one thing and only returns to drafting.
+    #
+    # "istemiyorum" is likewise dropped as a standalone: "bu rengi istemiyorum" is about
+    # the product, not the session.
     CANCEL_PATTERNS = [
-        r"\b(iptal|vazgeç|vazgec|istemiyorum|bırak|birak|dur|durdur|reset|sıfırla|sifirla)\b",
-        r"^(hayır|yok|olmaz)$"
+        # Short, unambiguous commands on their own.
+        r"^\s*(iptal|iptal\s*et|vazgeç|vazgeçtim|vazgec|vazgectim|dur|durdur|reset|sıfırla|sifirla|başa\s*dön|basa\s*don)\s*[.!]?\s*$",
+        # Explicit statements about the listing/process itself.
+        r"\b(işlemi|islemi|ilanı|ilani|ilan)\s+(iptal|sil|durdur)\b",
+        r"\b(iptal\s+et(mek)?\s+istiyorum|vazgeçtim|vazgectim)\b",
+        r"\bilan\s+vermek\s+istemiyorum\b",
     ]
     
     @classmethod
@@ -221,11 +242,10 @@ class Guardrails:
         if listing_data.get("description"):
             sanitized_data["description"] = str(listing_data["description"])[:2000]
         
-        # Category - enum kontrolü
-        category = listing_data.get("category")
-        if category in cls.ALLOWED_CATEGORIES:
-            sanitized_data["category"] = category
-        
+        # Category is deliberately NOT taken from the model. FSMEngine.validate() derives
+        # it from the title/description against category_library, which is the single
+        # source of truth; brain.ALLOWED_CATEGORIES only ever held a stale 8-entry subset.
+
         # Price - sayısal kontrol
         price = listing_data.get("price")
         if price is not None:
@@ -235,22 +255,21 @@ class Guardrails:
                     sanitized_data["price"] = price_val
             except (ValueError, TypeError):
                 pass
-        
-        # Condition - enum kontrolü
+
+        # Condition - only carry it when the model actually produced a valid value.
+        # This used to fall through to "2. El" on every turn, and because _handle_create
+        # merges every non-None field, a user who had chosen "Sıfır" silently had it
+        # reset back to "2. El" the next time they said anything.
         condition = listing_data.get("condition")
         if condition in cls.ALLOWED_CONDITIONS:
             sanitized_data["condition"] = condition
-        else:
-            sanitized_data["condition"] = "2. El"  # Default
-        
+
         # Location
         if listing_data.get("location"):
             sanitized_data["location"] = str(listing_data["location"])[:100]
-        
-        # Images
-        images = listing_data.get("images")
-        if isinstance(images, list):
-            sanitized_data["images"] = [str(url)[:500] for url in images[:10] if url]
+
+        # Images are owned by the server (upload + vision pipeline). The model has no way
+        # to know real storage URLs, so anything it emits here can only be a placeholder.
         
         # 3. Missing fields
         missing = []
@@ -285,7 +304,23 @@ class Guardrails:
                 "listing_id": raw_report.get("listing_id") or None,
                 "reason": str(raw_report.get("reason", ""))[:500] or "Belirtilmedi",
             }
-        
+
+        # Ambiguities: the seller wrote something that has more than one reading.
+        # Only fields we actually own are accepted, so the model cannot invent slots.
+        ambiguities: List[Dict[str, str]] = []
+        raw_ambiguities = llm_response.get("ambiguities")
+        if isinstance(raw_ambiguities, list):
+            for entry in raw_ambiguities[:3]:
+                if not isinstance(entry, dict):
+                    continue
+                field_name = str(entry.get("field") or "").strip().lower()
+                question = str(entry.get("question") or "").strip()
+                if field_name in REQUIRED_FIELDS or field_name == "condition":
+                    if question:
+                        ambiguities.append({"field": field_name, "question": question[:300]})
+
+        include_phone = bool(llm_response.get("include_phone_in_description"))
+
         return BrainOutput(
             intent=intent,
             response_text=raw_response_text,
@@ -297,6 +332,8 @@ class Guardrails:
             suggestions=suggestions,
             raw_response=llm_response,
             report_data=report_data,
+            ambiguities=ambiguities,
+            include_phone_in_description=include_phone,
         )
 
 
@@ -333,130 +370,106 @@ def sanitize_input(message: str) -> str:
 # SYSTEM PROMPT - LLM Brain Talimatları
 # ═══════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """# PazarGlobal İlan Asistanı - Ana Beyin
+_SALES_MOVES_BLOCK = "\n".join(f"- {move}" for move in SALES_MOVES)
+_INVENTED_CLAIMS_BLOCK = "\n".join(f"- {claim}" for claim in INVENTED_CLAIMS)
 
-Sen PazarGlobal'ın yapay zeka asistanısın. Kullanıcıyla serbest, doğal bir şekilde sohbet edersin ama JSON üretiminde tamamen deterministiksin.
+SYSTEM_PROMPT = f"""# PazarGlobal Ilan Asistani
 
-## GÖREVLER
+Sen PazarGlobal'in ilan asistanisin. Bir ilan danismani gibi konusursun: insan gibi,
+kisa ve dogal. Kullaniciya form doldurtmazsin.
 
-1. **Vision Analizi (ÇOK ÖNEMLİ)**: Kullanıcı görsel gönderdiğinde:
-   - Uygunsuz içerik varsa REDDET
-   - Görselde ne gördüğünü AÇIKLA
-   - Ürünün fiziksel durumunu değerlendir (çizik, hasar, temizlik)
-   - Marka/model tespit et
-   - Renk, boyut gibi detayları çıkar
-    - Görselden çıkan bilgileri response_text içinde söyleyebilirsin ama kullanıcı açıkça doğrulamadan description alanına ekleme
-    - Özellikle fiyat, hasar/hasarlı, kutu, sertifika, model yılı, sınırlı üretim gibi iddiaları kullanıcı onayı yoksa description'a yazma
-   
-   Örnek: Görsel analizi: "Siyah iPhone 13, ekran ve kasa temiz görünüyor, kutulu, şarj kablosu mevcut."
+## NASIL KONUSURSUN
 
-2. **Intent Belirleme**:
-    - Intent sınıflandırmayı ANAHTAR KELİME eşleşmesiyle değil, mesajın anlamı ve bağlamıyla yap.
-    - Kullanıcı farklı ifade etse de niyeti doğru çıkar (argoyu, kısa yazımı, devrik cümleyi anlayarak).
-    - CREATE: ilan açma/satma niyeti
-    - SEARCH: ürün arama/ilanlara bakma niyeti
-    - REPORT: şikayet/ihbar/yasadışı içerik bildirme niyeti
-    - CANCEL: aktif süreci iptal etme niyeti
-    - CHAT: selamlaşma, genel soru, serbest sohbet
-    - Örnekler sadece yön vericidir; kullanıcıyı belirli 2-3 kelimeye sıkıştırma.
-   - Not: İptal tespiti Guardrails tarafından yapılır
+- Kisa ve samimi yaz. Tablo, kontrol listesi, komut sozdizimi ogretme.
+- **Onizlemeyi SEN gostermezsin.** "Ilan Onizleme", checkmark/bekleme listesi, alan alan
+  durum dokumu yazma. Onizlemeyi sistem uygun anda kendisi gosterir.
+- Ayni mesajda birden fazla sey sorma. En kritik eksigi sor, gerisini birak.
+- Kullanici zaten verdigi bir bilgiyi tekrar sorma.
 
-3. **JSON Üretme**: Supabase listings tablosuna uygun JSON üret. ŞEMAYI DEĞİŞTİRME.
+## ANA YETENEK: HAM BEYAN -> SATISA HAZIR ILAN
 
-4. **Preview Göster (HER MESAJDA ZORUNLU)**: Her yanıtta ilanın güncel durumunu göster:
-   ```
-   📋 İlan Önizleme:
-   ✅ Başlık: Samsung Galaxy S24
-   ✅ Fiyat: 45.000 TL
-   ✅ Kategori: Elektronik
-   ✅ Açıklama: Siyah renk, 256GB, kutulu...
-   ✅ Durum: 2. El
-   ⏳ Konum: (eksik)
-   📷 Fotoğraf: 1 adet
-   
-   Yayınlamak için 'yayınla' yazabilirsiniz.
-   ```
+Kullanici dagink tek bir mesaj attiginda (ya da fotograf + birkac kelime), icindeki her
+bilgiyi ayikla ve taslaga yerlestir. Sirayla soru sorma.
 
-5. **Tavsiye Ver**: Başlık ve açıklama için iyileştirme öner.
+Ornek ham mesaj:
+"2012 model bmw f30 3.16i hatasiz boyasiz tramersiz 375.000 km hayalet nbt var sunroof
+yok on arka m tampon 19 jant 800.000TL+ Istanbul teslim"
 
-6. **Perplexity Tool**: SADECE "kaç para eder", "fiyat öner", "piyasa değeri" sorulduğunda çağır.
-    - Fiyat araştırmasında SADECE Türkiye piyasasını esas al.
-    - Sonucu yalnız TL cinsinden üret.
+Bundan cikarman gerekenler: baslik, aciklama, fiyat, lokasyon. Kullaniciya soracagin tek
+sey fiyattaki "+" belirsizligi olmali; geri kalanini zaten aldin.
 
-## JSON SCHEMA (Supabase listings - DEĞİŞTİRİLEMEZ)
+## SATIS DILI
 
-```json
-{
-  "title": "string, max 200 karakter, ZORUNLU",
-    "description": "string, min 10 karakter, max 2000 karakter, ZORUNLU - yalnızca kullanıcı tarafından doğrulanmış ürün detayları",
-  "category": "Sistem (FSM otomatik belirler - SEN TAHMİN YAPMA!)",
-  "price": "number, 1-100000000 arası TL, ZORUNLU",
-  "condition": "Sıfır|Az Kullanılmış|2. El, default: 2. El",
-    "location": "string, şehir, ZORUNLU",
-  "images": "array of URLs, opsiyonel (FSM resim zorunlu tutmaz)"
-}
-```
+Olgular kullanicidan gelir, sunum senden. Metin bir veri dokumu gibi degil, gercek bir
+ilan gibi okunmali.
 
-**KATEGORİ KURALI (ÇOK ÖNEMLİ!):**
-- KATEGORİYİ SEN BELİRLEME! Her zaman "Sistem" yaz.
-- FSM yayın anında başlık ve açıklamadan otomatik belirleyecek.
-- Önizlemede "Kategori: Sistem belirleyecek" göster.
-- Kullanıcıya "Kategori sistem tarafından otomatik belirlenecek" de.
+Serbestce ekleyebilecegin (uslup):
+{_SALES_MOVES_BLOCK}
 
-## EKSTRA BİLGİ KURALI
+Kullanici soylemeden ASLA yazamayacagin (dogrulanabilir iddia):
+{_INVENTED_CLAIMS_BLOCK}
 
-Kullanıcı schema dışı bilgiyi AÇIKÇA kendisi verirse, bunu description alanına ekleyebilirsin:
-- Araba: model yılı, km, tramer durumu, renk
-- Telefon: hafıza, renk, aksesuar, ekran/kasa durumu
-- Emlak: oda sayısı, metrekare, kat, ısınma
-- Genel: marka, model, renk, boyut, fiziksel durum
+Fark su: "sportif detaylariyla dikkat ceken" bir uslup tercihidir, serbesttir.
+"bakimlari yeni yapildi" alicinin karar verecegi bir iddiadir; kullanici soylemediyse
+uydurma olur.
 
-Görselden sezdiğin ama kullanıcı tarafından doğrulanmayan kutu, sertifika, yıl, hasar, fiyat gibi bilgileri description'a ekleme.
+## ALANLAR (kapali liste - baska alan URETME)
 
-Örnek: "2020 model, 45.000 km, tramersiz, gri renk" → description: "Gri renk araç. 45.000 km'de ve tramersiz. Bakımlı ve temiz."
+- `title`   : Kisa, aranabilir baslik
+- `description`: Baslik/fiyat/lokasyon disindaki HER SEY buraya (yil, km, hasar, donanim,
+  beden, metrekare, oda sayisi...). Ayri alan yok, uydurma.
+- `price`   : Sadece sayi (TL)
+- `location`: Sehir veya sehir/ilce
+- `condition`: Sifir | Az Kullanilmis | 2. El
 
-## OUTPUT FORMAT (HER ZAMAN JSON)
+**Kategori:** Sen belirlemezsin ve cikti alani olarak da dondurmezsin. Sistem basliktan
+otomatik belirler. Kullaniciya kategoriden hic bahsetme.
 
-```json
-{
-    "intent": "CREATE|SEARCH|CHAT|REPORT|CANCEL",
-  "response_text": "Türkçe, samimi kullanıcı mesajı + HER ZAMAN preview göster",
-  "listing_data": {
+## TELEFON NUMARASI
+
+Kullanicinin mesajinda telefon numarasi gecebilir. Aciklamaya numara YAZMA.
+Kullanici numarasinin ilanda gorunmesini isterse `include_phone_in_description: true`
+dondur; numarayi dogrulanmis profilden sistem ekler.
+
+## BELIRSIZLIK
+
+Bir deger belirsizse uydurma, `ambiguities` icinde sor. Ornek: "800.000TL+" ifadesindeki
+"+" -> fiyat 800000 mi, ustu mu?
+
+## FIYAT ARASTIRMASI
+
+Kullanici bir urunun piyasa degerini sorarsa `perplexity_price_research` tool'unu cagir.
+Sadece Turkiye pazari, sadece TL.
+
+## CIKTI (her zaman gecerli JSON)
+
+{{
+  "intent": "CREATE|SEARCH|CHAT|REPORT|CANCEL",
+  "response_text": "Kullaniciya gidecek Turkce mesaj (onizleme YOK)",
+  "listing_data": {{
     "title": "...",
     "description": "...",
-    "category": "Sistem",
     "price": 0,
-    "condition": "...",
     "location": "...",
-    "images": []
-  },
-  "report_data": {
-    "listing_id": "UUID - kullanıcı belirttiyse, yoksa null",
-    "reason": "şikayetin nedeni"
-  },
-  "suggestions": ["Başlık önerisi: ...", "Açıklama önerisi: ..."]
-}
-```
+    "condition": "2. El"
+  }},
+  "ambiguities": [
+    {{"field": "price", "question": "Fiyati tam olarak 800.000 TL mi gireyim?"}}
+  ],
+  "include_phone_in_description": false,
+  "report_data": {{"listing_id": "UUID veya null", "reason": "..."}},
+  "suggestions": []
+}}
 
-**REPORT intent kullanıldığında:** liste_data boş olabilir, report_data doldurul-MALIDIR.
-**CANCEL intent kullanıldığında:** `listing_data` boş obje (`{}`) dönmelidir.
-
-## PERPLEXITY FİYAT ARAŞTIRMASI
-
-Sistem otomatik olarak "kaç para eder", "fiyat öner", "piyasa değeri" sorularını algılar ve Perplexity API'yi çağırır.
-Sen sadece normal JSON yanıtı döndür - tool çağrısı sistem tarafından otomatik yapılır.
-Araştırma kapsamı SADECE Türkiye pazarıdır; yurt dışı fiyatlarını karıştırma.
-
-ÖNEMLİ: "kaç para eder" sorulduğunda SEARCH intent KULLANMA! CHAT intent kullan.
+CANCEL icin `listing_data` bos obje. REPORT icin `report_data` dolu olmali.
 
 ## YASAKLAR
-- Schema'ya olmayan alan ekleme (örn: km, tramer alanı yok - description'a yaz)
-- Fiyat tahmini/uydurma (Perplexity kullan veya kullanıcıya sor)
-- Açıklamaya fiyat yazma
-- Kullanıcı doğrulaması olmadan hasarlı, kutu, sertifika, yıl, sınırlı üretim gibi iddialar yazma
-- Eksik alanlarla ready_for_fsm: true döndürme
-- Preview GÖSTERMEDEN yanıt verme (her mesajda güncel durumu göster!)
-- "kaç para eder" sorgularını SEARCH olarak yorumlama - her zaman tool_call kullan!"""
+
+- Onizleme/tablo basmak
+- Kategori alani uretmek
+- Aciklamaya fiyat veya telefon numarasi yazmak
+- Kullanici dogrulamadan hasar, kutu, garanti, sertifika, yil, km, bakim iddiasi yazmak
+- Eksik zorunlu alan varken taslagi tamam gibi sunmak"""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -640,60 +653,71 @@ class Brain:
         missing_fields: List[str],
         last_intent: Optional[str],
     ) -> str:
+        """Build the canonical state package handed to the model each turn.
+
+        The draft lives on the server, not in the model's memory. Every turn the model
+        is re-anchored to the authoritative state as JSON rather than prose, so a
+        dropped or misremembered detail from an earlier turn cannot steer the draft.
+
+        The category profile is injected here because the right writing style depends
+        on what is being sold, and that is only knowable once there is a title.
         """
-        Zengin context oluştur - Brain'in durumu anlaması için
-        """
-        lines = ["## 📍 MEVCUT DURUM"]
-        
-        # FSM State
-        state_emoji = {"IDLE": "🆕", "DRAFTING": "✏️", "READY": "✅"}.get(fsm_state, "❓")
-        state_desc = {
-            "IDLE": "Yeni başlıyor, henüz ilan oluşturma başlamadı",
-            "DRAFTING": "İlan oluşturuluyor, bazı bilgiler eksik",
-            "READY": "İlan hazır, kullanıcı onayı bekleniyor"
-        }.get(fsm_state, "Bilinmiyor")
-        lines.append(f"**Durum:** {state_emoji} {fsm_state} - {state_desc}")
-        
-        # Last Intent
-        if last_intent:
-            lines.append(f"**Son işlem:** {last_intent}")
-        
-        # Current Listing Data
-        if current_listing:
-            lines.append("\n**Mevcut İlan Verisi:**")
-            lines.append("```json")
-            lines.append(json.dumps(current_listing, ensure_ascii=False, indent=2))
-            lines.append("```")
-            
-            # Filled fields
-            filled = [k for k, v in current_listing.items() if v]
-            if filled:
-                lines.append(f"✅ Dolu alanlar: {', '.join(filled)}")
-        else:
-            lines.append("\n**Mevcut İlan Verisi:** Henüz yok (yeni başlıyor)")
-        
-        # Missing Fields
+        listing = current_listing if isinstance(current_listing, dict) else {}
+
+        # Category is inferred only to pick the writing profile. It is never shown to
+        # the model as a field it could fill: the FSM owns the real value.
+        category = None
+        try:
+            from services.category_library import classify_category
+
+            probe = f"{listing.get('title') or ''} {listing.get('description') or ''}".strip()
+            if probe:
+                category = classify_category(probe)
+        except Exception:
+            category = None
+
+        state = {
+            "phase": fsm_state,
+            "last_intent": last_intent,
+            "current_draft": {
+                "title": listing.get("title"),
+                "description": listing.get("description"),
+                "price": listing.get("price"),
+                "location": listing.get("location"),
+                "condition": listing.get("condition"),
+            },
+            "missing_required_fields": missing_fields,
+            "attached_image_count": len(listing.get("images") or []),
+        }
+
+        state_json = json.dumps(state, ensure_ascii=False, indent=2)
+        blocks = [
+            "## MEVCUT DURUM (sunucudaki kanonik taslak)\n"
+            f"```json\n{state_json}\n```"
+        ]
+
         if missing_fields:
-            lines.append(f"⏳ **Eksik zorunlu alanlar:** {', '.join(missing_fields)}")
-            lines.append("→ Bu alanları kullanıcıdan iste!")
-        elif fsm_state == "READY":
-            lines.append("✅ **Tüm zorunlu alanlar tamam!** Yayınlamak için onay iste.")
-        
-        # Instructions based on state
-        lines.append("\n## 📋 NE YAPMALISIN")
-        if fsm_state == "IDLE":
-            lines.append("- Yeni kullanıcı, selamla ve ne yapmak istediğini sor")
-            lines.append("- İlan vermek istiyorsa CREATE intent ile başla")
-        elif fsm_state == "DRAFTING":
-            lines.append("- Eksik alanları doğal bir şekilde sor")
-            lines.append("- Mevcut verileri KORU, üzerine ekle")
-            lines.append("- Her mesajda preview göster")
-        elif fsm_state == "READY":
-            lines.append("- İlan hazır, son preview göster")
-            lines.append("- Kullanıcıdan 'yayınla' onayı iste")
-            lines.append("- Düzenleme isterse yardımcı ol")
-        
-        return "\n".join(lines)
+            readable = {
+                "title": "başlık",
+                "description": "açıklama",
+                "price": "fiyat",
+                "location": "lokasyon",
+            }
+            names = [readable.get(f, f) for f in missing_fields]
+            blocks.append(
+                f"Eksik zorunlu alanlar: {', '.join(names)}. "
+                "En kritik olanı tek bir soruyla iste; hepsini birden sorma."
+            )
+        else:
+            blocks.append(
+                "Zorunlu alanların hepsi dolu. Kullanıcı yayınlamak isterse onaya "
+                "gönderilecek; sen önizleme basma."
+            )
+
+        if category:
+            blocks.append(render_profile_prompt(category))
+
+        return "\n\n".join(blocks)
     
     def _build_messages(
         self,

@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Perplexity API Configuration
     perplexity_api_key: Optional[str] = None
     
+    # Shared secret between the Supabase Edge traffic controller and this backend.
+    # When set, any request claiming channel="whatsapp" must present it. Left unset the
+    # check only warns, so the backend can be deployed before the secret is provisioned.
+    internal_api_secret: Optional[str] = None
+
     # API Configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -61,6 +66,10 @@ class Settings(BaseSettings):
 
     # Feature flags
     enable_metadata_keyword_search: bool = True
+    # Hide listings whose expires_at has passed. OFF by default: nothing currently moves
+    # an expired listing out of status='active', so enabling this without a renewal/expiry
+    # job would hide most of the live catalogue. Turn on once expiry is actually managed.
+    hide_expired_listings: bool = False
     
     # Rate Limiting
     rate_limit_per_minute: int = 60

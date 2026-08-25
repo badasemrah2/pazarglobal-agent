@@ -79,6 +79,16 @@ class ButtonResponse(BaseModel):
 class MessageResponse(BaseModel):
     success: bool = True
     text: str
+    # WEBCHAT-ONLY HINT. `text` must always stand on its own.
+    #
+    # WhatsApp cannot show these. Its Business API only renders interactive replies through
+    # pre-registered Content Templates (max 3 quick replies, ~20 char labels, created
+    # ahead of time), which cannot carry the per-message labels generated here - and the
+    # bridge sends plain `body=` text anyway. So on WhatsApp the seller always types their
+    # answer, which is why FSM_COMMANDS accepts a wide range of natural confirmations.
+    #
+    # As of today the web ChatBox does not render them either, so nothing displays these
+    # at all; that they were never missed is itself evidence that `text` carries the flow.
     buttons: List[ButtonResponse] = []
     listing_preview: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = {}
@@ -195,7 +205,14 @@ def _session_key(user_id: str, channel: str) -> str:
 
 
 async def load_session(user_id: str, channel: str) -> Dict[str, Any]:
-    """Load session from Redis (scoped by channel)"""
+    """Load session from Redis (scoped by channel).
+
+    NOTE: this rebuilds a fixed dict, so any key not listed here is dropped on every turn
+    even though it was written to Redis. `description_confirmed_claims` and
+    `user_statements` used to be exactly that: the description guard re-derived the user's
+    confirmed claims from scratch each turn, so a detail the user gave in turn 1 counted as
+    unverified by turn 2 and was stripped back out of their own listing.
+    """
     session_id = _session_key(user_id, channel)
     session = await redis_client.get_session(session_id) or {}
     return {
@@ -210,6 +227,14 @@ async def load_session(user_id: str, channel: str) -> Dict[str, Any]:
         "fsm_state": session.get("fsm_state", FSM_STATE_IDLE),
         "pending_publish_balance": session.get("pending_publish_balance"),
         "pending_publish_cost": session.get("pending_publish_cost"),
+        # Ground truth for the description guard: what the user actually said, verbatim.
+        _SESSION_DESCRIPTION_CLAIMS_KEY: session.get(_SESSION_DESCRIPTION_CLAIMS_KEY, []),
+        _SESSION_USER_STATEMENTS_KEY: session.get(_SESSION_USER_STATEMENTS_KEY, []),
+        # Price research context, also previously lost between turns.
+        "last_price_query": session.get("last_price_query"),
+        "last_suggested_price": session.get("last_suggested_price"),
+        # Fingerprint of the last preview shown, so an unchanged draft is not re-printed.
+        "last_preview_signature": session.get("last_preview_signature"),
     }
 
 
@@ -229,18 +254,38 @@ async def clear_session(user_id: str, channel: str):
     await redis_client.delete_session(session_id)
 
 
-def _is_show_more_command(lower_msg: str) -> bool:
-    msg = (lower_msg or "").strip().lower()
-    triggers = [
-        "daha fazla göster",
-        "daha fazla",
-        "devamını göster",
-        "devamini goster",
-        "devamını",
-        "devamini",
-        "devam",
+def _draft_signature(listing: Optional[Dict[str, Any]]) -> str:
+    """Stable fingerprint of the fields a preview actually shows.
+
+    Used to decide whether a preview would tell the user anything new. Re-printing an
+    identical preview turn after turn is what made the flow feel like a form.
+    """
+    data = listing if isinstance(listing, dict) else {}
+    parts = [
+        str(data.get("title") or ""),
+        str(data.get("description") or ""),
+        str(data.get("price") or ""),
+        str(data.get("location") or ""),
+        str(data.get("condition") or ""),
+        str(len(_filter_valid_images(data.get("images")))),
     ]
-    return any(trigger in msg for trigger in triggers)
+    return "|".join(parts)
+
+
+def _is_show_more_command(lower_msg: str) -> bool:
+    """Is this message *only* a request for the next page of search results?
+
+    This used to be a substring test, so "devam edelim, konum İstanbul" - a perfectly
+    normal drafting message - matched "devam" and got answered with search pagination
+    whenever a stale search cache happened to exist. It now has to be the whole message.
+    """
+    msg = re.sub(r"[.!?\s]+$", "", (lower_msg or "").strip().lower())
+    exact = {
+        "daha fazla göster", "daha fazla goster", "daha fazla",
+        "devamını göster", "devamini goster", "devamını", "devamini",
+        "devam", "devam et", "sonraki", "sonraki sayfa", "diğerleri", "digerleri",
+    }
+    return msg in exact
 
 
 def _normalize_intent_text(text: str) -> str:
@@ -277,53 +322,18 @@ def _looks_like_price_research_request(message: str) -> bool:
     if any(p in msg for p in typo_phrases):
         return True
 
-    # Fallback token logic for colloquial variants
-    has_price_signal = any(t in msg for t in ["fiyat", "piyasa", "deger", "eder", "ortalama"])
-    has_question_signal = any(t in msg for t in ["?", "nedir", "ne", "kac", "kaca", "ne kadar", "arastir", "soyler misin"])
+    # Fallback token logic for colloquial variants.
+    # These are matched on word boundaries: "ne" as a substring also lives inside "yeni",
+    # "genel" and "sonra", so any sentence mentioning a price used to be routed to
+    # Perplexity - "fiyat yeni: 25000" was a price-research request as far as this was
+    # concerned.
+    has_price_signal = bool(re.search(r"\b(fiyat\w*|piyasa\w*|deger\w*|eder|ortalama)\b", msg))
+    has_question_signal = bool(
+        "?" in msg or re.search(r"\b(nedir|ne|kac|kaca|nekadar|arastir\w*|soyler)\b", msg)
+    )
     return has_price_signal and has_question_signal
 
 
-def _detect_enrichment_action(message: str) -> Optional[str]:
-    """Detect title/description improvement requests from natural language.
-
-    This is a soft, semantic guard for hybrid flow:
-    - user keeps chatting naturally
-    - deterministic enrichment action is selected in background
-    """
-    msg = _normalize_intent_text(message)
-    if not msg:
-        return None
-
-    verbs = [
-        "iyilestir", "duzelt", "gelistir", "guzellestir", "guncelle", "oner", "onerir misin", "yazar misin",
-        "yaz", "yeniden yaz", "kisalt", "uzat", "parlat", "sadelestir",
-    ]
-    refinement_hints = [
-        "daha iyi", "daha guzel", "guzel", "profesyonel", "yeniden",
-        "kisalt", "uzat", "parlat", "akici", "detayli", "kisa", "sade",
-    ]
-    has_verb = any(v in msg for v in verbs)
-    has_refinement_hint = any(h in msg for h in refinement_hints)
-    if not (has_verb or has_refinement_hint):
-        return None
-
-    title_terms = ["baslik", "baslig", "title", "ilan baslig"]
-    desc_terms = ["aciklama", "aciklam", "description", "metin", "metn", "ilan metni", "ilan aciklam"]
-
-    has_title = any(t in msg for t in title_terms)
-    has_desc = any(t in msg for t in desc_terms)
-
-    if has_title:
-        return "suggest_title"
-
-    if has_desc:
-        # "sablon", "olustur" gibi taleplerde yeni aciklama olustur;
-        # aksi durumda mevcut aciklamayi iyilestir.
-        if any(t in msg for t in ["sablon", "olustur", "yeni", "sifirdan"]):
-            return "suggest_description"
-        return "improve_text"
-
-    return None
 
 
 _DESCRIPTION_PRICE_PATTERN = re.compile(
@@ -333,10 +343,16 @@ _DESCRIPTION_PRICE_PATTERN = re.compile(
 _DESCRIPTION_PRICE_WORD_PATTERN = re.compile(r"\bfiyat[ıi]?\b", flags=re.IGNORECASE)
 _DESCRIPTION_DAMAGE_PATTERN = re.compile(r"\bhasarl[ıi]\b", flags=re.IGNORECASE)
 _DESCRIPTION_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
+# Turkish is agglutinative: "kutu" surfaces as kutulu / kutusu / kutusuz / kutuda.
+# The original patterns only allowed -lu/-suz, so "kutusu mevcuttur" and "sertifikası
+# vardır" walked straight past the guard. These must stay symmetric with the extraction
+# patterns in _extract_confirmed_description_claims: if the guard can recognise a surface
+# form the extractor cannot, it deletes wording the seller actually used.
 _DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS: Dict[str, re.Pattern] = {
-    "kutu": re.compile(r"\bkutu(?:lu|suz)?\b", flags=re.IGNORECASE),
-    "sertifika": re.compile(r"\bsertifika(?:l[ıi]|s[ıi]z)?\b", flags=re.IGNORECASE),
-    "sinirli": re.compile(r"\bs[ıi]n[ıi]rl[ıi](?:\s+[üu]retim)?\b", flags=re.IGNORECASE),
+    # Enumerated rather than \w* so the unrelated word "kutup" is not swept up.
+    "kutu": re.compile(r"\bkutu(?:lu|luk|su|suz|sunda|sundan|yla|yu|da|dan)?\b", flags=re.IGNORECASE),
+    "sertifika": re.compile(r"\bsertifika\w*", flags=re.IGNORECASE),
+    "sinirli": re.compile(r"\bs[ıi]n[ıi]rl[ıi]\w*(?:\s+[üu]retim\w*)?", flags=re.IGNORECASE),
 }
 _DESCRIPTION_CONFIRMABLE_CLAIM_LABELS = {
     "kutu": "kutu",
@@ -379,6 +395,11 @@ _DESCRIPTION_SEED_PREFIX_PATTERNS = [
     ),
 ]
 _SESSION_DESCRIPTION_CLAIMS_KEY = "description_confirmed_claims"
+# Append-only archive of what the user actually typed this draft. It is the provenance
+# source the description guard checks against, and it is never published - it only decides
+# whether a verifiable claim in the generated copy is allowed to stay.
+_SESSION_USER_STATEMENTS_KEY = "user_statements"
+_MAX_USER_STATEMENTS = 30
 _DESCRIPTION_REMOVAL_PATTERNS = [
     re.compile(
         r"(?:açıklamadan|aciklamadan|metinden|ilan metninden)\s+[\"'“”]?(?P<phrase>.+?)[\"'“”]?\s+(?:ifadesini|kelimesini|bilgisini)?\s*(?:sil|kaldır|kaldir|çıkar|cikar)(?:\s+gitsin)?\s*$",
@@ -406,11 +427,12 @@ def _extract_confirmed_description_claims(text: str) -> set[str]:
         return claims
 
     normalized = normalize_for_match(text)
-    if re.search(r"\bkutu(?:lu|suz)?\b", normalized, flags=re.IGNORECASE):
+    # Kept deliberately in step with _DESCRIPTION_CONFIRMABLE_CLAIM_PATTERNS above.
+    if re.search(r"\bkutu(?:lu|luk|su|suz|sunda|sundan|yla|yu|da|dan)?\b", normalized, flags=re.IGNORECASE):
         claims.add("kutu")
-    if re.search(r"\bsertifika(?:li|siz)?\b", normalized, flags=re.IGNORECASE):
+    if re.search(r"\bsertifika\w*", normalized, flags=re.IGNORECASE):
         claims.add("sertifika")
-    if re.search(r"\bsinirli(?:\s+uretim)?\b", normalized, flags=re.IGNORECASE):
+    if re.search(r"\bsinirli\w*", normalized, flags=re.IGNORECASE):
         claims.add("sinirli")
     for claim_key, pattern in _DESCRIPTION_DELIVERY_CLAIM_PATTERNS.items():
         if pattern.search(text):
@@ -461,12 +483,43 @@ def _remove_description_claims(session: Dict[str, Any], *texts: str) -> None:
         session.pop(_SESSION_DESCRIPTION_CLAIMS_KEY, None)
 
 
+def _get_user_statements(session: Dict[str, Any]) -> List[str]:
+    raw = session.get(_SESSION_USER_STATEMENTS_KEY) or []
+    if not isinstance(raw, list):
+        return []
+    return [str(entry) for entry in raw if str(entry).strip()]
+
+
+def _remember_user_statement(session: Dict[str, Any], message: str) -> None:
+    """Append a raw user message to the provenance archive for this draft."""
+    text = str(message or "").strip()
+    if not text:
+        return
+
+    statements = _get_user_statements(session)
+    if statements and statements[-1] == text:
+        return  # ignore an exact repeat (retries, duplicate webhooks)
+
+    statements.append(text)
+    session[_SESSION_USER_STATEMENTS_KEY] = statements[-_MAX_USER_STATEMENTS:]
+
+
 def _collect_confirmed_description_claims(
     session: Dict[str, Any],
     listing: Optional[Dict[str, Any]] = None,
     message: str = "",
 ) -> set[str]:
+    """Everything the user has verifiably told us across the whole draft.
+
+    Reads the full statement archive, not just the current turn: a detail given three
+    messages ago is still something the user said, and the generated copy is allowed to
+    keep it.
+    """
     claims = _get_session_description_claims(session)
+
+    for statement in _get_user_statements(session):
+        claims.update(_extract_confirmed_description_claims(statement))
+
     if listing and isinstance(listing, dict):
         claims.update(_extract_confirmed_description_claims(str(listing.get("title") or "")))
     if message:
@@ -755,7 +808,11 @@ def _classify_draft_message_intent(message: str) -> Optional[str]:
     if _should_try_direct_edit(message):
         return "field_update"
 
-    return _detect_enrichment_action(message)
+    # Copy improvement requests ("başlığı daha güzel yaz") intentionally return None:
+    # they belong to the Brain, which carries the category writing profile. Note that
+    # _should_try_direct_edit must still reject them, so they are not mistaken for a
+    # literal field edit - see _looks_like_enrichment_only_value.
+    return None
 
 
 async def _format_search_continuation_page(listings: List[Dict[str, Any]], start_idx: int, page_size: int = 5) -> str:
@@ -838,7 +895,15 @@ class FSMEngine:
         """
         missing = []
 
-        # Normalize text fields to TR/EN keyboard-safe alphabet + sentence case
+        # Normalize text fields to the TR/EN keyboard-safe alphabet, and sentence-case
+        # only text that clearly needs it.
+        #
+        # sentence_case_tr applies Turkish casing to the first letter of each sentence, so
+        # it turns "iPhone 15 Pro" into "İPhone 15 Pro". That was tolerable when the copy
+        # arrived flattened to lowercase anyway; now that the assistant writes properly
+        # cased listing copy, re-casing it does more damage than good. It is only applied
+        # to text with no capitals at all - the "user typed everything lowercase" case it
+        # was written for.
         try:
             from services.text_normalization import normalize_keyboard_text, sentence_case_tr
 
@@ -846,7 +911,9 @@ class FSMEngine:
                 raw_val = listing_data.get(key)
                 if isinstance(raw_val, str) and raw_val.strip():
                     normalized = normalize_keyboard_text(raw_val)
-                    listing_data[key] = sentence_case_tr(normalized)
+                    if not any(ch.isupper() for ch in normalized):
+                        normalized = sentence_case_tr(normalized)
+                    listing_data[key] = normalized
         except Exception:
             pass
 
@@ -921,12 +988,21 @@ class FSMEngine:
         condition = str(listing_data.get("condition") or "")
         location = str(listing_data.get("location") or "")
 
-        haystack = normalize_for_match(f"{category} {title} {desc}")
+        from services.text_normalization import lower_tr, normalize_keyboard_text
+
+        # Recall helpers key off category and title only. Scanning the description meant a
+        # single incidental word triggered a whole synonym family: a Mudanya flat whose
+        # description said "telefon" was indexed as "telefon, cep telefonu, akıllı telefon"
+        # and surfaced in phone searches.
+        haystack = normalize_for_match(f"{category} {title}")
         tokens: List[str] = []
 
         stop = {
             "satilik", "kiralik", "urun", "esya", "temiz", "kullanilmis",
             "fiyat", "tl", "acil", "hemen", "durumda",
+            # Turkish function words: pure noise that used to eat the token budget.
+            "ve", "ile", "veya", "bir", "bu", "icin", "için", "ise", "yani",
+            "sira", "sıra", "olan", "olarak",
         }
 
         # Category-level recall helpers
@@ -941,8 +1017,19 @@ class FSMEngine:
         if any(k in haystack for k in ["laptop", "notebook", "lenovo", "dell", "asus", "hp", "macbook"]):
             tokens.extend(["bilgisayar", "laptop", "notebook"])
 
-        for src in [title, desc, category, condition, location]:
-            for t in re.findall(r"[0-9a-zçğıöşü\+]{2,}", (src or "").lower(), flags=re.IGNORECASE):
+        # Order matters: the cap below truncates, so the short high-signal fields go
+        # first and the long description spends whatever budget is left.
+        for src in [title, category, condition, location, desc]:
+            # lower_tr(), not .lower(): Python maps the Turkish dotted capital İ to
+            # "i" + U+0307 (combining dot), which the character class below rejects, so
+            # "İstanbul" indexed as "stanbul" and never matched a search for "istanbul".
+            # search_listings() lowercases the query the same way, so both sides agree.
+            normalized_src = lower_tr(normalize_keyboard_text(src or ""))
+            # Contact numbers live in some descriptions. Indexing them would make a
+            # seller's phone number a searchable term, which the publish flow deliberately
+            # avoids everywhere else.
+            normalized_src = re.sub(r"\+?\d[\d\s().-]{7,}\d", " ", normalized_src)
+            for t in re.findall(r"[0-9a-zçğıöşü\+]{2,}", normalized_src, flags=re.IGNORECASE):
                 w = t.strip("+").strip()
                 if not w or w in stop:
                     continue
@@ -955,7 +1042,7 @@ class FSMEngine:
                 continue
             seen.add(w)
             deduped.append(w)
-            if len(deduped) >= 20:
+            if len(deduped) >= 40:
                 break
 
         return " ".join(deduped)
@@ -1121,17 +1208,52 @@ class FSMEngine:
             if prohibited_term:
                 return False, "🚫 Bu içerik platform politikalarına aykırı olduğu için yayınlanamaz.", None
             
-            # 2. Wallet check
-            has_enough, balance = await cls.check_wallet(user_id)
-            if not has_enough:
-                return False, f"💳 Bakiyeniz yetersiz (Mevcut: {balance:.0f} TL). İlan yayınlamak için 55 TL gerekiyor.", None
-            
-            # 3. Deduct credit
-            if not await cls.deduct_credit(user_id):
-                return False, "Kredi düşürülemedi. Lütfen tekrar deneyin.", None
-            
-            # 4. Prepare listing for Supabase
+            # 2-3. Reserve the publish credit atomically.
+            # The listing id doubles as the reservation's idempotency key, so it has to
+            # exist before the charge: a retried webhook then reuses the same reference
+            # instead of billing the user twice.
             listing_id = str(uuid.uuid4())
+            cost = int(getattr(settings, "listing_credit_cost", 55) or 55)
+
+            reservation = await supabase_client.reserve_listing_credit(user_id, cost, listing_id)
+            credit_reserved = bool(reservation.get("success"))
+            legacy_promo = False
+
+            if not credit_reserved and reservation.get("error") == "rpc_unavailable":
+                # migrations/005_atomic_listing_credit.sql is not applied yet. Keep
+                # publishing via the legacy read-modify-write path so a missing migration
+                # never takes the flow down; the race stays open until it is applied.
+                has_enough, balance = await cls.check_wallet(user_id, cost)
+                if not has_enough:
+                    return False, f"💳 Bakiyeniz yetersiz (Mevcut: {balance:.0f} TL). İlan yayınlamak için {cost} TL gerekiyor.", None
+
+                # check_wallet reports this sentinel balance only while the promo window
+                # is active, which is also when deduct_credit deliberately charges nothing.
+                legacy_promo = balance >= 10**12
+
+                if not await cls.deduct_credit(user_id, cost):
+                    return False, "Kredi düşürülemedi. Lütfen tekrar deneyin.", None
+
+            elif not credit_reserved:
+                error = str(reservation.get("error") or "")
+                if error == "insufficient_balance":
+                    balance = float(reservation.get("balance") or 0)
+                    return False, f"💳 Bakiyeniz yetersiz (Mevcut: {balance:.0f} TL). İlan yayınlamak için {cost} TL gerekiyor.", None
+                if error == "wallet_not_found":
+                    return False, "Cüzdan bulunamadı. Lütfen tekrar deneyin.", None
+                logger.error(f"Credit reservation failed for {user_id}: {reservation}")
+                return False, "Kredi düşürülemedi. Lütfen tekrar deneyin.", None
+
+            async def release_credit() -> None:
+                """Undo the charge, via whichever path actually took the money."""
+                if credit_reserved:
+                    await supabase_client.refund_listing_credit(user_id, listing_id)
+                elif not legacy_promo:
+                    # Never refund a promo user: they were not charged, so a refund would
+                    # hand them credits they never spent.
+                    await cls.deduct_credit(user_id, -float(cost))
+
+            # 4. Prepare listing for Supabase
             
             # Generate keywords
             keywords_text = cls.generate_keywords(listing_data)
@@ -1215,6 +1337,16 @@ class FSMEngine:
             except Exception:
                 pass
 
+            # The seller asked for their number in the listing text. It is appended here,
+            # from the verified profile, and never from whatever number was typed into
+            # chat - a pasted number could be wrong or belong to someone else.
+            if listing_data.get("include_phone_in_description") and user_phone:
+                description = str(final_listing.get("description") or "").strip()
+                if user_phone not in description:
+                    final_listing["description"] = (
+                        f"{description}\n\nİletişim: {user_phone}".strip()[:2000]
+                    )
+
             final_listing["user_name"] = user_name
             final_listing["user_phone"] = user_phone
             final_listing["phone_visibility"] = phone_visibility
@@ -1230,17 +1362,25 @@ class FSMEngine:
             except Exception as insert_err:
                 logger.error(f"Supabase insert exception: {insert_err}", exc_info=True)
                 logger.error(f"Failed listing data: {final_listing}")
-                # Refund credit
-                await cls.deduct_credit(user_id, -55.0)
+                await release_credit()
                 return False, f"İlan kaydedilemedi: {str(insert_err)}", None
             
             if not result.data:
                 logger.error(f"Supabase insert returned no data. Result: {result}")
-                # Refund credit
-                await cls.deduct_credit(user_id, -55.0)
+                await release_credit()
                 return False, "İlan kaydedilemedi. Lütfen tekrar deneyin.", None
             
             logger.info(f"Listing published successfully: {listing_id}")
+
+            # Search results are cached in Redis with no write-through invalidation.
+            # Without this the freshly published listing stays invisible to search until
+            # the cache TTL expires.
+            try:
+                cleared = await redis_client.clear_search_cache()
+                logger.info(f"Search cache invalidated after publish ({cleared} keys)")
+            except Exception as cache_err:
+                logger.warning(f"Search cache invalidation failed after publish: {cache_err}")
+
             return True, "İlan başarıyla yayınlandı!", listing_id
             
         except Exception as e:
@@ -1254,20 +1394,35 @@ class FSMEngine:
 
 # FSM Commands (deterministic, LLM bypassed)
 # IMPORTANT: In PENDING_CONFIRMATION state, these commands trigger direct action without LLM
+# Only consulted in PENDING_CONFIRMATION, where the assistant has just asked one yes/no
+# question, so words that are ambiguous anywhere else ("tamam", "olur") can only mean one
+# thing here. Guardrails.detect_confirmation stays narrow precisely because it runs in
+# every state.
+#
+# The list is deliberately generous. On WhatsApp there are no buttons to press - the
+# platform only supports quick replies through pre-registered Content Templates, which
+# cannot carry the per-message labels this agent generates - so the reply is always
+# free-typed. A confirmation the map does not recognise silently falls through to the LLM,
+# drops back to DRAFTING and leaves the seller wondering why nothing was published.
+#
+# Matching stays whole-message on purpose: "evet ama fiyatı değiştir" must NOT publish.
 FSM_COMMANDS = {
-    # Confirmation commands
-    "onayla": "CONFIRM",
-    "onaylıyorum": "CONFIRM",
-    "evet onayla": "CONFIRM",
-    "yayınla": "CONFIRM",  # In PENDING_CONFIRMATION state, "yayınla" = final confirm
-    "yayinla": "CONFIRM",  # Turkish keyboard variation
-    "evet": "CONFIRM",
-    "evet yayınla": "CONFIRM",
-    # Cancel commands
-    "iptal": "CANCEL",
-    "vazgeçtim": "CANCEL",
-    "iptal et": "CANCEL",
-    "hayır": "CANCEL",
+    cmd: "CONFIRM"
+    for cmd in (
+        "onayla", "onaylıyorum", "onayliyorum", "onaylayalım", "onaylayalim",
+        "onaylıyorum yayınla", "evet onayla", "evet yayınla", "evet yayinla",
+        "yayınla", "yayinla", "yayınlayalım", "yayinlayalim", "yayına al", "yayina al",
+        "evet", "evet lütfen", "evet lutfen", "tamam", "tamamdır", "tamamdir",
+        "olur", "olsun", "peki", "hadi", "hadi yayınla", "hadi yayinla",
+        "oldu", "uygun", "kabul", "kabul ediyorum", "onay",
+    )
+} | {
+    cmd: "CANCEL"
+    for cmd in (
+        "iptal", "iptal et", "iptal edelim", "vazgeç", "vazgeçtim", "vazgec", "vazgectim",
+        "hayır", "hayir", "yok", "olmaz", "istemiyorum", "dur", "boş ver", "bos ver",
+        "şimdilik olmasın", "simdilik olmasin",
+    )
 }
 
 # FSM Edit commands (deterministic, LLM bypassed)
@@ -1651,7 +1806,9 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
         logger.error(f"FSM: Failed to get wallet balance for {user_id}: {e}")
         balance = 0
     
-    credit_cost = 55
+    # Same source of truth as FSMEngine.publish, so the preview cannot promise a
+    # different price than the one actually charged.
+    credit_cost = int(getattr(settings, "listing_credit_cost", 55) or 55)
     
     # Kategori gösterimi (FSM tarafından belirlendi)
     category_display = listing.get('category', 'Diğer')
@@ -1664,41 +1821,34 @@ async def _fsm_show_confirmation_preview(user_id: str, channel: str, session: Di
     except Exception:
         sentence_case_tr = lambda s: s
 
-    preview = f"""📋 **YAYIN ÖNCESİ KONTROL**
+    # Last screen before money moves, so it stays explicit about the charge - but it
+    # reads like a question, not a control panel. The old version printed a boxed
+    # "YAYIN ONCESI KONTROL" form and then taught the reader command syntax
+    # ("Onayla: `onayla`", "baslik: Yeni Baslik"), which is most of what made the
+    # whole flow feel like software rather than an assistant.
+    photo_count = len(_filter_valid_images(listing.get('images')))
+    photo_note = f"{photo_count} fotoğraf" if photo_count else "fotoğrafsız"
 
-**BAŞLIK:**
-{sentence_case_tr(listing.get('title', '—'))}
+    money_line = (
+        f"Yayınlamak {credit_cost} kredi düşürecek; {balance:,.0f} krediniz var."
+        if balance >= credit_cost
+        else f"Yayın ücreti {credit_cost} kredi ama bakiyeniz {balance:,.0f}. Yüklemeden yayınlayamıyorum."
+    )
 
-**AÇIKLAMA:**
-{sentence_case_tr(listing.get('description', '—'))}
+    closing = (
+        "Onaylıyor musunuz? Değiştirmek istediğiniz bir şey varsa da söyleyin."
+        if balance >= credit_cost
+        else "Kredi yükledikten sonra kaldığımız yerden devam edebiliriz."
+    )
 
-**FİYAT:**
-{listing.get('price', 0):,.0f} ₺
-
-**DURUM:**
-{listing.get('condition', '2. El')}
-
-**KATEGORİ:**
-{category_display} ✅ (Sistem tarafından belirlendi)
-
-**LOKASYON:**
-{sentence_case_tr(listing.get('location', 'Belirtilmemiş'))}
-
-**FOTOĞRAFLAR:**
-{len(listing.get('images', []))} adet
-
-─────────────────────────
-💳 **Mevcut bakiyeniz:** {balance:,.0f} kredi
-💰 **Yayın ücreti:** {credit_cost} kredi
-{"✅ Bakiye yeterli" if balance >= credit_cost else "❌ Bakiye yetersiz!"}
-
-─────────────────────────
-🛠️ **KOMUTLAR**
-👉 Onayla: `onayla`
-👉 İptal: `iptal`
-👉 Düzenle: değişiklik için yazın (örn: "başlık: Yeni Başlık")
-
-İlanınızı yayınlamak için **onayla** yazın."""
+    preview = (
+        f"**{sentence_case_tr(listing.get('title') or '—')}**\n"
+        f"{listing.get('price', 0):,.0f} ₺ · {sentence_case_tr(listing.get('location') or 'Konum belirtilmemiş')} · "
+        f"{listing.get('condition') or '2. El'} · {category_display} · {photo_note}\n\n"
+        f"{sentence_case_tr(listing.get('description') or '—')}\n\n"
+        f"{money_line}\n\n"
+        f"{closing}"
+    )
 
     # Update session state with auto-categorized listing
     session["listing_data"] = listing  # Save with auto-category
@@ -1994,7 +2144,8 @@ async def _apply_description_removal_request(user_id: str, channel: str, session
 @router.post("/message", response_model=MessageResponse)
 async def handle_message(
     request: MessageRequest,
-    authorization: Optional[str] = Header(default=None, alias="Authorization")
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    internal_secret: Optional[str] = Header(default=None, alias="X-Internal-Secret"),
 ) -> MessageResponse:
     """
     V3 Gateway - LLM Brain + FSM Engine
@@ -2009,10 +2160,14 @@ async def handle_message(
         # ═══════════════════════════════════════════════════════════════════
         # 0. SECURITY: Verify user_id based on channel
         # ═══════════════════════════════════════════════════════════════════
+        # NOTE: request.channel is client-controlled. The "whatsapp" value skips JWT
+        # verification, so it is only trusted when the shared internal secret proves the
+        # request came from our Edge traffic controller.
         is_valid, verified_user_id, auth_error = await get_user_id_from_request(
             authorization=authorization,
             request_user_id=request.user_id,
-            channel=request.channel
+            channel=request.channel,
+            internal_secret=internal_secret,
         )
         
         if not is_valid:
@@ -2030,6 +2185,12 @@ async def handle_message(
         
         # 1. Load session (channel scoped)
         session = await load_session(user_id, request.channel)
+
+        # Record what the user said before anything else looks at it. This archive is the
+        # provenance source for the description guard, so it has to capture every turn
+        # regardless of which branch below handles the message.
+        _remember_user_statement(session, request.message or "")
+        await save_session(user_id, request.channel, session)
 
         # Ensure created_via is tracked for consistent metadata
         if request.channel in ("webchat", "whatsapp"):
@@ -2095,24 +2256,29 @@ async def handle_message(
                 await save_session(user_id, request.channel, session)
 
         # 1.1 Draft TTL check (10 minutes)
+        def _reset_draft() -> None:
+            """Abandon the current draft. The provenance archive belongs to that draft,
+            so it has to reset with it - otherwise claims from a previous product would
+            authorise details in the next one."""
+            session["listing_data"] = {}
+            session["state"] = "IDLE"
+            session["fsm_state"] = FSM_STATE_IDLE
+            session["draft_updated_at"] = None
+            session["last_intent"] = None
+            session[_SESSION_DESCRIPTION_CLAIMS_KEY] = []
+            # Keep the current turn's message: the user is starting a new draft with it.
+            session[_SESSION_USER_STATEMENTS_KEY] = _get_user_statements(session)[-1:]
+
         draft_updated_at = session.get("draft_updated_at")
         if draft_updated_at:
             try:
                 last_ts = datetime.fromisoformat(draft_updated_at)
                 if (datetime.utcnow() - last_ts).total_seconds() > 600:
-                    session["listing_data"] = {}
-                    session["state"] = "IDLE"
-                    session["fsm_state"] = FSM_STATE_IDLE
-                    session["draft_updated_at"] = None
-                    session["last_intent"] = None
+                    _reset_draft()
                     await save_session(user_id, request.channel, session)
             except Exception:
                 # If parsing fails, reset draft defensively
-                session["listing_data"] = {}
-                session["state"] = "IDLE"
-                session["fsm_state"] = FSM_STATE_IDLE
-                session["draft_updated_at"] = None
-                session["last_intent"] = None
+                _reset_draft()
                 await save_session(user_id, request.channel, session)
 
         # ═══════════════════════════════════════════════════════════════════
@@ -2151,18 +2317,10 @@ async def handle_message(
                 logger.info("FSM: PENDING_CONFIRMATION state, deterministic edit detected, bypassing LLM")
                 return await _fsm_handle_edit_request(user_id, request.channel, session, request.message or "")
 
-            if draft_message_intent in {"suggest_title", "improve_text", "suggest_description"}:
-                session["fsm_state"] = FSM_STATE_DRAFTING
-                await save_session(user_id, request.channel, session)
-                logger.info("FSM: PENDING_CONFIRMATION state, deterministic enrichment detected, bypassing LLM")
-                improved = await _handle_enrichment_action(
-                    user_id=user_id,
-                    channel=request.channel,
-                    session=session,
-                    action=draft_message_intent,
-                )
-                if improved is not None:
-                    return improved
+            # Copy improvement requests ("daha güzel yaz") deliberately fall through to
+            # the LLM now: it carries the category writing profile and composes listing
+            # copy by default, so intercepting these with a regex produced a canned reply
+            # from a second, less informed prompt.
 
             # Not a command or deterministic edit - allow free-form edits via LLM
             session["fsm_state"] = FSM_STATE_DRAFTING
@@ -2182,16 +2340,7 @@ async def handle_message(
                     logger.info("FSM: DRAFTING deterministic description removal handled before LLM")
                     return deterministic_remove_response
 
-            if draft_message_intent in {"suggest_title", "improve_text", "suggest_description"}:
-                deterministic_enrichment = await _handle_enrichment_action(
-                    user_id=user_id,
-                    channel=request.channel,
-                    session=session,
-                    action=draft_message_intent,
-                )
-                if deterministic_enrichment is not None:
-                    logger.info("FSM: DRAFTING deterministic enrichment handled before LLM")
-                    return deterministic_enrichment
+            # Copy improvement requests fall through to the LLM (see 1.2 above).
 
             deterministic_edit_response = await _apply_drafting_edit_request(
                 user_id,
@@ -2321,25 +2470,12 @@ async def handle_message(
                 metadata={"intent": "PRICE_RESEARCH", "tool": "perplexity", "price": price_result.get("suggested_price")},
             )
 
-        # 3.6. Hybrid enrichment bridge (title/description improvement)
-        # Keep user in free conversation while using deterministic edge action behind the scenes.
-        enrichment_action = _detect_enrichment_action(request.message)
-        if (
-            enrichment_action
-            and not brain_output.tool_call
-            and brain_output.intent in (Intent.CHAT, Intent.CREATE)
-            and isinstance(session.get("listing_data"), dict)
-            and session.get("listing_data")
-        ):
-            improved = await _handle_enrichment_action(
-                user_id=user_id,
-                channel=request.channel,
-                session=session,
-                action=enrichment_action,
-            )
-            if improved is not None:
-                return improved
-        
+        # 3.6. The hybrid enrichment bridge used to sit here, routing "başlığı iyileştir"
+        # style messages to the ai-assistant Edge function. Those category writing rules
+        # now live in config/category_profiles.py and are injected straight into this
+        # Brain's prompt, so the detour just replaced a context-aware answer with a
+        # context-free one.
+
         # 4. Handle by intent
         if brain_output.intent == Intent.CANCEL:
             # LLM override - reset
@@ -2466,6 +2602,12 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     confirmed_claims = _collect_confirmed_description_claims(session, current, user_message)
     description_errors = _apply_ai_description_guard(current, previous_listing, confirmed_claims)
     _remember_description_claims(session, user_message)
+
+    # The seller asked for their number to appear in the listing text. Record the intent
+    # on the draft; the number itself is only ever added at publish time, from the
+    # verified profile, so a number pasted into chat cannot be published blind.
+    if brain_output.include_phone_in_description:
+        current["include_phone_in_description"] = True
     
     logger.info(f"CREATE: current listing data: {current}")
     logger.info(f"CREATE: user_confirmed={brain_output.user_confirmed}, ready_for_fsm={brain_output.ready_for_fsm}")
@@ -2502,18 +2644,45 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
     if not response_text:
         response_text = "✅ İlan bilgilerini güncelledim."
 
-    # Channels like WhatsApp may not render `listing_preview`; include a compact preview in text.
-    if channel != "webchat" and current.get("title") and "📋" not in response_text:
+    # Preview is the server's job now, on every channel: the model used to be ordered to
+    # print one in every single message, which is what made the flow read like a form.
+    #
+    # It is shown only when it carries new information - the draft is complete and looks
+    # different from the last preview the user saw. While fields are still missing the
+    # assistant just asks its one question, and repeated previews of an unchanged draft
+    # are suppressed.
+    preview_signature = _draft_signature(current)
+    if (
+        is_valid
+        and current.get("title")
+        and "📋" not in response_text
+        and preview_signature != session.get("last_preview_signature")
+    ):
         response_text = f"{response_text}\n\n{_format_preview(current)}"
+        session["last_preview_signature"] = preview_signature
+        await save_session(user_id, channel, session)
     if description_errors:
         response_text += "\n\nNot: Doğrulanmamış açıklama ifadeleri kaydedilmedi."
-    
+
+    # A value the seller wrote ambiguously ("800.000₺+") gets asked about rather than
+    # guessed. If the model already worked the question into its reply, don't repeat it.
+    ambiguities = brain_output.ambiguities or []
+    for item in ambiguities:
+        question = item.get("question", "").strip()
+        if question and question not in response_text:
+            response_text = f"{response_text}\n\n{question}".strip()
+
     # Check if user wants to publish - use direct confirmation detection on user message
     from core.brain import Guardrails
     user_wants_to_publish = Guardrails.detect_confirmation(user_message)
-    
+
+    # An unresolved ambiguity must not ride through into a published listing.
+    if ambiguities and user_wants_to_publish:
+        logger.info(f"CREATE: holding publish, unresolved ambiguities: {ambiguities}")
+        user_wants_to_publish = False
+
     logger.info(f"CREATE: is_valid={is_valid}, user_wants_to_publish={user_wants_to_publish}")
-    
+
     if user_wants_to_publish and is_valid:
         # ═══════════════════════════════════════════════════════════════════
         # NEW FSM FLOW: Show confirmation preview instead of direct publish
@@ -2566,6 +2735,7 @@ async def _handle_create(user_id: str, channel: str, session: Dict, brain_output
             "ready_for_publish": is_valid,
             "description_errors": description_errors,
             "suggestions": brain_output.suggestions,
+            "ambiguities": ambiguities,
         },
     )
 
@@ -2665,104 +2835,6 @@ async def _handle_chat(user_id: str, channel: str, session: Dict, brain_output: 
     )
 
 
-async def _handle_enrichment_action(
-    user_id: str,
-    channel: str,
-    session: Dict[str, Any],
-    action: str,
-) -> Optional[MessageResponse]:
-    listing = session.get("listing_data") or {}
-    if not isinstance(listing, dict) or not listing:
-        return MessageResponse(
-            success=True,
-            text=(
-                "Açıklama/başlık iyileştirmesi yapabilmem için önce temel ilan bilgilerini alalım.\n"
-                "Örn: `başlık: Citroen C3 2017`, `fiyat: 650000`, `lokasyon: İstanbul`"
-            ),
-            metadata={"intent": "CREATE", "enrichment_action": action, "missing": FSMEngine.REQUIRED_FIELDS.copy()},
-        )
-
-    title = str(listing.get("title") or "").strip()
-    description = str(listing.get("description") or "").strip()
-    category = str(listing.get("category") or "Diğer").strip() or "Diğer"
-    condition = str(listing.get("condition") or "2. El").strip() or "2. El"
-
-    if action == "suggest_title" and len(title) < 2:
-        return MessageResponse(
-            success=True,
-            text="Başlık iyileştirmesi için önce kısa bir başlık yazın. Örn: 'Citroen C3 2017'.",
-            metadata={"intent": "CREATE", "enrichment_action": action, "missing": ["title"]},
-        )
-
-    if action in ("improve_text", "suggest_description") and len(title) < 2:
-        return MessageResponse(
-            success=True,
-            text="Açıklamayı iyileştirmem için önce kısa bir başlık yazın. Örn: 'Citroen C3 2017'.",
-            metadata={"intent": "CREATE", "enrichment_action": action, "missing": ["title"]},
-        )
-
-    if action == "improve_text" and len(description) < 5:
-        # If description is absent, switch to template generation.
-        action = "suggest_description"
-
-    payload = {
-        "action": action,
-        "category": category,
-        "title": title,
-        "description": description,
-        "condition": condition,
-    }
-
-    edge_result = await supabase_client._call_edge_function("ai-assistant", payload)
-    if not edge_result.get("success"):
-        logger.warning(f"Enrichment edge call failed: action={action}, error={edge_result.get('error')}")
-        return None
-
-    result_text = str(edge_result.get("result") or "").strip()
-    if not result_text:
-        return None
-
-    if action == "suggest_title":
-        listing["title"] = result_text
-        ack = "✅ Başlığı iyileştirdim."
-        description_errors: List[str] = []
-    else:
-        previous_listing = dict(listing)
-        listing["description"] = result_text
-        confirmed_claims = _collect_confirmed_description_claims(session, listing)
-        description_errors = _apply_ai_description_guard(listing, previous_listing, confirmed_claims)
-        ack = "✅ Açıklamayı güncelledim."
-
-    # Re-validate and update deterministic state in background.
-    confirmed_claims = _collect_confirmed_description_claims(session, listing)
-    is_valid, missing = FSMEngine.validate(listing, confirmed_claims)
-    session["listing_data"] = listing
-    session["state"] = "READY" if is_valid else "DRAFTING"
-    session["fsm_state"] = FSM_STATE_DRAFTING
-    session["last_intent"] = "CREATE"
-    session["draft_updated_at"] = datetime.utcnow().isoformat()
-    await save_session(user_id, channel, session)
-
-    text = f"{ack}\n\n{_format_preview(listing, show_full_description=(action != 'suggest_title'))}"
-    if description_errors:
-        text += "\n\nNot: Doğrulanmamış açıklama ifadeleri kaydedilmedi."
-    return MessageResponse(
-        success=True,
-        text=text,
-        listing_preview=listing,
-        buttons=[
-            ButtonResponse(text="✅ Yayınla", payload="yayınla") if is_valid else ButtonResponse(text="✏️ Devam Et", payload="devam"),
-            ButtonResponse(text="❌ İptal", payload="iptal"),
-        ],
-        metadata={
-            "intent": "CREATE",
-            "enrichment_action": action,
-            "state": session["state"],
-            "missing_fields": missing,
-            "ready_for_publish": is_valid,
-            "description_errors": description_errors,
-        },
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════

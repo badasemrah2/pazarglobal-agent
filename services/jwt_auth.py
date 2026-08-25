@@ -4,6 +4,7 @@ JWT Authentication Service for Supabase
 Verifies Supabase JWT tokens and extracts user_id.
 Used to secure WebChat API endpoints.
 """
+import hmac
 import httpx
 import jwt
 from typing import Optional, Tuple
@@ -88,22 +89,52 @@ async def verify_supabase_token(token: str) -> Tuple[bool, Optional[str], Option
         return False, None, f"Token doğrulama hatası: {str(e)}"
 
 
+def verify_internal_secret(provided_secret: Optional[str]) -> bool:
+    """Check the shared secret that proves a request came from our Edge function.
+
+    The "whatsapp" channel skips JWT verification because the Edge traffic controller
+    already did PIN verification. But `channel` is attacker-controlled in the request
+    body, so without this check anyone who knows a user UUID could impersonate that user
+    by simply claiming channel="whatsapp". This secret is what makes that trust valid.
+
+    Returns True when the secret is not configured at all, so the backend can be deployed
+    before the secret is provisioned on Railway/Supabase. That window is logged loudly.
+    """
+    expected = (settings.internal_api_secret or "").strip()
+
+    if not expected:
+        logger.warning(
+            "⚠️ INTERNAL_API_SECRET is not configured — the whatsapp trust path is "
+            "UNAUTHENTICATED. Set it on both the backend and the Edge function."
+        )
+        return True
+
+    provided = (provided_secret or "").strip()
+    if not provided:
+        return False
+
+    return hmac.compare_digest(provided, expected)
+
+
 async def get_user_id_from_request(
     authorization: Optional[str],
     request_user_id: Optional[str],
-    channel: str
+    channel: str,
+    internal_secret: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Get verified user_id based on channel type.
     
     Security model:
     - webchat: REQUIRES valid JWT token → user_id from token
-    - whatsapp: user_id comes from Edge Function (already verified via PIN)
+    - whatsapp: user_id comes from Edge Function (already verified via PIN),
+      proven by the shared internal secret
     
     Args:
         authorization: Authorization header value
         request_user_id: user_id from request body
         channel: "webchat" or "whatsapp"
+        internal_secret: X-Internal-Secret header value (whatsapp channel only)
         
     Returns:
         (is_valid, user_id, error_message)
@@ -129,7 +160,12 @@ async def get_user_id_from_request(
     
     elif channel == "whatsapp":
         # WhatsApp: Edge Function tarafından doğrulanmış user_id
-        # Edge Function PIN doğrulaması yapıp user_id inject ediyor
+        # Edge Function PIN doğrulaması yapıp user_id inject ediyor.
+        # Bu güvenin geçerli olması için isteğin gerçekten Edge'den geldiği kanıtlanmalı.
+        if not verify_internal_secret(internal_secret):
+            logger.warning("❌ whatsapp channel rejected: missing/invalid internal secret")
+            return False, None, "Yetkisiz istek"
+
         if not request_user_id:
             return False, None, "WhatsApp: user_id gerekli (Edge Function tarafından sağlanmalı)"
         

@@ -99,12 +99,49 @@ def sentence_case_tr(text: str) -> str:
     return "".join(result)
 
 
+def lower_tr(text: str) -> str:
+    """Lowercase for indexing and querying, without breaking the Turkish dotted capital.
+
+    str.lower() maps "İ" (U+0130) to "i" + U+0307 (combining dot above). Any tokenizer
+    with an explicit character class then splits on that invisible codepoint, so
+    "İstanbul" indexes as "stanbul" and never matches a search for "istanbul".
+
+    Unlike normalize_for_match() this keeps ç/ğ/ö/ş/ü intact, because the keyword index
+    and the ilike queries run against columns that still hold them.
+    """
+    if not text:
+        return ""
+    return str(text).replace("İ", "i").lower()
+
+
+def _restore_case(source: str, mapped: str) -> str:
+    """Give `mapped` the case of the `source` character it replaced."""
+    if not source.isupper():
+        return mapped
+    # Turkish letters must not go through str.upper(): "i" would become ASCII "I" and
+    # lose its dot, and "ç"/"ş" would round-trip through the wrong casing rules.
+    if source == "İ":
+        return "İ"
+    if source in "ÇĞÖŞÜ":
+        return source
+    return mapped.upper()
+
+
 def normalize_keyboard_text(text: str) -> str:
     """Normalize text to TR/EN keyboard-safe alphabet (Turkish 29 + q/w/x).
 
     - Keeps Turkish letters (ç, ğ, ı, ö, ş, ü)
     - Maps accented variants to closest allowed letters
     - Preserves digits and punctuation
+    - **Preserves case.**
+
+    That last point matters: _CHAR_MAP is written lowercase, so this used to lowercase
+    every letter it touched. It runs over listing titles and descriptions on the display
+    path, which turned "BMW F30, NBT sistemi, 375.000 KM" into "bmw f30, nbt sistemi,
+    375.000 km" on every save - brands, acronyms and units flattened in published copy.
+
+    Callers that want case-insensitive text lowercase the result themselves, or use
+    normalize_for_match().
     """
     if text is None:
         return ""
@@ -115,21 +152,21 @@ def normalize_keyboard_text(text: str) -> str:
 
     output: list[str] = []
     for ch in value:
-        if ch in _CHAR_MAP:
-            output.append(_CHAR_MAP[ch])
+        mapped = _CHAR_MAP.get(ch)
+        if mapped is not None:
+            output.append(_restore_case(ch, mapped))
             continue
 
         if ch.isalpha():
-            lower = ch.lower()
-            if lower in _ALLOWED_ALPHA:
-                output.append(lower)
+            if ch.lower() in _ALLOWED_ALPHA:
+                output.append(ch)
                 continue
 
             # Fallback: strip diacritics and try again
             decomposed = unicodedata.normalize("NFKD", ch)
             base = "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
             if base in _ALLOWED_ALPHA:
-                output.append(base)
+                output.append(_restore_case(ch, base))
             # else drop unsupported letter
             continue
 

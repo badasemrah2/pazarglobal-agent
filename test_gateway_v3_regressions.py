@@ -8,11 +8,9 @@ from routers.gateway_v3 import (  # noqa: E402
     _apply_structured_prefill_to_listing,
     _classify_draft_message_intent,
     _collect_description_validation_errors,
-    _detect_enrichment_action,
     _detect_prohibited_listing_term,
     _format_preview,
     _format_search_continuation_page,
-    _handle_enrichment_action,
     _parse_edit_updates,
     _should_try_direct_edit,
 )
@@ -96,12 +94,6 @@ async def test_apply_drafting_edit_request_accepts_multi_line_bundle_with_second
     assert response.listing_preview["location"] == "Ankara"
 
 
-def test_detect_enrichment_action_handles_inflected_title_and_description():
-    assert _detect_enrichment_action("başlığı daha güzel yap") == "suggest_title"
-    assert _detect_enrichment_action("başlığı yeniden yaz") == "suggest_title"
-    assert _detect_enrichment_action("açıklamayı daha profesyonel yaz") == "improve_text"
-
-
 def test_classify_description_removal_intent():
     assert _classify_draft_message_intent("açıklamadan hasarlı kelimesini sil") == "remove_description_text"
 
@@ -175,128 +167,6 @@ def test_format_preview_can_show_full_description_when_requested():
     assert "✅ Açıklama:" in preview
     assert description in preview
     assert "Tüm periyodik bakımları düzenli olarak yapıldı." in preview
-
-
-async def test_handle_enrichment_action_returns_full_improved_description(monkeypatch):
-    improved_description = (
-        "Satılık citroen c3 benzinli otomatik - 2020 model\n\n"
-        "Hatasız, boyasız ve tramer kaydı yok. Tüm periyodik bakımları düzenli olarak yapıldı.\n\n"
-        "Detaylar ve görüşme için lütfen mesaj atın."
-    )
-
-    async def fake_edge_call(*_: object, **__: object):
-        return {"success": True, "result": improved_description}
-
-    async def fake_save_session(*_: object, **__: object):
-        return None
-
-    monkeypatch.setattr("routers.gateway_v3.supabase_client._call_edge_function", fake_edge_call)
-    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
-
-    session = {
-        "listing_data": {
-            "title": "Citroen c3 benzinli otomatik 2020 model",
-            "description": "Kısa açıklama",
-            "price": 1200000,
-            "category": "Otomotiv",
-            "condition": "2. El",
-            "location": "Bursa",
-            "images": ["one", "two", "three"],
-        },
-        "state": "READY",
-        "fsm_state": "DRAFTING",
-    }
-
-    response = await _handle_enrichment_action("user-1", "webchat", session, "improve_text")
-
-    assert response is not None
-    assert response.success is True
-    assert "Tüm periyodik bakımları düzenli olarak yapıldı." in response.text
-    assert "Detaylar ve görüşme için lütfen mesaj atın." in response.text
-    assert response.listing_preview is not None
-    assert response.listing_preview["description"] == improved_description.replace("\n\n", "\n")
-
-
-async def test_handle_enrichment_action_strips_unconfirmed_claims(monkeypatch):
-    async def fake_edge_call(*_: object, **__: object):
-        return {
-            "success": True,
-            "result": "Temiz cihaz. Uzun süre sorunsuz kullanıldı. 500 TL. Kutulu. Sertifikalı. 2021 sınırlı üretim.",
-        }
-
-    async def fake_save_session(*_: object, **__: object):
-        return None
-
-    monkeypatch.setattr("routers.gateway_v3.supabase_client._call_edge_function", fake_edge_call)
-    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
-
-    session = {
-        "listing_data": {
-            "title": "iPhone 13",
-            "description": "Temiz cihaz ve sorunsuz kullanım.",
-            "price": 18000,
-            "category": "Elektronik",
-            "condition": "2. El",
-            "location": "Bursa",
-        },
-        "state": "READY",
-        "fsm_state": "DRAFTING",
-    }
-
-    response = await _handle_enrichment_action("user-1", "webchat", session, "improve_text")
-
-    assert response is not None
-    assert response.listing_preview is not None
-    assert "500" not in response.listing_preview["description"]
-    assert "Kutulu" not in response.listing_preview["description"]
-    assert "Sertifikalı" not in response.listing_preview["description"]
-    assert "2021" not in response.listing_preview["description"]
-    assert "Temiz cihaz" in response.listing_preview["description"]
-
-
-async def test_handle_enrichment_action_strips_delivery_usage_and_seed_labels(monkeypatch):
-    async def fake_edge_call(*_: object, **__: object):
-        return {
-            "success": True,
-            "result": (
-                "Görsel 1: dekoratif dünya globu. Durum: çok iyi durumda. "
-                "Öne çıkan özellikler: metal yapı, altın rengi detaylar. "
-                "Sadece 1 kez kullanıldı. ✅📦 Teslimat kargo ile yapılacaktır."
-            ),
-        }
-
-    async def fake_save_session(*_: object, **__: object):
-        return None
-
-    monkeypatch.setattr("routers.gateway_v3.supabase_client._call_edge_function", fake_edge_call)
-    monkeypatch.setattr("routers.gateway_v3.save_session", fake_save_session)
-
-    session = {
-        "listing_data": {
-            "title": "Dekoratif dünya globu",
-            "description": "Dekoratif dünya globu.",
-            "price": 1800,
-            "category": "Ev & Yaşam",
-            "condition": "2. El",
-            "location": "Bursa",
-        },
-        "state": "READY",
-        "fsm_state": "DRAFTING",
-    }
-
-    response = await _handle_enrichment_action("user-1", "webchat", session, "improve_text")
-
-    assert response is not None
-    assert response.listing_preview is not None
-    description = response.listing_preview["description"]
-    assert "Görsel" not in description
-    assert "Durum" not in description
-    assert "Öne çıkan özellikler" not in description
-    assert "1 kez" not in description
-    assert "teslimat" not in description.lower()
-    assert "kargo" not in description.lower()
-    assert "çok iyi durumda" not in description.lower()
-    assert "Metal yapı, altın rengi detaylar." in description
 
 
 async def test_apply_description_removal_request_removes_phrase(monkeypatch):
