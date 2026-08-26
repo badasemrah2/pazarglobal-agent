@@ -1610,14 +1610,45 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
     return updates, errors
 
 
-def _apply_structured_prefill_to_listing(listing_data: Dict[str, Any], prefill: Dict[str, Any]) -> bool:
-    """Merge structured prefill into listing data for faster slot completion."""
+# What the bridge sends in place of an empty body on a media-only WhatsApp message.
+# Kept normalised (normalize_for_match strips Turkish diacritics) to match either spelling.
+_MEDIA_ONLY_PLACEHOLDERS = {
+    "fotograf gonderdim",
+    "resim gonderdim",
+    "gorsel gonderdim",
+}
+
+
+def _apply_structured_prefill_to_listing(
+    listing_data: Dict[str, Any],
+    prefill: Dict[str, Any],
+    user_text: str = "",
+) -> bool:
+    """Merge vision-derived prefill into the draft, without outranking the seller.
+
+    The prefill is a guess made from a photo, and it is applied before the Brain has read
+    the message. So when someone sent photos of their Jetta along with the words
+    "2011 model Jetta", a misread of the first photo ("Toyota Corolla") became the title,
+    and every later turn treated that as established fact.
+
+    A guess may fill a gap; it may never contradict what the seller actually typed.
+    """
     changed = False
+
+    # Did the seller actually describe the item, or is this a photo-only message?
+    # The bridge substitutes a fixed placeholder when a WhatsApp message carries media
+    # and no text, and that placeholder must not be mistaken for a description - it is
+    # exactly the case where the photo guess is the only thing we have.
+    normalized_text = normalize_for_match(user_text or "").strip()
+    user_described_item = (
+        normalized_text not in _MEDIA_ONLY_PLACEHOLDERS and len(normalized_text) >= 15
+    )
 
     raw_title = prefill.get("title")
     if isinstance(raw_title, str):
         title = raw_title.strip()
-        if title and len(str(listing_data.get("title") or "").strip()) < 3:
+        existing_title = str(listing_data.get("title") or "").strip()
+        if title and len(existing_title) < 3 and not user_described_item:
             listing_data["title"] = title[:200]
             changed = True
 
@@ -2206,7 +2237,9 @@ async def handle_message(
             if not isinstance(listing_data, dict):
                 listing_data = {}
 
-            if _apply_structured_prefill_to_listing(listing_data, request.prefill_listing_data):
+            if _apply_structured_prefill_to_listing(
+                listing_data, request.prefill_listing_data, request.message or ""
+            ):
                 session["listing_data"] = listing_data
                 session["state"] = "DRAFTING"
                 session["fsm_state"] = FSM_STATE_DRAFTING

@@ -19,6 +19,7 @@ from core.brain import Guardrails
 from routers.gateway_v3 import (
     FSM_COMMANDS,
     FSMEngine,
+    _apply_structured_prefill_to_listing,
     _is_show_more_command,
     _looks_like_price_research_request,
 )
@@ -218,3 +219,38 @@ def test_contact_numbers_are_not_indexed():
     })
     assert not [t for t in kw if t.isdigit() and len(t) >= 7]
     assert "8779" not in kw
+
+
+# ── Vision prefill vs. what the seller actually wrote ─────────────────────────
+# A four-photo VW Jetta, sent with the text "2011 model Jetta 1.6 dizel manuel...",
+# came back titled "Toyota Corolla": vision misread the first photo, and because the
+# prefill is applied before the Brain reads the message, the guess became the title and
+# every later turn treated it as fact.
+
+def test_photo_guess_does_not_override_what_the_seller_wrote():
+    listing = {}
+    changed = _apply_structured_prefill_to_listing(
+        listing,
+        {"title": "Toyota Corolla"},
+        user_text="2011 model Jetta 1.6 dizel manuel, 324 bin km, Antep teslim",
+    )
+    assert changed is False
+    assert "title" not in listing
+
+
+def test_photo_guess_still_fills_an_empty_draft():
+    """Photo-only messages have nothing else to go on, so the guess is welcome there."""
+    listing = {}
+    changed = _apply_structured_prefill_to_listing(
+        listing, {"title": "Volkswagen Jetta"}, user_text="Fotoğraf gönderdim"
+    )
+    assert changed is True
+    assert listing["title"] == "Volkswagen Jetta"
+
+
+def test_photo_guess_never_replaces_an_existing_title():
+    listing = {"title": "2011 Volkswagen Jetta 1.6 TDI"}
+    _apply_structured_prefill_to_listing(
+        listing, {"title": "Toyota Corolla"}, user_text=""
+    )
+    assert listing["title"] == "2011 Volkswagen Jetta 1.6 TDI"
