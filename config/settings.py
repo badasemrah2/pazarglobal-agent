@@ -1,6 +1,7 @@
 """
 Application settings and configuration
 """
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 from pathlib import Path
@@ -46,7 +47,19 @@ class Settings(BaseSettings):
     # Shared secret between the Supabase Edge traffic controller and this backend.
     # When set, any request claiming channel="whatsapp" must present it. Left unset the
     # check only warns, so the backend can be deployed before the secret is provisioned.
-    internal_api_secret: Optional[str] = None
+    #
+    # Two names are accepted because the two sides were named differently: the Edge
+    # function reads BACKEND_INTERNAL_SECRET from Supabase, this backend read only
+    # INTERNAL_API_SECRET from Railway. Setting the Edge function's name on Railway did
+    # nothing - the value was never read - and because an unset secret fails open, that
+    # produced no error, just a silently unauthenticated trust path.
+    #
+    # INTERNAL_API_SECRET wins when both are set; see _check_internal_secret_config(),
+    # which reports it when the two disagree.
+    internal_api_secret: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("INTERNAL_API_SECRET", "BACKEND_INTERNAL_SECRET"),
+    )
 
     # API Configuration
     api_host: str = "0.0.0.0"
@@ -88,3 +101,43 @@ class Settings(BaseSettings):
     
 # Global settings instance
 settings = Settings()
+
+
+def internal_secret_status() -> dict:
+    """Describe how the whatsapp trust secret is configured, for /health.
+
+    An unset secret makes verify_internal_secret() return True for everything, so a
+    misconfiguration looks exactly like success: the Edge function gets 200 and the log
+    still says "Auth verified". Nothing in the request path can tell the two apart, which
+    is why this is surfaced separately instead of being left to a warning line.
+    """
+    import os
+
+    # The state is derived from the value actually in use, not from the environment:
+    # settings also loads the .env file, so a secret can be active while neither
+    # environment variable is set. Reporting "not configured" in that case would be its
+    # own piece of misleading health output.
+    active = (settings.internal_api_secret or "").strip()
+    primary = (os.getenv("INTERNAL_API_SECRET") or "").strip()
+    fallback = (os.getenv("BACKEND_INTERNAL_SECRET") or "").strip()
+
+    names = [n for n, v in (("INTERNAL_API_SECRET", primary),
+                            ("BACKEND_INTERNAL_SECRET", fallback)) if v]
+
+    if not active:
+        state, using = "unauthenticated", None
+    elif primary and fallback and primary != fallback:
+        # Both names are set to different values and only one of them can be in use.
+        # Whoever set the other one meant it to take effect, so this is a real
+        # misconfiguration even while requests are still succeeding.
+        state, using = "conflict", "INTERNAL_API_SECRET"
+    else:
+        state = "configured"
+        if primary and primary == active:
+            using = "INTERNAL_API_SECRET"
+        elif fallback and fallback == active:
+            using = "BACKEND_INTERNAL_SECRET"
+        else:
+            using = ".env file"
+
+    return {"state": state, "configured_names": names, "using": using}

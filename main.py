@@ -264,10 +264,17 @@ async def webchat_media_analyze(request: Request):
 @app.get("/health")
 async def health_check():
     """Health check endpoint for Railway"""
+    from config.settings import internal_secret_status
+
+    # Reported here because it cannot be observed anywhere else: an unset whatsapp trust
+    # secret fails open, so requests succeed and the logs say "Auth verified" either way.
+    # This is the only way to check it without reading Railway's variables by hand.
+    # It names variables and states, never the secret itself.
     return {
         "status": "healthy",
         "service": "pazarglobal-agent",
-        "environment": settings.api_env
+        "environment": settings.api_env,
+        "whatsapp_trust_secret": internal_secret_status(),
     }
 
 
