@@ -66,10 +66,17 @@ class Settings(BaseSettings):
 
     # Feature flags
     enable_metadata_keyword_search: bool = True
-    # Hide listings whose expires_at has passed. OFF by default: nothing currently moves
-    # an expired listing out of status='active', so enabling this without a renewal/expiry
-    # job would hide most of the live catalogue. Turn on once expiry is actually managed.
-    hide_expired_listings: bool = False
+    # Hide listings whose expires_at has passed from search results.
+    #
+    # This stayed off while sellers had no way to see or extend their deadline - enabling
+    # it then would have removed most of the catalogue from people who were never warned.
+    # The countdown and the "Yeniden Yayınla" button are live now, so an expired listing
+    # is something its owner can bring back in one click, and search should stop showing
+    # listings whose window has closed.
+    #
+    # "İlanlarım" is not affected: it queries listings directly and deliberately keeps
+    # showing expired ones, which is where renewal happens.
+    hide_expired_listings: bool = True
     
     # Rate Limiting
     rate_limit_per_minute: int = 60
