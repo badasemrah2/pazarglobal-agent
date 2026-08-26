@@ -955,8 +955,19 @@ class FSMEngine:
                 listing_data["category"] = normalized
                 category = normalized
         
-        # Kategori boş, "Sistem", "Otomatik" veya geçersizse → başlık/açıklamadan otomatik belirle
-        if not category or category in ["Sistem", "Otomatik"] or category not in cls.ALLOWED_CATEGORIES:
+        # Kategori boş, "Sistem", "Otomatik", "Diğer" veya geçersizse → başlık/açıklamadan
+        # otomatik belirle.
+        #
+        # "Diğer" is this function's own fallback for "nothing matched", not a choice
+        # anyone made - category is derived here, never asked of the seller. Treating it
+        # as a settled answer made it stick: a Jetta whose title and description classify
+        # cleanly as "Otomotiv" stayed in "Diğer" because an earlier turn, when the draft
+        # was still an empty shell with nothing to classify, had already written it there.
+        if not listing_data.get("category_locked") and (
+            not category
+            or category in ["Sistem", "Otomatik", "Diğer"]
+            or category not in cls.ALLOWED_CATEGORIES
+        ):
             title = listing_data.get("title", "")
             description = listing_data.get("description", "")
             auto_category = cls.classify_category(f"{title} {description}")
@@ -969,7 +980,14 @@ class FSMEngine:
                 listing_data["category"] = "Diğer"
                 category = "Diğer"
                 logger.info(f"FSM defaulted category to 'Diğer' - no match found")
-        
+
+        # The lock above skips re-derivation, not the guarantee that a category exists:
+        # a locked value that is empty or not a real category would otherwise reach the
+        # insert as-is.
+        if category not in cls.ALLOWED_CATEGORIES:
+            listing_data["category"] = "Diğer"
+            category = "Diğer"
+
         # Kategori artık kesinlikle dolu - missing'e ekleme (FSM her zaman doldurur)
         # NOT: Kategori artık hiçbir zaman missing olmaz!
         
@@ -1425,6 +1443,51 @@ FSM_COMMANDS = {
     )
 }
 
+# The exact phrases above can never cover how people actually type. A seller who wrote
+# "uygundur yayınla" and then "evet onaylıyorum" was sent to the LLM both times, saw the
+# same preview come back, and had to say "evet" a third time before anything published -
+# and the extra LLM pass rewrote the description nobody asked it to touch.
+#
+# So a message also counts as a command when EVERY word in it is a confirmation word (or
+# every word a cancellation word). "evet onaylıyorum" and "uygundur yayınla" publish;
+# "evet ama fiyatı değiştir" still does not, because "ama" belongs to neither set.
+#
+# These are whole words, never prefixes. Turkish negation is a suffix, so matching
+# "yayınla" as a prefix would also match "yayınlama" - and publish a refusal to publish.
+_CONFIRM_WORDS = {
+    "evet", "evt", "tabi", "tabii", "aynen", "kesinlikle", "elbette", "lütfen", "lutfen",
+    "onay", "onayla", "onaylıyorum", "onayliyorum", "onaylayalım", "onaylayalim",
+    "onaydır", "onaydir", "kabul", "ediyorum", "edelim",
+    "yayınla", "yayinla", "yayınlayalım", "yayinlayalim", "yayına", "yayina", "al",
+    "tamam", "tamamdır", "tamamdir", "tmm", "olur", "olsun", "peki", "hadi", "oldu",
+    "uygun", "uygundur", "güzel", "guzel", "harika", "süper", "super", "devam",
+}
+_CANCEL_WORDS = {
+    "iptal", "et", "edelim", "vazgeç", "vazgec", "vazgeçtim", "vazgectim",
+    "hayır", "hayir", "yok", "olmaz", "istemiyorum", "dur", "boş", "bos", "ver",
+    "şimdilik", "simdilik", "olmasın", "olmasin", "gerek", "kalsın", "kalsin",
+}
+
+
+def _match_fsm_command(normalized_cmd: str) -> Optional[str]:
+    """Read a confirmation or cancellation out of a whole message.
+
+    Exact phrases win first; otherwise the message counts only if every one of its words
+    belongs to the same set, which is what keeps "evet ama fiyatı değiştir" out.
+    """
+    exact = FSM_COMMANDS.get(normalized_cmd)
+    if exact:
+        return exact
+
+    words = [w for w in (normalized_cmd or "").split() if w]
+    if not words or len(words) > 4:
+        return None
+    if all(w in _CONFIRM_WORDS for w in words):
+        return "CONFIRM"
+    if all(w in _CANCEL_WORDS for w in words):
+        return "CANCEL"
+    return None
+
 # FSM Edit commands (deterministic, LLM bypassed)
 EDIT_FIELD_MAP = {
     "başlık": "title",
@@ -1604,6 +1667,13 @@ def _parse_edit_updates(message: str) -> tuple[Dict[str, Any], List[str]]:
                 errors.append("durum")
             else:
                 updates[field] = parsed_condition
+        elif field == "category":
+            updates[field] = value
+            # Category is normally derived from the title and description, and "Diğer" is
+            # the "nothing matched" fallback that validate() re-runs past. Someone who
+            # typed the category themselves means it, including "Diğer", so mark it as
+            # settled and stop re-deriving it underneath them.
+            updates["category_locked"] = True
         else:
             updates[field] = value
 
@@ -2231,6 +2301,40 @@ async def handle_message(
                 session["listing_data"] = listing_data
                 await save_session(user_id, request.channel, session)
 
+        # 0.85 Draft TTL check - MUST run before the prefill and media steps below.
+        #
+        # Those two steps both stamp draft_updated_at with the current time. While the
+        # check sat after them, every arriving photo refreshed the very timestamp it was
+        # about to be judged by, so an abandoned draft could never go stale: an hour-old
+        # draft was revived by the message that was starting a new listing, and its images
+        # and category came along. A Jetta went out carrying a photo from an earlier,
+        # unrelated draft and stayed in that draft's "Diğer" category.
+        def _reset_draft() -> None:
+            """Abandon the current draft. The provenance archive belongs to that draft,
+            so it has to reset with it - otherwise claims from a previous product would
+            authorise details in the next one."""
+            session["listing_data"] = {}
+            session["state"] = "IDLE"
+            session["fsm_state"] = FSM_STATE_IDLE
+            session["draft_updated_at"] = None
+            session["last_intent"] = None
+            session[_SESSION_DESCRIPTION_CLAIMS_KEY] = []
+            # Keep the current turn's message: the user is starting a new draft with it.
+            session[_SESSION_USER_STATEMENTS_KEY] = _get_user_statements(session)[-1:]
+
+        draft_updated_at = session.get("draft_updated_at")
+        if draft_updated_at:
+            try:
+                last_ts = datetime.fromisoformat(draft_updated_at)
+                if (datetime.utcnow() - last_ts).total_seconds() > 600:
+                    logger.info("Draft expired (>10 min) - starting clean before prefill/media")
+                    _reset_draft()
+                    await save_session(user_id, request.channel, session)
+            except Exception:
+                # If parsing fails, reset draft defensively
+                _reset_draft()
+                await save_session(user_id, request.channel, session)
+
         # 0.9 Structured prefill injection (channel-agnostic, currently fed by WhatsApp vision bridge)
         if isinstance(request.prefill_listing_data, dict) and request.prefill_listing_data:
             listing_data = session.get("listing_data", {})
@@ -2288,31 +2392,7 @@ async def handle_message(
                 session["draft_updated_at"] = datetime.utcnow().isoformat()
                 await save_session(user_id, request.channel, session)
 
-        # 1.1 Draft TTL check (10 minutes)
-        def _reset_draft() -> None:
-            """Abandon the current draft. The provenance archive belongs to that draft,
-            so it has to reset with it - otherwise claims from a previous product would
-            authorise details in the next one."""
-            session["listing_data"] = {}
-            session["state"] = "IDLE"
-            session["fsm_state"] = FSM_STATE_IDLE
-            session["draft_updated_at"] = None
-            session["last_intent"] = None
-            session[_SESSION_DESCRIPTION_CLAIMS_KEY] = []
-            # Keep the current turn's message: the user is starting a new draft with it.
-            session[_SESSION_USER_STATEMENTS_KEY] = _get_user_statements(session)[-1:]
-
-        draft_updated_at = session.get("draft_updated_at")
-        if draft_updated_at:
-            try:
-                last_ts = datetime.fromisoformat(draft_updated_at)
-                if (datetime.utcnow() - last_ts).total_seconds() > 600:
-                    _reset_draft()
-                    await save_session(user_id, request.channel, session)
-            except Exception:
-                # If parsing fails, reset draft defensively
-                _reset_draft()
-                await save_session(user_id, request.channel, session)
+        # 1.1 Draft TTL is checked at 0.85, before prefill and media touch the timestamp.
 
         # ═══════════════════════════════════════════════════════════════════
         # 1.2 FSM STATE CHECK - LLM BYPASS for deterministic commands
@@ -2327,7 +2407,7 @@ async def handle_message(
         
         if fsm_state == FSM_STATE_PENDING_CONFIRMATION:
             # In confirmation state - check for deterministic commands
-            fsm_command = FSM_COMMANDS.get(normalized_cmd)
+            fsm_command = _match_fsm_command(normalized_cmd)
             
             if fsm_command:
                 # Deterministic command - LLM BYPASSED
