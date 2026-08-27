@@ -267,20 +267,34 @@ $fn$;
 commit;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- NOT BACKFILLED, ON PURPOSE
+-- NOTHING TO BACKFILL
 --
--- Publishes made between migration 005 and this one moved credits with no ledger
--- entry. listing_credit_reservations has a row for each, so the history could be
--- reconstructed - but a reconstructed row is a guess about when and at what balance,
--- and a ledger that mixes recorded facts with reconstructions is worse than one with
--- an acknowledged gap.
+-- Measured on the live project when this was applied: every one of the 14 wallets is
+-- on the free promo, and
 --
--- The gap is visible and datable:
 --   select count(*) from listing_credit_reservations r
 --    where r.charged
 --      and not exists (select 1 from wallet_transactions w where w.reference = r.reference);
 --
--- To verify this migration, publish one listing and then:
---   select kind, amount_bigint, reference, metadata, created_at
---     from wallet_transactions order by created_at desc limit 5;
+-- returns 0. The hole in the code was real, but no transaction ever fell through it -
+-- the platform has been free throughout, so reserve_listing_credit has never taken a
+-- credit from anyone. This migration matters for the day payment goes live, not for
+-- any history that was lost.
+--
+-- VERIFYING IT
+--
+-- A real publish cannot exercise the charged path while every wallet is on promo: it
+-- takes the v_promo branch, writes no ledger row, and that is correct. Run the charge
+-- and its refund inside a transaction you throw away instead:
+--
+--   begin;
+--   update wallets set free_unlimited_until = null where user_id = '<uuid>';
+--   select public.reserve_listing_credit('<uuid>', 55, 'ledger_selftest');
+--   select public.refund_listing_credit('<uuid>', 'ledger_selftest');
+--   select kind, amount_bigint, metadata->>'source'
+--     from wallet_transactions where reference = 'ledger_selftest' order by kind;
+--   rollback;
+--
+-- Expected: debit -55 from reserve_listing_credit, refund +55 from
+-- refund_listing_credit. Confirmed on 2026-08-27; the rollback left nothing behind.
 -- ─────────────────────────────────────────────────────────────────────────────
