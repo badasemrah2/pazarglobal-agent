@@ -78,6 +78,10 @@ begin
     -- If `kind` is constrained, the two values used below must both be permitted.
     -- supabase_client.py tried 'debit', 'spend', 'usage', 'credit' in turn precisely
     -- because nobody knew which this deployment allows; find out for certain instead.
+    --
+    -- On the live project the constraint permits debit, credit, spend, usage, deposit,
+    -- withdrawal, refund, purchase and admin_adjust - which is why the refund below
+    -- uses 'refund' rather than a generic 'credit'.
     select pg_get_constraintdef(c.oid)
       into v_kind_def
     from pg_constraint c
@@ -90,9 +94,9 @@ begin
     limit 1;
 
     if v_kind_def is not null
-       and not (v_kind_def ilike '%''debit''%' and v_kind_def ilike '%''credit''%') then
+       and not (v_kind_def ilike '%''debit''%' and v_kind_def ilike '%''refund''%') then
         raise exception
-            'wallet_transactions.kind does not permit both ''debit'' and ''credit''. '
+            'wallet_transactions.kind does not permit both ''debit'' and ''refund''. '
             'Constraint is: %  --  edit the two kind literals in this migration to match.',
             v_kind_def;
     end if;
@@ -251,7 +255,7 @@ begin
     values (
         p_user_id,
         v_row.amount,
-        'credit',
+        'refund',
         p_reference,
         jsonb_build_object('source', 'refund_listing_credit', 'balance_after', v_balance)
     );
